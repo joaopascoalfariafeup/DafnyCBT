@@ -26,10 +26,12 @@ class Program
         tiersOpt.AddAlias("-t");
         var checkOpt = new Option<bool>("--check", "Validate each test case by running Dafny (--no-verify), split output into Passing/Failing methods");
         checkOpt.AddAlias("-c");
+        var repeatOpt = new Option<int>("--repeat", () => 1, "Number of distinct test cases to generate per condition (default: 1)");
+        repeatOpt.AddAlias("-r");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -43,6 +45,7 @@ class Program
             var simple = ctx.ParseResult.GetValueForOption(simpleOpt);
             var tiers = ctx.ParseResult.GetValueForOption(tiersOpt);
             var check = ctx.ParseResult.GetValueForOption(checkOpt);
+            var repeat = ctx.ParseResult.GetValueForOption(repeatOpt);
 
             // Resolve input to a list of .dfy files
             var files = ResolveInputFiles(input);
@@ -83,7 +86,7 @@ class Program
                 if (files.Count > 1)
                     Console.WriteLine($"{'='} Processing: {file.Name} {'=',40}");
 
-                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check);
+                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat);
 
                 if (files.Count > 1)
                     Console.WriteLine();
@@ -126,7 +129,7 @@ class Program
         return new List<FileInfo>();
     }
 
-    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false)
+    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1)
     {
         if (!file.Exists)
         {
@@ -243,7 +246,7 @@ class Program
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
             Console.WriteLine();
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers);
+            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, repeat);
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -732,7 +735,7 @@ class Program
     /// Generates tests by calling Z3 directly with SMT2 queries for each DNF clause.
     /// For each test condition (PRE && POST_clause), we ask Z3 to find satisfying values.
     /// </summary>
-    static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4)
+    static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1)
     {
         var z3Path = @"C:\Users\jpf\.vscode\extensions\dafny-lang.ide-vscode-3.5.2\out\resources\4.11.0\github\dafny\z3\bin\z3-4.12.1.exe";
 
@@ -853,61 +856,102 @@ class Program
         foreach (var (label, literals, exclusions, extraConstraints) in testSchedule)
         {
             current++;
-            Console.WriteLine($"  Solving combination {label} ({current}/{total})...");
+            // For repeat > 1, solve multiple times with exclusion constraints on previous inputs
+            var repeatExclusions = new List<string>();
 
-            var smt = BuildSmt2Query(inputs, outputs, preClauses, literals, method, verbose, exclusions, extraConstraints);
-
-            if (verbose)
+            for (int rep = 0; rep < repeat; rep++)
             {
-                Console.WriteLine($"  [DEBUG] SMT2 query for {label}:");
-                Console.WriteLine(smt);
-                Console.WriteLine();
-            }
+                var repLabel = repeat > 1 ? $"{label}#{rep + 1}" : label;
+                Console.WriteLine($"  Solving combination {repLabel} ({current}/{total})...");
 
-            var result = await RunZ3(z3Path, smt);
+                var allExtra = new List<string>(extraConstraints);
+                allExtra.AddRange(repeatExclusions);
 
-            if (verbose)
-                Console.WriteLine($"  [DEBUG] Z3 output: {result.Substring(0, Math.Min(result.Length, 500))}");
+                var smt = BuildSmt2Query(inputs, outputs, preClauses, literals, method, verbose, exclusions, allExtra);
 
-            var resultLines = result.Split('\n').Select(l => l.Trim()).ToList();
-            bool isSat = resultLines.Any(l => l == "sat");
-            bool isUnsat = resultLines.Any(l => l == "unsat");
-
-            if (isSat)
-            {
-                var values = ParseZ3Model(result, allVars);
-                if (values.Count > 0)
+                if (verbose)
                 {
-                    testCases.Add((label, values, literals));
-                    Console.WriteLine($"  Combination {label}: SAT - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                    Console.WriteLine($"  [DEBUG] SMT2 query for {repLabel}:");
+                    Console.WriteLine(smt);
+                    Console.WriteLine();
+                }
+
+                var result = await RunZ3(z3Path, smt);
+
+                if (verbose)
+                    Console.WriteLine($"  [DEBUG] Z3 output: {result.Substring(0, Math.Min(result.Length, 500))}");
+
+                var resultLines = result.Split('\n').Select(l => l.Trim()).ToList();
+                bool isSat = resultLines.Any(l => l == "sat");
+                bool isUnsat = resultLines.Any(l => l == "unsat");
+
+                if (isSat)
+                {
+                    var values = ParseZ3Model(result, allVars);
+                    if (values.Count > 0)
+                    {
+                        testCases.Add((repLabel, values, literals));
+                        Console.WriteLine($"  Combination {repLabel}: SAT - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
+
+                        // Build exclusion constraint: inputs must differ from this solution
+                        var eqParts = new List<string>();
+                        foreach (var (name, type) in inputs)
+                        {
+                            if (IsArrayType(type) || IsSeqType(type))
+                            {
+                                if (values.TryGetValue(name + "_len", out var lenVal))
+                                    eqParts.Add($"(= {name}_len {lenVal})");
+                            }
+                            else if (values.TryGetValue(name, out var val))
+                            {
+                                var smtType = DafnyTypeToSmt(type);
+                                if (smtType == "Bool")
+                                    eqParts.Add($"(= {name} {val.ToLower()})");
+                                else if (smtType == "Real")
+                                    eqParts.Add($"(= {name} {val})");
+                                else
+                                    eqParts.Add($"(= {name} {val})");
+                            }
+                        }
+                        if (eqParts.Count > 0)
+                        {
+                            var conjunction = eqParts.Count == 1 ? eqParts[0] : $"(and {string.Join(" ", eqParts)})";
+                            repeatExclusions.Add($"(not {conjunction})");
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"  Combination {repLabel}: SAT but could not parse model");
+                        break;
+                    }
+                }
+                else if (isUnsat)
+                {
+                    Console.WriteLine($"  Combination {repLabel}: UNSAT (no more distinct inputs)");
+                    break;
+                }
+                else if (result.Trim() == "timeout" || resultLines.Any(l => l == "timeout"))
+                {
+                    Console.WriteLine($"  Combination {repLabel}: TIMEOUT (skipping)");
+                    break;
                 }
                 else
                 {
-                    Console.WriteLine($"  Combination {label}: SAT but could not parse model");
+                    Console.WriteLine($"  Combination {repLabel}: unknown result");
+                    if (verbose)
+                        Console.WriteLine($"  Z3 output: {result}");
+                    break;
                 }
-            }
-            else if (isUnsat)
-            {
-                Console.WriteLine($"  Combination {label}: UNSAT (skipping)");
-            }
-            else if (result.Trim() == "timeout" || resultLines.Any(l => l == "timeout"))
-            {
-                Console.WriteLine($"  Combination {label}: TIMEOUT (skipping)");
-            }
-            else
-            {
-                Console.WriteLine($"  Combination {label}: unknown result");
-                if (verbose)
-                    Console.WriteLine($"  Z3 output: {result}");
             }
         }
 
         if (!testCases.Any())
             return "";
 
-        // Deduplicate test cases with identical input values
+        // Deduplicate test cases with identical input values.
+        // When duplicates exist, prefer the one with more literals (more constrained outputs).
         var deduped = new List<(string label, Dictionary<string, string> values, List<string> literals)>();
-        var seen = new HashSet<string>();
+        var seenKeys = new Dictionary<string, int>(); // key -> index in deduped
         foreach (var tc in testCases)
         {
             // Build a key from input values only
@@ -924,8 +968,16 @@ class Program
                 tc.values.TryGetValue(name, out var val);
                 return $"{name}:{val}";
             }));
-            if (seen.Add(key))
+            if (!seenKeys.ContainsKey(key))
+            {
+                seenKeys[key] = deduped.Count;
                 deduped.Add(tc);
+            }
+            else if (tc.literals.Count > deduped[seenKeys[key]].literals.Count)
+            {
+                // Replace with the more constrained version (better output values)
+                deduped[seenKeys[key]] = tc;
+            }
         }
         if (deduped.Count < testCases.Count)
             Console.WriteLine($"  Deduplicated: {testCases.Count} -> {deduped.Count} unique test cases");
@@ -1828,7 +1880,8 @@ class Program
         {
             sb.AppendLine(comment);
             sb.AppendLine("  {");
-            sb.Append(body);
+            foreach (var line in body.Split('\n').Select(l => l.TrimEnd()))
+                if (line.Length > 0) sb.AppendLine(line);
             sb.AppendLine("  }");
             sb.AppendLine();
         }
@@ -1846,9 +1899,9 @@ class Program
         {
             sb.AppendLine(comment);
             sb.AppendLine("  {");
-            // Comment out expect lines so the file compiles
-            foreach (var line in body.Split('\n'))
+            foreach (var line in body.Split('\n').Select(l => l.TrimEnd()))
             {
+                if (line.Length == 0) continue;
                 var trimmed = line.TrimStart();
                 if (trimmed.StartsWith("expect "))
                     sb.AppendLine(line.Replace("expect ", "// expect "));
