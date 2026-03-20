@@ -1,0 +1,90 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <DafnyDir>C:\Users\jpf\.vscode\extensions\dafny-lang.ide-vscode-3.5.2\out\resources\4.11.0\github\dafny</DafnyDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Dafny core (for parsing .dfy files and walking the AST) -->
+    <Reference Include="DafnyCore">
+      <HintPath>$(DafnyDir)\DafnyCore.dll</HintPath>
+    </Reference>
+    <Reference Include="DafnyPipeline">
+      <HintPath>$(DafnyDir)\DafnyPipeline.dll</HintPath>
+    </Reference>
+
+    <!-- Boogie (transitive dependencies of DafnyCore) -->
+    <Reference Include="Boogie.Core">
+      <HintPath>$(DafnyDir)\Boogie.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="Boogie.BaseTypes">
+      <HintPath>$(DafnyDir)\Boogie.BaseTypes.dll</HintPath>
+    </Reference>
+    <Reference Include="Boogie.Graph">
+      <HintPath>$(DafnyDir)\Boogie.Graph.dll</HintPath>
+    </Reference>
+    <Reference Include="Boogie.ExecutionEngine">
+      <HintPath>$(DafnyDir)\Boogie.ExecutionEngine.dll</HintPath>
+    </Reference>
+
+    <!-- CLI framework -->
+    <Reference Include="System.CommandLine">
+      <HintPath>$(DafnyDir)\System.CommandLine.dll</HintPath>
+    </Reference>
+
+    <!-- DafnyCore dependencies -->
+    <Reference Include="System.Collections.Immutable">
+      <HintPath>$(DafnyDir)\System.Collections.Immutable.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.Logging.Abstractions">
+      <HintPath>$(DafnyDir)\Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.Logging">
+      <HintPath>$(DafnyDir)\Microsoft.Extensions.Logging.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.DependencyInjection.Abstractions">
+      <HintPath>$(DafnyDir)\Microsoft.Extensions.DependencyInjection.Abstractions.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.DependencyInjection">
+      <HintPath>$(DafnyDir)\Microsoft.Extensions.DependencyInjection.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.Options">
+      <HintPath>$(DafnyDir)\Microsoft.Extensions.Options.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.FileProviders.Abstractions">
+      <HintPath>$(DafnyDir)\Microsoft.Extensions.FileProviders.Abstractions.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.FileProviders.Physical">
+      <HintPath>$(DafnyDir)\Microsoft.Extensions.FileProviders.Physical.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.FileSystemGlobbing">
+      <HintPath>$(DafnyDir)\Microsoft.Extensions.FileSystemGlobbing.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.Configuration">
+      <HintPath>$(DafnyDir)\Microsoft.Extensions.Configuration.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.Configuration.Abstractions">
+      <HintPath>$(DafnyDir)\Microsoft.Extensions.Configuration.Abstractions.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.Primitives">
+      <HintPath>$(DafnyDir)\Microsoft.Extensions.Primitives.dll</HintPath>
+    </Reference>
+    <Reference Include="Tomlyn">
+      <HintPath>$(DafnyDir)\Tomlyn.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.DotNet.PlatformAbstractions">
+      <HintPath>$(DafnyDir)\Microsoft.DotNet.PlatformAbstractions.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.DependencyModel">
+      <HintPath>$(DafnyDir)\Microsoft.Extensions.DependencyModel.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
