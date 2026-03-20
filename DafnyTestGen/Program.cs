@@ -1846,6 +1846,21 @@ class Program
             return $"{arrToSeqMatch.Groups[1].Value}_seq";
         }
 
+        // Handle arithmetic operators: +, -, *, /, %
+        // Must come after comparisons but before literals/identifiers
+        var arithOps = new[] { ("+", "+"), ("-", "-"), ("*", "*"), ("/", "div"), ("%", "mod") };
+        foreach (var (dOp, sOp) in arithOps)
+        {
+            var parts = SplitOnOperator(expr, dOp);
+            if (parts != null)
+            {
+                var left = DafnyExprToSmt(parts.Value.left, inputs);
+                var right = DafnyExprToSmt(parts.Value.right, inputs);
+                if (left != null && right != null)
+                    return $"({sOp} {left} {right})";
+            }
+        }
+
         // Numeric literal (integer)
         if (int.TryParse(expr, out var num))
             return num < 0 ? $"(- {-num})" : num.ToString();
