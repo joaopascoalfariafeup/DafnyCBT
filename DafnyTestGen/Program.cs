@@ -1611,6 +1611,18 @@ class Program
         if (expr.StartsWith("-") && int.TryParse(expr.Substring(1), out var posNum))
             return $"(- {posNum})";
 
+        // Unary negation on expression: -x, -(a + b), etc.
+        if (expr.StartsWith("-"))
+        {
+            var inner = expr.Substring(1).Trim();
+            // Remove surrounding parens if present: -(expr) -> expr
+            if (inner.StartsWith("(") && inner.EndsWith(")"))
+                inner = inner.Substring(1, inner.Length - 2);
+            var innerSmt = DafnyExprToSmt(inner, inputs);
+            if (innerSmt != null)
+                return $"(- {innerSmt})";
+        }
+
         // Handle function calls: FuncName(arg1, arg2, ...)
         // Declared as uninterpreted functions in SMT
         var funcMatch = Regex.Match(expr, @"^(\w+)\((.+)\)$");
