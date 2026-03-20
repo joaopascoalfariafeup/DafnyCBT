@@ -914,6 +914,19 @@ class Program
 
         var preClauses = method.Req.Select(r => r.E).ToList();
 
+        // Decompose preconditions into DNF (for disjunctive precondition handling)
+        var preDnfClauses = new List<List<string>> { new List<string>() }; // trivial "true"
+        foreach (var pre in preClauses)
+        {
+            var preDnf = ExprToDnf(pre);
+            preDnfClauses = CrossProduct(preDnfClauses, preDnf);
+        }
+        // Remove the empty "true" elements from single-clause results
+        preDnfClauses = preDnfClauses.Select(c => c.Where(s => s.Length > 0).ToList()).ToList();
+        bool hasDisjunctivePre = preDnfClauses.Count > 1;
+        if (hasDisjunctivePre)
+            Console.WriteLine($"  Disjunctive precondition: {preDnfClauses.Count} branches");
+
         // Collect input/output variable info
         var inputs = method.Ins.Select(f => (f.Name, Type: f.Type.ToString())).ToList();
         var outputs = method.Outs.Select(f => (f.Name, Type: f.Type.ToString())).ToList();
@@ -929,98 +942,111 @@ class Program
         foreach (var clause in dnfClauses)
             commonLiterals.IntersectWith(clause);
 
-        // Build boundary tiers if requested
-        var boundaryTiers = new List<(string tierLabel, List<string> tierConstraints)>();
+        // Build boundary tiers per precondition branch if requested
+        var boundaryTiersPerBranch = new Dictionary<int, List<(string tierLabel, List<string> tierConstraints)>>();
         if (boundary)
         {
-            boundaryTiers = BuildBoundaryTiers(inputs, preClauses, method, verbose, tierCount);
-            Console.WriteLine($"  Boundary mode: {boundaryTiers.Count} boundary tiers generated");
+            for (int pi = 0; pi < preDnfClauses.Count; pi++)
+            {
+                boundaryTiersPerBranch[pi] = BuildBoundaryTiers(inputs, preClauses, method, verbose, tierCount, preDnfClauses[pi]);
+            }
+            var tierCount0 = boundaryTiersPerBranch[0].Count;
+            Console.WriteLine($"  Boundary mode: {tierCount0} boundary tiers generated");
         }
 
-        // Build test schedule: list of (label, includedLiterals, excludedLiterals, extraConstraints)
-        var testSchedule = new List<(string label, List<string> literals, List<string> exclusions, List<string> extraConstraints)>();
+        // Build test schedule: list of (label, postLiterals, preLiterals, excludedLiterals, extraConstraints)
+        var testSchedule = new List<(string label, List<string> literals, List<string> preLiterals, List<string> exclusions, List<string> extraConstraints)>();
 
-        if (allCombinations)
+        // Iterate over precondition branches (for non-disjunctive pre, just one branch)
+        for (int pi = 0; pi < preDnfClauses.Count; pi++)
         {
-            // All non-empty subsets of {0..n-1} DNF clauses
-            int n = dnfClauses.Count;
-            int totalCombinations = (1 << n) - 1; // 2^n - 1
-            Console.WriteLine($"  All-combinations mode: {n} clauses -> {totalCombinations} combinations");
+            var preLits = preDnfClauses[pi];
+            var preLabel = hasDisjunctivePre ? $"P{pi + 1}/" : "";
+            var boundaryTiers = boundary ? boundaryTiersPerBranch[pi] : new List<(string, List<string>)>();
 
-            for (int mask = 1; mask <= totalCombinations; mask++)
+            if (allCombinations)
             {
-                var included = new List<int>();
-                for (int bit = 0; bit < n; bit++)
-                    if ((mask & (1 << bit)) != 0)
-                        included.Add(bit);
+                // All non-empty subsets of {0..n-1} DNF clauses
+                int n = dnfClauses.Count;
+                int totalCombinations = (1 << n) - 1; // 2^n - 1
+                if (pi == 0)
+                    Console.WriteLine($"  All-combinations mode: {n} clauses -> {totalCombinations} combinations");
 
-                var label = "{" + string.Join(",", included.Select(i => (i + 1).ToString())) + "}";
-
-                var mergedLiterals = new List<string>();
-                foreach (var idx in included)
-                    foreach (var lit in dnfClauses[idx])
-                        if (!mergedLiterals.Contains(lit))
-                            mergedLiterals.Add(lit);
-
-                var exclusions = new List<string>();
-                for (int bit = 0; bit < n; bit++)
+                for (int mask = 1; mask <= totalCombinations; mask++)
                 {
-                    if ((mask & (1 << bit)) != 0) continue;
-                    foreach (var lit in dnfClauses[bit])
+                    var included = new List<int>();
+                    for (int bit = 0; bit < n; bit++)
+                        if ((mask & (1 << bit)) != 0)
+                            included.Add(bit);
+
+                    var label = preLabel + "{" + string.Join(",", included.Select(i => (i + 1).ToString())) + "}";
+
+                    var mergedLiterals = new List<string>();
+                    foreach (var idx in included)
+                        foreach (var lit in dnfClauses[idx])
+                            if (!mergedLiterals.Contains(lit))
+                                mergedLiterals.Add(lit);
+
+                    var exclusions = new List<string>();
+                    for (int bit = 0; bit < n; bit++)
                     {
-                        if (!commonLiterals.Contains(lit) && !mergedLiterals.Contains(lit) && !exclusions.Contains(lit))
-                            exclusions.Add(lit);
+                        if ((mask & (1 << bit)) != 0) continue;
+                        foreach (var lit in dnfClauses[bit])
+                        {
+                            if (!commonLiterals.Contains(lit) && !mergedLiterals.Contains(lit) && !exclusions.Contains(lit))
+                                exclusions.Add(lit);
+                        }
                     }
-                }
 
-                if (boundary && boundaryTiers.Count > 0)
-                {
-                    foreach (var (tierLabel, tierConstraints) in boundaryTiers)
-                        testSchedule.Add(($"{label}/B{tierLabel}", mergedLiterals, exclusions, tierConstraints));
-                }
-                else
-                {
-                    testSchedule.Add((label, mergedLiterals, exclusions, new List<string>()));
+                    if (boundary && boundaryTiers.Count > 0)
+                    {
+                        foreach (var (tierLabel, tierConstraints) in boundaryTiers)
+                            testSchedule.Add(($"{label}/B{tierLabel}", mergedLiterals, preLits, exclusions, tierConstraints));
+                    }
+                    else
+                    {
+                        testSchedule.Add((label, mergedLiterals, preLits, exclusions, new List<string>()));
+                    }
                 }
             }
-        }
-        else
-        {
-            // Default: one test per clause, with exclusions for distinctness
-            for (int ci = 0; ci < dnfClauses.Count; ci++)
+            else
             {
-                var clause = dnfClauses[ci];
-                var label = $"{ci + 1}";
-
-                var exclusions = new List<string>();
-                for (int oi = 0; oi < dnfClauses.Count; oi++)
+                // Default: one test per clause, with exclusions for distinctness
+                for (int ci = 0; ci < dnfClauses.Count; ci++)
                 {
-                    if (oi == ci) continue;
-                    foreach (var lit in dnfClauses[oi])
+                    var clause = dnfClauses[ci];
+                    var label = $"{preLabel}{ci + 1}";
+
+                    var exclusions = new List<string>();
+                    for (int oi = 0; oi < dnfClauses.Count; oi++)
                     {
-                        if (!commonLiterals.Contains(lit) && !clause.Contains(lit) && !exclusions.Contains(lit))
-                            exclusions.Add(lit);
+                        if (oi == ci) continue;
+                        foreach (var lit in dnfClauses[oi])
+                        {
+                            if (!commonLiterals.Contains(lit) && !clause.Contains(lit) && !exclusions.Contains(lit))
+                                exclusions.Add(lit);
+                        }
                     }
-                }
 
-                if (boundary && boundaryTiers.Count > 0)
-                {
-                    foreach (var (tierLabel, tierConstraints) in boundaryTiers)
-                        testSchedule.Add(($"{label}/B{tierLabel}", clause, exclusions, tierConstraints));
-                }
-                else
-                {
-                    testSchedule.Add((label, clause, exclusions, new List<string>()));
+                    if (boundary && boundaryTiers.Count > 0)
+                    {
+                        foreach (var (tierLabel, tierConstraints) in boundaryTiers)
+                            testSchedule.Add(($"{label}/B{tierLabel}", clause, preLits, exclusions, tierConstraints));
+                    }
+                    else
+                    {
+                        testSchedule.Add((label, clause, preLits, exclusions, new List<string>()));
+                    }
                 }
             }
         }
 
         // Helper: solve one SMT query and return parsed values (or null)
         async Task<Dictionary<string, string>?> SolveOne(string solveLabel, int schedIdx, int schedTotal,
-            List<string> lits, List<string> excl, List<string> extra)
+            List<string> lits, List<string> preLits, List<string> excl, List<string> extra)
         {
             Console.WriteLine($"  Solving combination {solveLabel} ({schedIdx}/{schedTotal})...");
-            var smt = BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra);
+            var smt = BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits);
             if (verbose)
             {
                 Console.WriteLine($"  [DEBUG] SMT2 query for {solveLabel}:");
@@ -1085,11 +1111,11 @@ class Program
         // baseKey -> list of exclusion constraints on inputs found so far
         var baseConditionExclusions = new Dictionary<string, List<string>>();
 
-        foreach (var (label, literals, exclusions, extraConstraints) in testSchedule)
+        foreach (var (label, literals, preLits, exclusions, extraConstraints) in testSchedule)
         {
             current++;
             // Base key: identifies the postcondition combination (without boundary tier)
-            var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions);
+            var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions) + "||" + string.Join("|", preLits);
 
             if (!baseConditionExclusions.ContainsKey(baseKey))
                 baseConditionExclusions[baseKey] = new List<string>();
@@ -1099,7 +1125,7 @@ class Program
             var allExtra = new List<string>(extraConstraints);
             allExtra.AddRange(inputExclusions);
 
-            var values = await SolveOne(label, current, total, literals, exclusions, allExtra);
+            var values = await SolveOne(label, current, total, literals, preLits, exclusions, allExtra);
             if (values != null)
             {
                 testCases.Add((label, values, literals));
@@ -1112,21 +1138,21 @@ class Program
         if (repeat > 1)
         {
             // Collect the distinct base conditions (literals + exclusions, no boundary)
-            var baseConditions = new List<(string baseLabel, List<string> literals, List<string> exclusions, string baseKey)>();
+            var baseConditions = new List<(string baseLabel, List<string> literals, List<string> preLits, List<string> exclusions, string baseKey)>();
             var seenBaseKeys = new HashSet<string>();
 
-            foreach (var (label, literals, exclusions, _) in testSchedule)
+            foreach (var (label, literals, preLits, exclusions, _) in testSchedule)
             {
-                var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions);
+                var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions) + "||" + string.Join("|", preLits);
                 if (seenBaseKeys.Add(baseKey))
                 {
                     // Strip boundary tier suffix from label for the base label
                     var baseLabel = label.Contains("/B") ? label.Substring(0, label.IndexOf("/B")) : label;
-                    baseConditions.Add((baseLabel, literals, exclusions, baseKey));
+                    baseConditions.Add((baseLabel, literals, preLits, exclusions, baseKey));
                 }
             }
 
-            foreach (var (baseLabel, literals, exclusions, baseKey) in baseConditions)
+            foreach (var (baseLabel, literals, preLits, exclusions, baseKey) in baseConditions)
             {
                 var inputExclusions = baseConditionExclusions[baseKey];
                 int found = inputExclusions.Count; // tests already found (from boundary phase)
@@ -1136,7 +1162,7 @@ class Program
                 {
                     var repLabel = $"{baseLabel}/R{found + rep + 1}";
                     // Solve without boundary constraints, only postcondition + input exclusions
-                    var values = await SolveOne(repLabel, current, total, literals, exclusions, inputExclusions.ToList());
+                    var values = await SolveOne(repLabel, current, total, literals, preLits, exclusions, inputExclusions.ToList());
                     if (values != null)
                     {
                         testCases.Add((repLabel, values, literals));
@@ -1206,9 +1232,13 @@ class Program
         List<Expression> preClauses,
         Method method,
         bool verbose,
-        int tierCount = 4)
+        int tierCount = 4,
+        List<string>? preLiterals = null)
     {
-        var preStrings = preClauses.Select(e => ExprToString(e)).ToList();
+        // Use precondition literals from DNF decomposition if available, otherwise from raw expressions
+        var preStrings = preLiterals != null && preLiterals.Count > 0
+            ? preLiterals
+            : preClauses.Select(e => ExprToString(e)).ToList();
 
         // Build per-parameter tiers
         var paramTiers = new List<(string paramName, List<(string label, string smtConstraint)> tiers)>();
@@ -1346,20 +1376,41 @@ class Program
     static (int? lower, int? upper) ExtractBounds(string varName, List<string> preClauses)
     {
         int? lower = null, upper = null;
+        var numPat = @"(-?\d+)"; // matches negative and positive integers
 
         foreach (var pre in preClauses)
         {
+            // Handle chain comparison: N <= varName <= M or N < varName < M etc.
+            var chainMatch = Regex.Match(pre,
+                $@"{numPat}\s*(<=?)\s*{Regex.Escape(varName)}\s*(<=?)\s*{numPat}");
+            if (chainMatch.Success)
+            {
+                if (int.TryParse(chainMatch.Groups[1].Value, out var lo))
+                {
+                    var loAdj = chainMatch.Groups[2].Value == "<" ? 1 : 0;
+                    var loVal = lo + loAdj;
+                    lower = lower.HasValue ? Math.Max(lower.Value, loVal) : loVal;
+                }
+                if (int.TryParse(chainMatch.Groups[4].Value, out var hi))
+                {
+                    var hiAdj = chainMatch.Groups[3].Value == "<" ? -1 : 0;
+                    var hiVal = hi + hiAdj;
+                    upper = upper.HasValue ? Math.Min(upper.Value, hiVal) : hiVal;
+                }
+                continue;
+            }
+
             // Match patterns like: varName >= N, varName > N, N <= varName, N < varName
             var patterns = new (string pattern, bool isLower, int adjust)[]
             {
-                ($@"{Regex.Escape(varName)}\s*>=\s*(\d+)", true, 0),
-                ($@"{Regex.Escape(varName)}\s*>\s*(\d+)", true, 1),
-                ($@"(\d+)\s*<=\s*{Regex.Escape(varName)}", true, 0),
-                ($@"(\d+)\s*<\s*{Regex.Escape(varName)}", true, 1),
-                ($@"{Regex.Escape(varName)}\s*<=\s*(\d+)", false, 0),
-                ($@"{Regex.Escape(varName)}\s*<\s*(\d+)", false, -1),
-                ($@"(\d+)\s*>=\s*{Regex.Escape(varName)}", false, 0),
-                ($@"(\d+)\s*>\s*{Regex.Escape(varName)}", false, -1),
+                ($@"{Regex.Escape(varName)}\s*>=\s*{numPat}", true, 0),
+                ($@"{Regex.Escape(varName)}\s*>\s*{numPat}", true, 1),
+                ($@"{numPat}\s*<=\s*{Regex.Escape(varName)}", true, 0),
+                ($@"{numPat}\s*<\s*{Regex.Escape(varName)}", true, 1),
+                ($@"{Regex.Escape(varName)}\s*<=\s*{numPat}", false, 0),
+                ($@"{Regex.Escape(varName)}\s*<\s*{numPat}", false, -1),
+                ($@"{numPat}\s*>=\s*{Regex.Escape(varName)}", false, 0),
+                ($@"{numPat}\s*>\s*{Regex.Escape(varName)}", false, -1),
             };
 
             foreach (var (pattern, isLower, adjust) in patterns)
@@ -1376,7 +1427,6 @@ class Program
             }
         }
 
-        // Handle nat type (implicit >= 0)
         return (lower, upper);
     }
 
@@ -1414,7 +1464,8 @@ class Program
         Method method,
         bool verbose,
         List<string>? exclusions = null,
-        List<string>? extraConstraints = null)
+        List<string>? extraConstraints = null,
+        List<string>? preLiterals = null)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("(set-option :produce-models true)");
@@ -1486,14 +1537,30 @@ class Program
         }
 
         // Encode preconditions
-        foreach (var pre in preClauses)
+        if (preLiterals != null && preLiterals.Count > 0)
         {
-            var preStr = ExprToString(pre);
-            var smtExpr = DafnyExprToSmt(preStr, inputs);
-            if (smtExpr != null)
-                assertions.AppendLine($"(assert {smtExpr})");
-            else
-                assertions.AppendLine($"; Could not translate precondition: {preStr}");
+            // Use decomposed precondition literals (from DNF decomposition)
+            foreach (var preLit in preLiterals)
+            {
+                var smtExpr = DafnyExprToSmt(preLit, inputs);
+                if (smtExpr != null)
+                    assertions.AppendLine($"(assert {smtExpr})");
+                else
+                    assertions.AppendLine($"; Could not translate precondition: {preLit}");
+            }
+        }
+        else
+        {
+            // Fallback: use raw precondition expressions
+            foreach (var pre in preClauses)
+            {
+                var preStr = ExprToString(pre);
+                var smtExpr = DafnyExprToSmt(preStr, inputs);
+                if (smtExpr != null)
+                    assertions.AppendLine($"(assert {smtExpr})");
+                else
+                    assertions.AppendLine($"; Could not translate precondition: {preStr}");
+            }
         }
 
         // Emit uninterpreted function declarations (discovered during translation)
