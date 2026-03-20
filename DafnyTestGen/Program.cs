@@ -848,99 +848,138 @@ class Program
             }
         }
 
+        // Helper: solve one SMT query and return parsed values (or null)
+        async Task<Dictionary<string, string>?> SolveOne(string solveLabel, int schedIdx, int schedTotal,
+            List<string> lits, List<string> excl, List<string> extra)
+        {
+            Console.WriteLine($"  Solving combination {solveLabel} ({schedIdx}/{schedTotal})...");
+            var smt = BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra);
+            if (verbose)
+            {
+                Console.WriteLine($"  [DEBUG] SMT2 query for {solveLabel}:");
+                Console.WriteLine(smt);
+                Console.WriteLine();
+            }
+            var result = await RunZ3(z3Path, smt);
+            if (verbose)
+                Console.WriteLine($"  [DEBUG] Z3 output: {result.Substring(0, Math.Min(result.Length, 500))}");
+            var resultLines = result.Split('\n').Select(l => l.Trim()).ToList();
+            if (resultLines.Any(l => l == "sat"))
+            {
+                var values = ParseZ3Model(result, allVars);
+                if (values.Count > 0)
+                {
+                    Console.WriteLine($"  Combination {solveLabel}: SAT - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                    return values;
+                }
+                Console.WriteLine($"  Combination {solveLabel}: SAT but could not parse model");
+                return null;
+            }
+            if (resultLines.Any(l => l == "unsat"))
+                Console.WriteLine($"  Combination {solveLabel}: UNSAT (skipping)");
+            else if (result.Trim() == "timeout" || resultLines.Any(l => l == "timeout"))
+                Console.WriteLine($"  Combination {solveLabel}: TIMEOUT (skipping)");
+            else
+            {
+                Console.WriteLine($"  Combination {solveLabel}: unknown result");
+                if (verbose) Console.WriteLine($"  Z3 output: {result}");
+            }
+            return null;
+        }
+
+        // Helper: build an SMT exclusion constraint from a set of input values
+        string? BuildInputExclusion(Dictionary<string, string> values)
+        {
+            var eqParts = new List<string>();
+            foreach (var (name, type) in inputs)
+            {
+                if (IsArrayType(type) || IsSeqType(type))
+                {
+                    if (values.TryGetValue(name + "_len", out var lenVal))
+                        eqParts.Add($"(= {name}_len {lenVal})");
+                }
+                else if (values.TryGetValue(name, out var val))
+                {
+                    eqParts.Add($"(= {name} {val})");
+                }
+            }
+            if (eqParts.Count == 0) return null;
+            var conjunction = eqParts.Count == 1 ? eqParts[0] : $"(and {string.Join(" ", eqParts)})";
+            return $"(not {conjunction})";
+        }
+
         // Solve each test condition
         var testCases = new List<(string label, Dictionary<string, string> values, List<string> literals)>();
         int total = testSchedule.Count;
         int current = 0;
 
+        // Group schedule entries by base condition (literals + exclusions) to track
+        // inputs found across boundary tiers for the same condition.
+        // baseKey -> list of exclusion constraints on inputs found so far
+        var baseConditionExclusions = new Dictionary<string, List<string>>();
+
         foreach (var (label, literals, exclusions, extraConstraints) in testSchedule)
         {
             current++;
-            // For repeat > 1, solve multiple times with exclusion constraints on previous inputs
-            var repeatExclusions = new List<string>();
+            // Base key: identifies the postcondition combination (without boundary tier)
+            var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions);
 
-            for (int rep = 0; rep < repeat; rep++)
+            if (!baseConditionExclusions.ContainsKey(baseKey))
+                baseConditionExclusions[baseKey] = new List<string>();
+            var inputExclusions = baseConditionExclusions[baseKey];
+
+            // Solve with boundary/extra constraints + exclusions from previous inputs
+            var allExtra = new List<string>(extraConstraints);
+            allExtra.AddRange(inputExclusions);
+
+            var values = await SolveOne(label, current, total, literals, exclusions, allExtra);
+            if (values != null)
             {
-                var repLabel = repeat > 1 ? $"{label}#{rep + 1}" : label;
-                Console.WriteLine($"  Solving combination {repLabel} ({current}/{total})...");
+                testCases.Add((label, values, literals));
+                var excl = BuildInputExclusion(values);
+                if (excl != null) inputExclusions.Add(excl);
+            }
+        }
 
-                var allExtra = new List<string>(extraConstraints);
-                allExtra.AddRange(repeatExclusions);
+        // Repeat phase: generate additional test cases per base condition (without boundary constraints)
+        if (repeat > 1)
+        {
+            // Collect the distinct base conditions (literals + exclusions, no boundary)
+            var baseConditions = new List<(string baseLabel, List<string> literals, List<string> exclusions, string baseKey)>();
+            var seenBaseKeys = new HashSet<string>();
 
-                var smt = BuildSmt2Query(inputs, outputs, preClauses, literals, method, verbose, exclusions, allExtra);
-
-                if (verbose)
+            foreach (var (label, literals, exclusions, _) in testSchedule)
+            {
+                var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions);
+                if (seenBaseKeys.Add(baseKey))
                 {
-                    Console.WriteLine($"  [DEBUG] SMT2 query for {repLabel}:");
-                    Console.WriteLine(smt);
-                    Console.WriteLine();
+                    // Strip boundary tier suffix from label for the base label
+                    var baseLabel = label.Contains("/B") ? label.Substring(0, label.IndexOf("/B")) : label;
+                    baseConditions.Add((baseLabel, literals, exclusions, baseKey));
                 }
+            }
 
-                var result = await RunZ3(z3Path, smt);
+            foreach (var (baseLabel, literals, exclusions, baseKey) in baseConditions)
+            {
+                var inputExclusions = baseConditionExclusions[baseKey];
+                int found = inputExclusions.Count; // tests already found (from boundary phase)
+                int needed = repeat - found;
 
-                if (verbose)
-                    Console.WriteLine($"  [DEBUG] Z3 output: {result.Substring(0, Math.Min(result.Length, 500))}");
-
-                var resultLines = result.Split('\n').Select(l => l.Trim()).ToList();
-                bool isSat = resultLines.Any(l => l == "sat");
-                bool isUnsat = resultLines.Any(l => l == "unsat");
-
-                if (isSat)
+                for (int rep = 0; rep < needed; rep++)
                 {
-                    var values = ParseZ3Model(result, allVars);
-                    if (values.Count > 0)
+                    var repLabel = $"{baseLabel}/R{found + rep + 1}";
+                    // Solve without boundary constraints, only postcondition + input exclusions
+                    var values = await SolveOne(repLabel, current, total, literals, exclusions, inputExclusions.ToList());
+                    if (values != null)
                     {
                         testCases.Add((repLabel, values, literals));
-                        Console.WriteLine($"  Combination {repLabel}: SAT - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
-
-                        // Build exclusion constraint: inputs must differ from this solution
-                        var eqParts = new List<string>();
-                        foreach (var (name, type) in inputs)
-                        {
-                            if (IsArrayType(type) || IsSeqType(type))
-                            {
-                                if (values.TryGetValue(name + "_len", out var lenVal))
-                                    eqParts.Add($"(= {name}_len {lenVal})");
-                            }
-                            else if (values.TryGetValue(name, out var val))
-                            {
-                                var smtType = DafnyTypeToSmt(type);
-                                if (smtType == "Bool")
-                                    eqParts.Add($"(= {name} {val.ToLower()})");
-                                else if (smtType == "Real")
-                                    eqParts.Add($"(= {name} {val})");
-                                else
-                                    eqParts.Add($"(= {name} {val})");
-                            }
-                        }
-                        if (eqParts.Count > 0)
-                        {
-                            var conjunction = eqParts.Count == 1 ? eqParts[0] : $"(and {string.Join(" ", eqParts)})";
-                            repeatExclusions.Add($"(not {conjunction})");
-                        }
+                        var excl = BuildInputExclusion(values);
+                        if (excl != null) inputExclusions.Add(excl);
                     }
                     else
                     {
-                        Console.WriteLine($"  Combination {repLabel}: SAT but could not parse model");
-                        break;
+                        break; // no more distinct inputs
                     }
-                }
-                else if (isUnsat)
-                {
-                    Console.WriteLine($"  Combination {repLabel}: UNSAT (no more distinct inputs)");
-                    break;
-                }
-                else if (result.Trim() == "timeout" || resultLines.Any(l => l == "timeout"))
-                {
-                    Console.WriteLine($"  Combination {repLabel}: TIMEOUT (skipping)");
-                    break;
-                }
-                else
-                {
-                    Console.WriteLine($"  Combination {repLabel}: unknown result");
-                    if (verbose)
-                        Console.WriteLine($"  Z3 output: {result}");
-                    break;
                 }
             }
         }
