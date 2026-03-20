@@ -942,27 +942,80 @@ class Program
         foreach (var clause in dnfClauses)
             commonLiterals.IntersectWith(clause);
 
-        // Build boundary tiers per precondition branch if requested
-        var boundaryTiersPerBranch = new Dictionary<int, List<(string tierLabel, List<string> tierConstraints)>>();
-        if (boundary)
+        // Build precondition combinations (all-combinations with exclusions, like postconditions)
+        // Each entry: (label, mergedPreLiterals, preExclusions)
+        var preCommonLiterals = preDnfClauses.Count > 0
+            ? new HashSet<string>(preDnfClauses[0])
+            : new HashSet<string>();
+        foreach (var pc in preDnfClauses)
+            preCommonLiterals.IntersectWith(pc);
+
+        var preCombinations = new List<(string label, List<string> preLits, List<string> preExclusions)>();
+        if (hasDisjunctivePre)
         {
-            for (int pi = 0; pi < preDnfClauses.Count; pi++)
+            int pm = preDnfClauses.Count;
+            int preTotalComb = (1 << pm) - 1;
+            Console.WriteLine($"  Disjunctive precondition: {pm} branches -> {preTotalComb} combinations");
+
+            for (int mask = 1; mask <= preTotalComb; mask++)
             {
-                boundaryTiersPerBranch[pi] = BuildBoundaryTiers(inputs, preClauses, method, verbose, tierCount, preDnfClauses[pi]);
+                var included = new List<int>();
+                for (int bit = 0; bit < pm; bit++)
+                    if ((mask & (1 << bit)) != 0)
+                        included.Add(bit);
+
+                var label = "P{" + string.Join(",", included.Select(i => (i + 1).ToString())) + "}";
+
+                var mergedPreLits = new List<string>();
+                foreach (var idx in included)
+                    foreach (var lit in preDnfClauses[idx])
+                        if (!mergedPreLits.Contains(lit))
+                            mergedPreLits.Add(lit);
+
+                var preExclusions = new List<string>();
+                for (int bit = 0; bit < pm; bit++)
+                {
+                    if ((mask & (1 << bit)) != 0) continue;
+                    foreach (var lit in preDnfClauses[bit])
+                    {
+                        if (!preCommonLiterals.Contains(lit) && !mergedPreLits.Contains(lit) && !preExclusions.Contains(lit))
+                            preExclusions.Add(lit);
+                    }
+                }
+
+                preCombinations.Add((label, mergedPreLits, preExclusions));
             }
-            var tierCount0 = boundaryTiersPerBranch[0].Count;
-            Console.WriteLine($"  Boundary mode: {tierCount0} boundary tiers generated");
+        }
+        else
+        {
+            // Single precondition branch, no exclusions
+            preCombinations.Add(("", preDnfClauses[0], new List<string>()));
         }
 
-        // Build test schedule: list of (label, postLiterals, preLiterals, excludedLiterals, extraConstraints)
+        // Build boundary tiers per precondition combination if requested
+        var boundaryTiersPerPre = new Dictionary<int, List<(string tierLabel, List<string> tierConstraints)>>();
+        if (boundary)
+        {
+            for (int pi = 0; pi < preCombinations.Count; pi++)
+            {
+                boundaryTiersPerPre[pi] = BuildBoundaryTiers(inputs, preClauses, method, verbose, tierCount, preCombinations[pi].preLits);
+            }
+            Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
+        }
+
+        // Build test schedule: list of (label, postLiterals, preLiterals+preExclusions, postExclusions, extraConstraints)
         var testSchedule = new List<(string label, List<string> literals, List<string> preLiterals, List<string> exclusions, List<string> extraConstraints)>();
 
-        // Iterate over precondition branches (for non-disjunctive pre, just one branch)
-        for (int pi = 0; pi < preDnfClauses.Count; pi++)
+        // Cross-product: precondition combinations × postcondition schedule
+        for (int pi = 0; pi < preCombinations.Count; pi++)
         {
-            var preLits = preDnfClauses[pi];
-            var preLabel = hasDisjunctivePre ? $"P{pi + 1}/" : "";
-            var boundaryTiers = boundary ? boundaryTiersPerBranch[pi] : new List<(string, List<string>)>();
+            var (preLabel, preLits, preExclusions) = preCombinations[pi];
+            // Build full pre literals: positive assertions + negated exclusions
+            var fullPreLits = new List<string>(preLits);
+            foreach (var excl in preExclusions)
+                fullPreLits.Add($"!({excl})");
+            var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
+            var boundaryTiers = boundary ? boundaryTiersPerPre[pi] : new List<(string, List<string>)>();
 
             if (allCombinations)
             {
@@ -970,7 +1023,7 @@ class Program
                 int n = dnfClauses.Count;
                 int totalCombinations = (1 << n) - 1; // 2^n - 1
                 if (pi == 0)
-                    Console.WriteLine($"  All-combinations mode: {n} clauses -> {totalCombinations} combinations");
+                    Console.WriteLine($"  All-combinations mode: {n} post clauses -> {totalCombinations} combinations");
 
                 for (int mask = 1; mask <= totalCombinations; mask++)
                 {
@@ -979,7 +1032,7 @@ class Program
                         if ((mask & (1 << bit)) != 0)
                             included.Add(bit);
 
-                    var label = preLabel + "{" + string.Join(",", included.Select(i => (i + 1).ToString())) + "}";
+                    var label = fullPreLabel + "{" + string.Join(",", included.Select(i => (i + 1).ToString())) + "}";
 
                     var mergedLiterals = new List<string>();
                     foreach (var idx in included)
@@ -1001,11 +1054,11 @@ class Program
                     if (boundary && boundaryTiers.Count > 0)
                     {
                         foreach (var (tierLabel, tierConstraints) in boundaryTiers)
-                            testSchedule.Add(($"{label}/B{tierLabel}", mergedLiterals, preLits, exclusions, tierConstraints));
+                            testSchedule.Add(($"{label}/B{tierLabel}", mergedLiterals, fullPreLits, exclusions, tierConstraints));
                     }
                     else
                     {
-                        testSchedule.Add((label, mergedLiterals, preLits, exclusions, new List<string>()));
+                        testSchedule.Add((label, mergedLiterals, fullPreLits, exclusions, new List<string>()));
                     }
                 }
             }
@@ -1015,7 +1068,7 @@ class Program
                 for (int ci = 0; ci < dnfClauses.Count; ci++)
                 {
                     var clause = dnfClauses[ci];
-                    var label = $"{preLabel}{ci + 1}";
+                    var label = $"{fullPreLabel}{ci + 1}";
 
                     var exclusions = new List<string>();
                     for (int oi = 0; oi < dnfClauses.Count; oi++)
@@ -1031,11 +1084,11 @@ class Program
                     if (boundary && boundaryTiers.Count > 0)
                     {
                         foreach (var (tierLabel, tierConstraints) in boundaryTiers)
-                            testSchedule.Add(($"{label}/B{tierLabel}", clause, preLits, exclusions, tierConstraints));
+                            testSchedule.Add(($"{label}/B{tierLabel}", clause, fullPreLits, exclusions, tierConstraints));
                     }
                     else
                     {
-                        testSchedule.Add((label, clause, preLits, exclusions, new List<string>()));
+                        testSchedule.Add((label, clause, fullPreLits, exclusions, new List<string>()));
                     }
                 }
             }
