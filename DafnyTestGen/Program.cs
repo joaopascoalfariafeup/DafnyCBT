@@ -2387,6 +2387,14 @@ class Program
                     // Ensure real output values have a decimal point
                     if (typeStr == "real" && !val.Contains('.'))
                         val += ".0";
+                    // Format char output as Dafny char literal
+                    if (typeStr == "char" && int.TryParse(val, out var charCode))
+                    {
+                        if (charCode >= 32 && charCode < 127 && charCode != '\'')
+                            val = $"'{(char)charCode}'";
+                        else
+                            val = $"'\\U{{{charCode:X4}}}'";
+                    }
                     sb.AppendLine($"    expect {outp.Name} == {val};");
                 }
                 else if (IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr)
