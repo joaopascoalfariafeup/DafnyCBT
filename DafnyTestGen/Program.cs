@@ -2017,6 +2017,15 @@ class Program
                     result[name] = NormalizeZ3Real(realMatch.Groups[1].Value);
                 }
             }
+            else if (type == "bool")
+            {
+                var pattern = new Regex(@$"define-fun\s+{Regex.Escape(name)}\s+\(\)\s+Bool\s*\n?\s*(true|false)");
+                var match = pattern.Match(fullText);
+                if (match.Success)
+                {
+                    result[name] = match.Groups[1].Value;
+                }
+            }
             else
             {
                 var pattern = new Regex(@$"define-fun\s+{Regex.Escape(name)}\s+\(\)\s+\w+\s*\n?\s*([-\d]+|\(- \d+\))");
