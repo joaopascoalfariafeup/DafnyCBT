@@ -1327,9 +1327,26 @@ class Program
         sb.Append(assertions);
 
         // Assert well-formedness guards (e.g., seq index bounds)
+        // Filter out guards that reference quantifier-bound variables (not declared at top level)
+        var declaredNames = new HashSet<string>(allVars.Select(v => v.Name));
+        // Also include companion names (_len, _seq) for arrays/sequences
+        foreach (var (name, type) in allVars)
+        {
+            if (IsArrayType(type) || IsSeqType(type))
+            {
+                declaredNames.Add(name + "_len");
+                declaredNames.Add(name + "_seq");
+            }
+        }
         foreach (var guard in _wfGuards)
         {
-            sb.AppendLine($"(assert {guard})");
+            // Extract variable names from the guard and check they're all declared
+            var guardVars = Regex.Matches(guard, @"\b([a-zA-Z_]\w*)\b")
+                .Cast<Match>()
+                .Select(m => m.Value)
+                .Where(v => v != "and" && v != "or" && v != "not" && v != "seq" && v != "len" && v != "nth");
+            if (guardVars.All(v => declaredNames.Contains(v) || int.TryParse(v, out _)))
+                sb.AppendLine($"(assert {guard})");
         }
 
         // Negate exclusion literals to ensure distinct test cases
@@ -1396,6 +1413,24 @@ class Program
     static string? DafnyExprToSmt(string dafnyExpr, List<(string Name, string Type)> inputs)
     {
         var expr = dafnyExpr.Trim();
+
+        // Strip balanced outer parentheses: (expr) -> expr
+        while (expr.StartsWith("(") && expr.EndsWith(")"))
+        {
+            // Verify the parens are actually balanced outer parens, not e.g. "(a) && (b)"
+            int depth = 0;
+            bool isOuter = true;
+            for (int i = 0; i < expr.Length - 1; i++)
+            {
+                if (expr[i] == '(') depth++;
+                else if (expr[i] == ')') depth--;
+                if (depth == 0) { isOuter = false; break; }
+            }
+            if (isOuter)
+                expr = expr.Substring(1, expr.Length - 2).Trim();
+            else
+                break;
+        }
 
         // Handle negation
         if (expr.StartsWith("!(") && expr.EndsWith(")"))
@@ -1472,17 +1507,58 @@ class Program
             if (left != null && right != null) return $"(or {left} {right})";
         }
 
-        // Handle chain comparisons: 0 <= x < n, 0 <= x <= n, 0 < x < n, 0 < x <= n
-        var chainMatch = Regex.Match(expr, @"^(.+?)\s*(<=|<)\s*(\w+)\s*(<=|<)\s*(.+)$");
-        if (chainMatch.Success)
+        // Handle chain comparisons: 0 <= i < j < |s|, 0 <= x < n, etc.
+        // Split on <= and < operators to detect chains of 3+ terms
         {
-            var lo = DafnyExprToSmt(chainMatch.Groups[1].Value, inputs);
-            var op1 = chainMatch.Groups[2].Value;
-            var mid = DafnyExprToSmt(chainMatch.Groups[3].Value, inputs);
-            var op2 = chainMatch.Groups[4].Value;
-            var hi = DafnyExprToSmt(chainMatch.Groups[5].Value, inputs);
-            if (lo != null && mid != null && hi != null)
-                return $"(and ({op1} {lo} {mid}) ({op2} {mid} {hi}))";
+            var chainParts = SplitChainComparison(expr);
+            if (chainParts != null && chainParts.Count >= 3)
+            {
+                var smtParts = new List<string>();
+                bool allOk = true;
+                for (int ci = 0; ci < chainParts.Count; ci += 2)
+                {
+                    var smt = DafnyExprToSmt(chainParts[ci], inputs);
+                    if (smt == null) { allOk = false; break; }
+                    smtParts.Add(smt);
+                }
+                if (allOk)
+                {
+                    var conjuncts = new List<string>();
+                    int termIdx = 0;
+                    for (int ci = 1; ci < chainParts.Count; ci += 2)
+                    {
+                        var op = chainParts[ci]; // "<" or "<="
+                        conjuncts.Add($"({op} {smtParts[termIdx]} {smtParts[termIdx + 1]})");
+                        termIdx++;
+                    }
+                    if (conjuncts.Count == 1) return conjuncts[0];
+                    return $"(and {string.Join(" ", conjuncts)})";
+                }
+            }
+        }
+
+        // Handle chain equalities: s[i] == s[j] == c -> (and (= s[i] s[j]) (= s[j] c))
+        {
+            var eqChain = SplitChainEquality(expr);
+            if (eqChain != null && eqChain.Count >= 3)
+            {
+                var smtTerms = new List<string>();
+                bool allOk = true;
+                foreach (var term in eqChain)
+                {
+                    var smt = DafnyExprToSmt(term, inputs);
+                    if (smt == null) { allOk = false; break; }
+                    smtTerms.Add(smt);
+                }
+                if (allOk)
+                {
+                    var conjuncts = new List<string>();
+                    for (int ci = 0; ci < smtTerms.Count - 1; ci++)
+                        conjuncts.Add($"(= {smtTerms[ci]} {smtTerms[ci + 1]})");
+                    if (conjuncts.Count == 1) return conjuncts[0];
+                    return $"(and {string.Join(" ", conjuncts)})";
+                }
+            }
         }
 
         // Handle comparison operators
@@ -1668,13 +1744,25 @@ class Program
 
     static (string left, string right)? SplitOnOperator(string expr, string op)
     {
-        // Find the operator outside of parentheses
+        // Find the operator outside of parentheses and outside quantifier scopes
         int depth = 0;
         for (int i = 0; i <= expr.Length - op.Length; i++)
         {
             if (expr[i] == '(') depth++;
             else if (expr[i] == ')') depth--;
-            else if (depth == 0 && expr.Substring(i, op.Length) == op)
+            // If we encounter "forall" or "exists" at current depth, the quantifier body
+            // extends to the end of the expression (after "::"), so skip past it.
+            else if (depth == 0 && i + 6 <= expr.Length)
+            {
+                var remaining = expr.Substring(i);
+                if ((remaining.StartsWith("forall ") || remaining.StartsWith("exists ")) &&
+                    (i == 0 || !char.IsLetterOrDigit(expr[i - 1])))
+                {
+                    // Skip to end — quantifier body extends to end of expression
+                    break;
+                }
+            }
+            if (depth == 0 && i <= expr.Length - op.Length && expr.Substring(i, op.Length) == op)
             {
                 // Make sure it's not part of a longer operator
                 bool okLeft = i == 0 || !char.IsLetterOrDigit(expr[i - 1]);
@@ -1687,6 +1775,101 @@ class Program
                         return (left, right);
                 }
             }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Splits a chain comparison like "0 <= i < j < |s|" into alternating terms and operators:
+    /// ["0", "<=", "i", "<", "j", "<", "|s|"]
+    /// Returns null if the expression is not a chain comparison (fewer than 3 terms).
+    /// </summary>
+    static List<string>? SplitChainComparison(string expr)
+    {
+        var parts = new List<string>();
+        int depth = 0;
+        int lastSplit = 0;
+
+        for (int i = 0; i < expr.Length; i++)
+        {
+            if (expr[i] == '(') depth++;
+            else if (expr[i] == ')') depth--;
+            else if (depth == 0)
+            {
+                // Check for <= first (longer match), then <
+                string? matchedOp = null;
+                if (i + 1 < expr.Length && expr[i] == '<' && expr[i + 1] == '=')
+                    matchedOp = "<=";
+                else if (expr[i] == '<' && (i + 1 >= expr.Length || expr[i + 1] != '='))
+                {
+                    // Make sure it's not part of ==> or other operators
+                    if (i > 0 && expr[i - 1] == '=') continue; // skip <=
+                    matchedOp = "<";
+                }
+                else if (i + 1 < expr.Length && expr[i] == '>' && expr[i + 1] == '=')
+                    matchedOp = ">=";
+                else if (expr[i] == '>' && (i + 1 >= expr.Length || expr[i + 1] != '='))
+                {
+                    if (i > 0 && expr[i - 1] == '=') continue; // skip >=
+                    matchedOp = ">";
+                }
+
+                if (matchedOp != null)
+                {
+                    var left = expr.Substring(lastSplit, i - lastSplit).Trim();
+                    if (left.Length == 0) return null;
+                    parts.Add(left);
+                    parts.Add(matchedOp);
+                    lastSplit = i + matchedOp.Length;
+                    i += matchedOp.Length - 1; // skip past operator
+                }
+            }
+        }
+
+        if (parts.Count >= 2) // at least one operator found
+        {
+            var last = expr.Substring(lastSplit).Trim();
+            if (last.Length == 0) return null;
+            parts.Add(last);
+            // Only return if there are 3+ terms (2+ operators), i.e. a real chain
+            int termCount = (parts.Count + 1) / 2;
+            if (termCount >= 3) return parts;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Splits a chain equality like "s[i] == s[j] == c" into terms: ["s[i]", "s[j]", "c"].
+    /// Returns null if fewer than 3 terms.
+    /// </summary>
+    static List<string>? SplitChainEquality(string expr)
+    {
+        var terms = new List<string>();
+        int depth = 0;
+        int lastSplit = 0;
+
+        for (int i = 0; i <= expr.Length - 2; i++)
+        {
+            if (expr[i] == '(') depth++;
+            else if (expr[i] == ')') depth--;
+            else if (depth == 0 && expr[i] == '=' && expr[i + 1] == '=')
+            {
+                // Make sure it's not ==>
+                if (i + 2 < expr.Length && expr[i + 2] == '>') continue;
+                var left = expr.Substring(lastSplit, i - lastSplit).Trim();
+                if (left.Length == 0) return null;
+                terms.Add(left);
+                lastSplit = i + 2;
+                i++; // skip past ==
+            }
+        }
+
+        if (terms.Count >= 2) // at least two == found
+        {
+            var last = expr.Substring(lastSplit).Trim();
+            if (last.Length == 0) return null;
+            terms.Add(last);
+            if (terms.Count >= 3) return terms;
         }
         return null;
     }
