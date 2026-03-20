@@ -1054,8 +1054,21 @@ class Program
             {
                 var smtName = SeqSmtName(name, type);
                 // Size tiers: 0, 1, ..., tierCount-1
+                // For seq/string with size > 1, add distinctness constraints on elements
+                // to help Z3 avoid spurious SAT from incomplete quantifier reasoning
                 for (int sz = 0; sz < tierCount; sz++)
-                    tiers.Add(($"{sz}", $"(= (seq.len {smtName}) {sz})"));
+                {
+                    var constraint = $"(= (seq.len {smtName}) {sz})";
+                    if (sz >= 2)
+                    {
+                        var distincts = new List<string>();
+                        for (int a = 0; a < sz; a++)
+                            for (int b = a + 1; b < sz; b++)
+                                distincts.Add($"(not (= (seq.nth {smtName} {a}) (seq.nth {smtName} {b})))");
+                        constraint = $"(and {constraint} {string.Join(" ", distincts)})";
+                    }
+                    tiers.Add(($"{sz}", constraint));
+                }
             }
             else if (type == "int" || type == "nat" || type == "T")
             {
@@ -1392,7 +1405,7 @@ class Program
         if (dafnyType == "bool") return "Bool";
         if (dafnyType == "real") return "Real";
         if (dafnyType == "char") return "Int"; // simplified
-        if (dafnyType == "string") return "String";
+        if (dafnyType == "string") return "(Seq Int)"; // model as Seq Int to avoid Unicode sort mismatch
         if (dafnyType.StartsWith("seq<")) return $"(Seq {DafnyTypeToSmt(dafnyType.Substring(4, dafnyType.Length - 5))})";
         if (dafnyType.StartsWith("array<")) return "Int"; // represent as length; actual array modeled separately
         return "Int"; // fallback
@@ -1677,6 +1690,32 @@ class Program
             if (realNum < 0)
                 return $"(- {(-realNum).ToString("G", System.Globalization.CultureInfo.InvariantCulture)})";
             return realNum.ToString("G", System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        // Char literal: 'a', '\U{0000}', '\n', etc.
+        var charLitMatch = Regex.Match(expr, @"^'(.+)'$");
+        if (charLitMatch.Success)
+        {
+            var charContent = charLitMatch.Groups[1].Value;
+            int charCode;
+            if (charContent.StartsWith("\\U{") && charContent.EndsWith("}"))
+            {
+                // Unicode escape: '\U{XXXX}'
+                var hexStr = charContent.Substring(3, charContent.Length - 4);
+                charCode = int.Parse(hexStr, System.Globalization.NumberStyles.HexNumber);
+            }
+            else if (charContent.Length == 1)
+            {
+                charCode = (int)charContent[0];
+            }
+            else if (charContent == "\\n") charCode = 10;
+            else if (charContent == "\\t") charCode = 9;
+            else if (charContent == "\\r") charCode = 13;
+            else if (charContent == "\\0") charCode = 0;
+            else if (charContent == "\\'") charCode = 39;
+            else if (charContent == "\\\\") charCode = 92;
+            else charCode = 0;
+            return charCode.ToString();
         }
 
         // Variable name (identifier)
