@@ -598,6 +598,24 @@ class Program
             }
         }
 
+        // Exists quantifier: decompose into boundary cases
+        // exists k :: lo <= k < hi && body  ->  body[k/lo] || (exists k :: lo<k<hi-1 && body) || body[k/hi-1]
+        if (!negated && expr is Microsoft.Dafny.ExistsExpr existsExpr)
+        {
+            var decomposed = TryDecomposeExists(existsExpr);
+            if (decomposed != null)
+                return decomposed;
+        }
+        // Negated exists = forall-not, negated forall = exists-not -> decompose too
+        if (negated && expr is Microsoft.Dafny.ForallExpr forallNeg)
+        {
+            // !(forall k :: range ==> body) = exists k :: range && !body
+            // We can decompose this exists into boundary cases too
+            var decomposed = TryDecomposeNegatedForall(forallNeg);
+            if (decomposed != null)
+                return decomposed;
+        }
+
         // Leaf: atomic expression
         var str = negated ? $"!({ExprToString(expr)})" : ExprToString(expr);
         return new List<List<string>> { new List<string> { str } };
@@ -616,6 +634,155 @@ class Program
             }
         }
         return result;
+    }
+
+    /// <summary>
+    /// Try to decompose an exists quantifier into boundary cases:
+    ///   exists k :: lo <= k < hi && body(k)
+    /// becomes a 3-clause disjunction:
+    ///   body[k/lo] || (exists k :: lo+1 <= k < hi-1 && body) || body[k/hi-1]
+    /// Returns null if the pattern is not recognized.
+    /// </summary>
+    static List<List<string>>? TryDecomposeExists(Microsoft.Dafny.ExistsExpr existsExpr)
+    {
+        // Only handle single bound variable
+        if (existsExpr.BoundVars.Count != 1)
+            return null;
+        var boundVar = existsExpr.BoundVars[0].Name;
+
+        // Get the full string representation and extract the body after "::"
+        var full = ExprToString(existsExpr);
+        var colonIdx = full.IndexOf("::");
+        if (colonIdx < 0) return null;
+        var body = full.Substring(colonIdx + 2).Trim();
+
+        // Try to extract range pattern: lo <= k < hi && rest
+        // Pattern: <lo> <= <var> < <hi> && <property>
+        // Also handle: <lo> <= <var> && <var> < <hi> && <property>
+        return TryDecomposeExistsBody(boundVar, body);
+    }
+
+    /// <summary>
+    /// Decompose negated forall into boundary cases:
+    ///   !(forall k :: lo <= k < hi ==> P(k))
+    /// = exists k :: lo <= k < hi && !P(k)
+    /// Then apply the same boundary decomposition.
+    /// </summary>
+    static List<List<string>>? TryDecomposeNegatedForall(Microsoft.Dafny.ForallExpr forallExpr)
+    {
+        if (forallExpr.BoundVars.Count != 1)
+            return null;
+        var boundVar = forallExpr.BoundVars[0].Name;
+
+        var full = ExprToString(forallExpr);
+        var colonIdx = full.IndexOf("::");
+        if (colonIdx < 0) return null;
+        var body = full.Substring(colonIdx + 2).Trim();
+
+        // forall k :: range ==> P(k)  →  we want exists k :: range && !P(k)
+        // Split on top-level "==>"
+        var implParts = SplitTopLevel(body, "==>");
+        if (implParts == null) return null;
+        var range = implParts.Value.left.Trim();
+        var prop = implParts.Value.right.Trim();
+
+        // Build negated exists body: range && !(prop)
+        var negBody = $"{range} && !({prop})";
+        return TryDecomposeExistsBody(boundVar, negBody);
+    }
+
+    /// <summary>
+    /// Core decomposition: given bound variable and body string of form
+    ///   "lo <= k < hi && property(k)"
+    /// produce 3 boundary clauses.
+    /// </summary>
+    static List<List<string>>? TryDecomposeExistsBody(string boundVar, string body)
+    {
+        // Pattern 1: chain comparison "lo <= k < hi && rest"
+        var chainMatch = Regex.Match(body,
+            @"^(.+?)\s*<=\s*" + Regex.Escape(boundVar) + @"\s*<\s*(.+?)\s*&&\s*(.+)$");
+        string? lo = null, hi = null, property = null;
+
+        if (chainMatch.Success)
+        {
+            lo = chainMatch.Groups[1].Value.Trim();
+            hi = chainMatch.Groups[2].Value.Trim();
+            property = chainMatch.Groups[3].Value.Trim();
+        }
+        else
+        {
+            // Pattern 2: split comparisons "lo <= k && k < hi && rest"
+            var splitMatch = Regex.Match(body,
+                @"^(.+?)\s*<=\s*" + Regex.Escape(boundVar) + @"\s*&&\s*"
+                + Regex.Escape(boundVar) + @"\s*<\s*(.+?)\s*&&\s*(.+)$");
+            if (splitMatch.Success)
+            {
+                lo = splitMatch.Groups[1].Value.Trim();
+                hi = splitMatch.Groups[2].Value.Trim();
+                property = splitMatch.Groups[3].Value.Trim();
+            }
+        }
+
+        if (lo == null || hi == null || property == null)
+            return null;
+
+        // Generate boundary substitutions
+        var loExpr = lo;  // min index value
+        var hiMinusOne = hi == "1" ? "0"
+            : (int.TryParse(hi, out var hiVal) ? (hiVal - 1).ToString()
+            : $"({hi} - 1)");  // max index value
+        var loPlus1 = lo == "0" ? "1"
+            : (int.TryParse(lo, out var loVal) ? (loVal + 1).ToString()
+            : $"({lo} + 1)");
+
+        // Clause 1 (left boundary): substitute k with lo in property
+        var leftProp = SubstBoundVar(property, boundVar, loExpr);
+        // Clause 2 (middle): keep as exists with narrowed range
+        var middleExists = $"exists {boundVar} :: {loPlus1} <= {boundVar} < {hiMinusOne} && {property}";
+        // Clause 3 (right boundary): substitute k with hi-1 in property
+        var rightProp = SubstBoundVar(property, boundVar, hiMinusOne);
+
+        return new List<List<string>>
+        {
+            new List<string> { leftProp },
+            new List<string> { middleExists },
+            new List<string> { rightProp }
+        };
+    }
+
+    /// <summary>
+    /// Substitute all occurrences of a bound variable with a replacement expression.
+    /// Uses word boundaries to avoid replacing inside other identifiers.
+    /// </summary>
+    static string SubstBoundVar(string expr, string varName, string replacement)
+    {
+        // Replace whole-word occurrences of varName
+        // Handle array indexing: a[k] -> a[replacement]
+        return Regex.Replace(expr, @"\b" + Regex.Escape(varName) + @"\b", replacement);
+    }
+
+    /// <summary>
+    /// Split an expression string on a top-level operator (not inside parens/brackets/quantifiers).
+    /// </summary>
+    static (string left, string right)? SplitTopLevel(string expr, string op)
+    {
+        int depth = 0;
+        bool inQuantifier = false;
+        for (int i = 0; i < expr.Length - op.Length + 1; i++)
+        {
+            char c = expr[i];
+            if (c == '(' || c == '[') depth++;
+            else if (c == ')' || c == ']') depth--;
+            // Skip quantifier bodies
+            if (depth == 0 && i + 2 < expr.Length && expr.Substring(i, 2) == "::")
+                inQuantifier = true;
+
+            if (depth == 0 && !inQuantifier && expr.Substring(i, op.Length) == op)
+            {
+                return (expr.Substring(0, i), expr.Substring(i + op.Length));
+            }
+        }
+        return null;
     }
 
     static string ExprToString(Expression expr)
