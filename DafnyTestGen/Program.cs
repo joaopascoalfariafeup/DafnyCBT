@@ -1531,6 +1531,9 @@ class Program
         {
             var smtType = DafnyTypeToSmt(type);
             sb.AppendLine($"(declare-const {name} {smtType})");
+            // Constrain nat-typed variables to be non-negative
+            if (type == "nat")
+                sb.AppendLine($"(assert (>= {name} 0))");
         }
 
         // For array params, declare a companion sequence and length alias
@@ -1688,7 +1691,7 @@ class Program
 
     static string DafnyTypeToSmt(string dafnyType)
     {
-        if (dafnyType == "int" || dafnyType == "T") return "Int";
+        if (dafnyType == "int" || dafnyType == "nat" || dafnyType == "T") return "Int";
         if (dafnyType == "bool") return "Bool";
         if (dafnyType == "real") return "Real";
         if (dafnyType == "char") return "Int"; // simplified
