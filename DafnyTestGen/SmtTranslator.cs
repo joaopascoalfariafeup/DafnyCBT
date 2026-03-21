@@ -83,11 +83,11 @@ static class SmtTranslator
                 sb.AppendLine($"(assert (>= (seq.len {smtName}) 0))");
                 sb.AppendLine($"(assert (<= (seq.len {smtName}) 8))");
 
-                // Constrain char elements to printable ASCII ('a'-'z')
+                // Constrain char elements to printable ASCII (32-126)
                 var elemType = TypeUtils.GetSeqElementType(type);
                 if (elemType == "char")
                 {
-                    sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 97) (<= (seq.nth {smtName} i) 122)))))");
+                    sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
                 }
             }
         }
@@ -180,14 +180,41 @@ static class SmtTranslator
                 sb.AppendLine($"(assert {guard})");
         }
 
-        // Negate exclusion literals to ensure distinct test cases
+        // Negate exclusion literals to ensure distinct test cases.
+        // Each exclusion is guarded by its well-formedness conditions (e.g., index bounds)
+        // so that exclusions don't create contradictions when elements don't exist.
         if (exclusions != null)
         {
             foreach (var excl in exclusions)
             {
+                var wfBefore = _wfGuards.Count;
                 var smtExpr = DafnyExprToSmt(excl, inputs);
                 if (smtExpr != null)
-                    sb.AppendLine($"(assert (not {smtExpr}))");
+                {
+                    // Collect WF guards generated specifically by this exclusion
+                    var exclGuards = _wfGuards.Skip(wfBefore)
+                        .Where(g =>
+                        {
+                            var gVars = Regex.Matches(g, @"\b([a-zA-Z_]\w*)\b")
+                                .Cast<Match>().Select(m => m.Value)
+                                .Where(v => v != "and" && v != "or" && v != "not" && v != "seq" && v != "len" && v != "nth");
+                            return gVars.All(v => declaredNames.Contains(v) || int.TryParse(v, out _));
+                        })
+                        .ToList();
+                    // Remove exclusion-specific guards from the global list (they shouldn't be asserted unconditionally)
+                    if (exclGuards.Count > 0)
+                    {
+                        _wfGuards.RemoveRange(wfBefore, _wfGuards.Count - wfBefore);
+                        var guard = exclGuards.Count == 1
+                            ? exclGuards[0]
+                            : $"(and {string.Join(" ", exclGuards)})";
+                        sb.AppendLine($"(assert (=> {guard} (not {smtExpr})))");
+                    }
+                    else
+                    {
+                        sb.AppendLine($"(assert (not {smtExpr}))");
+                    }
+                }
             }
         }
 
@@ -289,7 +316,33 @@ static class SmtTranslator
             if (bodySmt != null)
             {
                 var bindings = string.Join(" ", boundVars.Select(v => $"({v.name} {v.smtType})"));
-                return $"({quantifier} ({bindings}) {bodySmt})";
+                var result = $"({quantifier} ({bindings}) {bodySmt})";
+
+                // Add a WF guard for the quantifier's domain being non-empty.
+                // When this forall is negated as an exclusion, the guard ensures the
+                // negation (exists ...) only applies when a witness can exist.
+                // Extract range from implication body: lo <= var < hi ==> P
+                if (quantifier == "forall" && boundVars.Count == 1)
+                {
+                    var impBody = SplitOnOperator(body, "==>");
+                    if (impBody != null)
+                    {
+                        // Try to find upper bound of the form "var < hi" or "var <= hi" in the range
+                        var rangeStr = impBody.Value.left.Trim();
+                        var bvName = boundVars[0].name;
+                        // Match patterns like "0 <= k < |s|" or "lo <= k < hi"
+                        var rangeMatch = Regex.Match(rangeStr, @"(.+?)\s*<=\s*" + Regex.Escape(bvName) + @"\s*<\s*(.+)");
+                        if (rangeMatch.Success)
+                        {
+                            var lo = DafnyExprToSmt(rangeMatch.Groups[1].Value.Trim(), inputs);
+                            var hi = DafnyExprToSmt(rangeMatch.Groups[2].Value.Trim(), inputs);
+                            if (lo != null && hi != null)
+                                _wfGuards.Add($"(< {lo} {hi})");
+                        }
+                    }
+                }
+
+                return result;
             }
         }
 
@@ -401,13 +454,35 @@ static class SmtTranslator
             return $"(= (seq.nth {arrName}_seq {idxName}) {valName})";
         }
 
-        // Handle !in pattern: x !in a[..]
-        var notInMatch = Regex.Match(expr, @"^(\w+)\s+!in\s+(\w+)\[\.\.?\]$");
+        // Handle !in pattern: x !in a[..] or x !in s (seq variable)
+        var notInMatch = Regex.Match(expr, @"^(.+?)\s+!in\s+(\w+)(\[\.\.?\])?$");
         if (notInMatch.Success)
         {
-            var val = notInMatch.Groups[1].Value;
-            var arr = notInMatch.Groups[2].Value;
-            return $"(not (seq.contains {arr}_seq (seq.unit {val})))";
+            var valExpr = DafnyExprToSmt(notInMatch.Groups[1].Value.Trim(), inputs);
+            var seqName = notInMatch.Groups[2].Value;
+            var hasSlice = notInMatch.Groups[3].Success;
+            if (valExpr != null)
+            {
+                // Determine SMT seq name: arrays use name_seq, seq params use name directly
+                var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
+                var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
+                return $"(not (seq.contains {smtSeq} (seq.unit {valExpr})))";
+            }
+        }
+
+        // Handle 'in' pattern: x in a[..] or x in s
+        var inMatch = Regex.Match(expr, @"^(.+?)\s+in\s+(\w+)(\[\.\.?\])?$");
+        if (inMatch.Success)
+        {
+            var valExpr = DafnyExprToSmt(inMatch.Groups[1].Value.Trim(), inputs);
+            var seqName = inMatch.Groups[2].Value;
+            var hasSlice = inMatch.Groups[3].Success;
+            if (valExpr != null)
+            {
+                var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
+                var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
+                return $"(seq.contains {smtSeq} (seq.unit {valExpr}))";
+            }
         }
 
         // Handle a.Length

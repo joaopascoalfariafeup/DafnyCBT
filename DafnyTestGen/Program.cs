@@ -199,6 +199,11 @@ class Program
             Console.WriteLine($"[DafnyTestGen] Auto-discovered {methods.Count} method(s): {string.Join(", ", methods.Select(m => m.Name))}");
         }
 
+        // Find non-recursive predicates/functions for inlining into postconditions
+        var inlinablePredicates = DafnyParser.FindInlinablePredicates(program);
+        if (inlinablePredicates.Count > 0 && verbose)
+            Console.WriteLine($"[DafnyTestGen] Found {inlinablePredicates.Count} inlinable predicate(s): {string.Join(", ", inlinablePredicates.Select(p => p.name))}");
+
         Console.WriteLine($"[DafnyTestGen] Input:  {file.FullName}");
         Console.WriteLine($"[DafnyTestGen] Output: {outputPath}");
         Console.WriteLine();
@@ -246,7 +251,7 @@ class Program
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
             Console.WriteLine();
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, repeat);
+            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, repeat, inlinablePredicates);
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -422,9 +427,45 @@ class Program
 
     /// <summary>
     /// Generates tests by calling Z3 directly with SMT2 queries for each DNF clause.
+    /// Removes complementary exclusions: if both L and !(L) appear, negating both
+    /// would create a contradiction. Drop both members of any complementary pair.
+    /// </summary>
+    static List<string> FilterComplementaryExclusions(List<string> exclusions)
+    {
+        var toRemove = new HashSet<int>();
+        for (int i = 0; i < exclusions.Count; i++)
+        {
+            for (int j = i + 1; j < exclusions.Count; j++)
+            {
+                if (AreComplementary(exclusions[i], exclusions[j]))
+                {
+                    toRemove.Add(i);
+                    toRemove.Add(j);
+                }
+            }
+        }
+        if (toRemove.Count == 0) return exclusions;
+        return exclusions.Where((_, idx) => !toRemove.Contains(idx)).ToList();
+    }
+
+    /// <summary>
+    /// Checks if two literals are complementary: L and !(L), or !(L) and L.
+    /// </summary>
+    static bool AreComplementary(string a, string b)
+    {
+        // Check if a == !(b) or b == !(a)
+        if (a == $"!({b})" || b == $"!({a})") return true;
+        // Also handle the case without parens: !(expr) vs expr
+        if (a.StartsWith("!(") && a.EndsWith(")") && a.Substring(2, a.Length - 3) == b) return true;
+        if (b.StartsWith("!(") && b.EndsWith(")") && b.Substring(2, b.Length - 3) == a) return true;
+        return false;
+    }
+
+    /// <summary>
     /// For each test condition (PRE && POST_clause), we ask Z3 to find satisfying values.
     /// </summary>
-    static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1)
+    static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
+        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null)
     {
         var z3Path = @"C:\Users\jpf\.vscode\extensions\dafny-lang.ide-vscode-3.5.2\out\resources\4.11.0\github\dafny\z3\bin\z3-4.12.1.exe";
 
@@ -433,6 +474,15 @@ class Program
         var dnfClauses = DnfEngine.ExprToDnf(ensuresClauses[0]);
         for (int i = 1; i < ensuresClauses.Count; i++)
             dnfClauses = DnfEngine.CrossProduct(dnfClauses, DnfEngine.ExprToDnf(ensuresClauses[i]));
+
+        // Keep original DNF clauses for expect emission, create inlined versions for SMT translation
+        var originalDnfClauses = dnfClauses;
+        if (inlinablePredicates != null && inlinablePredicates.Count > 0)
+        {
+            dnfClauses = dnfClauses.Select(clause =>
+                clause.Select(lit => DafnyParser.InlinePredicates(lit, inlinablePredicates)).ToList()
+            ).ToList();
+        }
 
         var preClauses = method.Req.Select(r => r.E).ToList();
 
@@ -445,6 +495,13 @@ class Program
         }
         // Remove the empty "true" elements from single-clause results
         preDnfClauses = preDnfClauses.Select(c => c.Where(s => s.Length > 0).ToList()).ToList();
+        // Inline predicates in precondition literals too
+        if (inlinablePredicates != null && inlinablePredicates.Count > 0)
+        {
+            preDnfClauses = preDnfClauses.Select(clause =>
+                clause.Select(lit => DafnyParser.InlinePredicates(lit, inlinablePredicates)).ToList()
+            ).ToList();
+        }
         bool hasDisjunctivePre = preDnfClauses.Count > 1;
         if (hasDisjunctivePre)
             Console.WriteLine($"  Disjunctive precondition: {preDnfClauses.Count} branches");
@@ -572,6 +629,9 @@ class Program
                                 exclusions.Add(lit);
                         }
                     }
+                    // Remove complementary exclusions: if both L and !(L) are exclusions,
+                    // negating both creates a contradiction. Drop both.
+                    exclusions = FilterComplementaryExclusions(exclusions);
 
                     if (boundary && boundaryTiers.Count > 0)
                     {
@@ -602,6 +662,7 @@ class Program
                                 exclusions.Add(lit);
                         }
                     }
+                    exclusions = FilterComplementaryExclusions(exclusions);
 
                     if (boundary && boundaryTiers.Count > 0)
                     {
@@ -795,8 +856,22 @@ class Program
         // Check if output values from Z3 may be unreliable (uninterpreted functions or untranslated postconditions)
         bool hasUninterpFuncs = SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
+        // Restore original (non-inlined) literals for expect emission.
+        // Inlined versions were needed for SMT translation; originals are needed for valid Dafny expects.
+        if (inlinablePredicates != null && inlinablePredicates.Count > 0)
+        {
+            var inlinedToOriginal = new Dictionary<string, string>();
+            for (int ci = 0; ci < originalDnfClauses.Count && ci < dnfClauses.Count; ci++)
+                for (int li = 0; li < originalDnfClauses[ci].Count && li < dnfClauses[ci].Count; li++)
+                    inlinedToOriginal[dnfClauses[ci][li]] = originalDnfClauses[ci][li];
+
+            deduped = deduped.Select(tc => (tc.label, tc.values,
+                tc.literals.Select(lit => inlinedToOriginal.TryGetValue(lit, out var orig) ? orig : lit).ToList()
+            )).ToList();
+        }
+
         // Emit Dafny test file
-        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, deduped, dnfClauses, preClauses, hasArrayParam, hasUninterpFuncs);
+        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, deduped, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs);
     }
 
 }

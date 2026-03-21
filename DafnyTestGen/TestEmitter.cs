@@ -196,7 +196,7 @@ static class TestEmitter
                     // Emit as a char sequence literal: ['a', 'b', 'c']
                     var charElems = elems.Select(e =>
                     {
-                        if (int.TryParse(e, out var code) && code >= 32 && code < 127 && code != '\'')
+                        if (int.TryParse(e, out var code) && code >= 32 && code < 127 && code != '\'' && code != '\\')
                             return $"'{(char)code}'";
                         return $"'\\U{{{(int.TryParse(e, out var c) ? c : 0):X4}}}'"; // Dafny Unicode escape: \U{XXXX}
                     });
@@ -218,10 +218,18 @@ static class TestEmitter
             // Ensure real values have a decimal point (Dafny requires e.g. 0.0, not 0)
             if (typeStr == "real" && !val.Contains('.'))
                 val += ".0";
+            // Format char values as Dafny char literals
+            if (typeStr == "char" && int.TryParse(val, out var charCode))
+            {
+                if (charCode >= 32 && charCode < 127 && charCode != '\'' && charCode != '\\')
+                    val = $"'{(char)charCode}'";
+                else
+                    val = $"'\\U{{{charCode:X4}}}'";
+            }
             return $"    var {name} := {val};";
         }
 
-        var defaultVal = typeStr == "real" ? "0.0" : "0";
+        var defaultVal = typeStr switch { "real" => "0.0", "char" => "' '", "bool" => "false", _ => "0" };
         return $"    var {name} := {defaultVal}; // Z3 did not assign a value";
     }
 
@@ -333,7 +341,7 @@ static class TestEmitter
                     // Format char output as Dafny char literal
                     if (typeStr == "char" && int.TryParse(val, out var charCode))
                     {
-                        if (charCode >= 32 && charCode < 127 && charCode != '\'')
+                        if (charCode >= 32 && charCode < 127 && charCode != '\'' && charCode != '\\')
                             val = $"'{(char)charCode}'";
                         else
                             val = $"'\\U{{{charCode:X4}}}'";
@@ -355,7 +363,7 @@ static class TestEmitter
                     {
                         var charElems = elems.Take(seqLen).Select(e =>
                         {
-                            if (int.TryParse(e, out var code) && code >= 32 && code < 127 && code != '\'')
+                            if (int.TryParse(e, out var code) && code >= 32 && code < 127 && code != '\'' && code != '\\')
                                 return $"'{(char)code}'";
                             return $"'\\U{{{(int.TryParse(e, out var c) ? c : 0):X4}}}'";
                         });

@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using Microsoft.Dafny;
 
 namespace DafnyTestGen;
@@ -71,6 +72,88 @@ static class DafnyParser
                         result.Add(m);
                 }
             }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Finds non-recursive predicates and functions that can be inlined into postcondition literals.
+    /// Returns a list of (name, paramNames, bodyString) for each inlinable predicate/function.
+    /// </summary>
+    internal static List<(string name, List<string> paramNames, string body)> FindInlinablePredicates(
+        Microsoft.Dafny.Program program)
+    {
+        var result = new List<(string name, List<string> paramNames, string body)>();
+        foreach (var topDecl in AllTopLevelDecls(program))
+        {
+            if (topDecl is TopLevelDeclWithMembers cls)
+            {
+                foreach (var member in cls.Members)
+                {
+                    if (member is Function func && func.Body != null)
+                    {
+                        var bodyStr = DnfEngine.ExprToString(func.Body);
+                        // Skip recursive functions (body references the function name)
+                        if (bodyStr.Contains(func.Name + "(")) continue;
+                        var paramNames = func.Ins.Select(p => p.Name).ToList();
+                        result.Add((func.Name, paramNames, bodyStr));
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Inlines non-recursive predicate/function calls in a literal string.
+    /// E.g., "IsDigit(s[i])" with predicate IsDigit(c) = '0' <= c <= '9'
+    /// becomes "('0' <= s[i] <= '9')".
+    /// Applies repeatedly to handle nested inlining (up to a depth limit).
+    /// </summary>
+    internal static string InlinePredicates(string literal,
+        List<(string name, List<string> paramNames, string body)> predicates)
+    {
+        var result = literal;
+        for (int pass = 0; pass < 3; pass++) // max 3 inlining passes for nested calls
+        {
+            var changed = false;
+            foreach (var (name, paramNames, body) in predicates)
+            {
+                // Find occurrences of name(args...)
+                var pattern = @"\b" + Regex.Escape(name) + @"\s*\(";
+                while (Regex.IsMatch(result, pattern))
+                {
+                    var match = Regex.Match(result, pattern);
+                    int argsStart = match.Index + match.Length;
+
+                    // Find the closing paren and extract the arguments string
+                    int depth = 1, pos = argsStart;
+                    while (pos < result.Length && depth > 0)
+                    {
+                        if (result[pos] == '(') depth++;
+                        else if (result[pos] == ')') depth--;
+                        pos++;
+                    }
+                    if (depth != 0) break;
+
+                    var argsStr = result.Substring(argsStart, pos - 1 - argsStart);
+                    var args = SmtTranslator.SplitArgs(argsStr);
+                    if (args.Count != paramNames.Count)
+                        break; // can't inline this call
+
+                    // Build substituted body
+                    var inlined = body;
+                    for (int p = 0; p < paramNames.Count; p++)
+                    {
+                        inlined = Regex.Replace(inlined, @"\b" + Regex.Escape(paramNames[p]) + @"\b", args[p].Trim());
+                    }
+
+                    // Replace the call with parenthesized inlined body
+                    result = result.Substring(0, match.Index) + "(" + inlined + ")" + result.Substring(pos);
+                    changed = true;
+                }
+            }
+            if (!changed) break;
         }
         return result;
     }
