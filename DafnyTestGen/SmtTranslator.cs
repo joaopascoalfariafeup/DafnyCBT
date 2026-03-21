@@ -361,6 +361,34 @@ static class SmtTranslator
             if (left != null && right != null) return $"(=> {left} {right})";
         }
 
+        // Handle if-then-else: "if cond then thenExpr else elseExpr" -> (ite cond then else)
+        {
+            var ifMatch = Regex.Match(expr, @"^if\s+(.+)$");
+            if (ifMatch.Success)
+            {
+                var rest = ifMatch.Groups[1].Value;
+                // Find " then " at depth 0
+                var thenIdx = FindKeywordAtDepth0(rest, " then ");
+                if (thenIdx >= 0)
+                {
+                    var cond = rest.Substring(0, thenIdx).Trim();
+                    var afterThen = rest.Substring(thenIdx + 6).Trim();
+                    // Find " else " at depth 0
+                    var elseIdx = FindKeywordAtDepth0(afterThen, " else ");
+                    if (elseIdx >= 0)
+                    {
+                        var thenExpr = afterThen.Substring(0, elseIdx).Trim();
+                        var elseExpr = afterThen.Substring(elseIdx + 6).Trim();
+                        var condSmt = DafnyExprToSmt(cond, inputs);
+                        var thenSmt = DafnyExprToSmt(thenExpr, inputs);
+                        var elseSmt = DafnyExprToSmt(elseExpr, inputs);
+                        if (condSmt != null && thenSmt != null && elseSmt != null)
+                            return $"(ite {condSmt} {thenSmt} {elseSmt})";
+                    }
+                }
+            }
+        }
+
         // Handle && and || first (lower precedence than comparisons)
         var andParts = SplitOnOperator(expr, "&&");
         if (andParts != null)
@@ -730,6 +758,23 @@ static class SmtTranslator
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// Finds a keyword string (e.g., " then ", " else ") at parenthesis depth 0.
+    /// Returns the index within expr, or -1 if not found.
+    /// </summary>
+    static int FindKeywordAtDepth0(string expr, string keyword)
+    {
+        int depth = 0;
+        for (int i = 0; i <= expr.Length - keyword.Length; i++)
+        {
+            if (expr[i] == '(') depth++;
+            else if (expr[i] == ')') depth--;
+            else if (depth == 0 && expr.Substring(i, keyword.Length) == keyword)
+                return i;
+        }
+        return -1;
     }
 
     /// <summary>

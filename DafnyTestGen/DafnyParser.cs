@@ -141,11 +141,39 @@ static class DafnyParser
                     if (args.Count != paramNames.Count)
                         break; // can't inline this call
 
-                    // Build substituted body
+                    // Build substituted body, handling lambda arguments via beta-reduction
                     var inlined = body;
                     for (int p = 0; p < paramNames.Count; p++)
                     {
-                        inlined = Regex.Replace(inlined, @"\b" + Regex.Escape(paramNames[p]) + @"\b", args[p].Trim());
+                        var arg = args[p].Trim();
+                        var lambdaMatch = Regex.Match(arg, @"^(\w+)\s*=>\s*(.+)$");
+                        if (lambdaMatch.Success)
+                        {
+                            // Lambda argument: beta-reduce paramName(expr) -> lambdaBody[lambdaVar := expr]
+                            var lambdaVar = lambdaMatch.Groups[1].Value;
+                            var lambdaBody = lambdaMatch.Groups[2].Value;
+                            var callPattern = @"\b" + Regex.Escape(paramNames[p]) + @"\s*\(";
+                            while (Regex.IsMatch(inlined, callPattern))
+                            {
+                                var callMatch = Regex.Match(inlined, callPattern);
+                                int callArgsStart = callMatch.Index + callMatch.Length;
+                                int callDepth = 1, callPos = callArgsStart;
+                                while (callPos < inlined.Length && callDepth > 0)
+                                {
+                                    if (inlined[callPos] == '(') callDepth++;
+                                    else if (inlined[callPos] == ')') callDepth--;
+                                    callPos++;
+                                }
+                                if (callDepth != 0) break;
+                                var callArg = inlined.Substring(callArgsStart, callPos - 1 - callArgsStart).Trim();
+                                var reduced = Regex.Replace(lambdaBody, @"\b" + Regex.Escape(lambdaVar) + @"\b", callArg);
+                                inlined = inlined.Substring(0, callMatch.Index) + "(" + reduced + ")" + inlined.Substring(callPos);
+                            }
+                        }
+                        else
+                        {
+                            inlined = Regex.Replace(inlined, @"\b" + Regex.Escape(paramNames[p]) + @"\b", arg);
+                        }
                     }
 
                     // Replace the call with parenthesized inlined body
