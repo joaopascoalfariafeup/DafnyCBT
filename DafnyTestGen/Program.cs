@@ -2690,12 +2690,17 @@ class Program
 
     /// <summary>
     /// Extracts all old(expr) occurrences from postcondition literals and returns
-    /// a list of (innerExpr, captureVarName) pairs for pre-call capture.
-    /// E.g., old(a[..]) -> ("a[..]", "old_a_seq")
+    /// a list of (innerExpr, captureVarName, isArrayCapture) triples for pre-call capture.
+    /// When old(a[indexExpr]) references an array parameter, the entire array is captured
+    /// as a sequence (a[..]) so that quantifier-bound indices work correctly.
+    /// E.g., old(a[k + 1]) with array param 'a' -> ("a[..]", "old_a", true)
+    /// E.g., old(a[0]) with array param 'a' -> ("a[..]", "old_a", true)
+    /// E.g., old(x) -> ("x", "old_x", false)
     /// </summary>
-    static List<(string innerExpr, string varName)> ExtractOldCaptures(List<string> literals)
+    static List<(string innerExpr, string varName, bool isArrayCapture)> ExtractOldCaptures(
+        List<string> literals, HashSet<string> arrayParamNames)
     {
-        var captures = new Dictionary<string, string>(); // innerExpr -> varName
+        var captures = new Dictionary<string, (string varName, bool isArray)>(); // captureExpr -> (varName, isArray)
         foreach (var lit in literals)
         {
             foreach (Match m in Regex.Matches(lit, @"\bold\s*\("))
@@ -2713,7 +2718,18 @@ class Program
                 if (depth == 0)
                 {
                     var innerExpr = lit.Substring(start, pos - 1 - start).Trim();
-                    if (!captures.ContainsKey(innerExpr))
+
+                    // Check if this is an array access: arrayName[indexExpr]
+                    var arrayAccessMatch = Regex.Match(innerExpr, @"^(\w+)\[");
+                    if (arrayAccessMatch.Success && arrayParamNames.Contains(arrayAccessMatch.Groups[1].Value))
+                    {
+                        // Consolidate all old(a[...]) into a single capture of a[..]
+                        var arrayName = arrayAccessMatch.Groups[1].Value;
+                        var captureExpr = arrayName + "[..]";
+                        if (!captures.ContainsKey(captureExpr))
+                            captures[captureExpr] = ("old_" + arrayName, true);
+                    }
+                    else if (!captures.ContainsKey(innerExpr))
                     {
                         // Generate a clean variable name from the expression
                         var varName = "old_" + Regex.Replace(innerExpr, @"[^a-zA-Z0-9_]", "_")
@@ -2721,29 +2737,74 @@ class Program
                         // Deduplicate variable names
                         var baseName = varName;
                         int suffix = 2;
-                        while (captures.Values.Contains(varName))
+                        while (captures.Values.Any(v => v.varName == varName))
                         {
                             varName = baseName + suffix;
                             suffix++;
                         }
-                        captures[innerExpr] = varName;
+                        captures[innerExpr] = (varName, false);
                     }
                 }
             }
         }
-        return captures.Select(kv => (kv.Key, kv.Value)).ToList();
+        return captures.Select(kv => (kv.Key, kv.Value.varName, kv.Value.isArray)).ToList();
     }
 
     /// <summary>
     /// Replaces old(expr) references in a literal with the corresponding capture variable name.
+    /// For array captures, old(a[indexExpr]) is replaced with old_a[indexExpr].
+    /// For non-array captures, old(expr) is replaced with varName.
     /// </summary>
-    static string ReplaceOldReferences(string literal, List<(string innerExpr, string varName)> oldCaptures)
+    static string ReplaceOldReferences(string literal,
+        List<(string innerExpr, string varName, bool isArrayCapture)> oldCaptures,
+        HashSet<string> arrayParamNames)
     {
         var result = literal;
-        foreach (var (innerExpr, varName) in oldCaptures)
+
+        // First handle array captures: old(arrayName[...]) -> old_arrayName[...]
+        foreach (var (_, varName, isArrayCapture) in oldCaptures)
         {
-            // Replace old(innerExpr) with varName, handling possible whitespace after 'old'
-            // Use balanced paren matching to find exact old(innerExpr) occurrences
+            if (!isArrayCapture) continue;
+            // Extract the array name from varName (old_arrayName -> arrayName)
+            var arrayName = varName.Substring(4); // remove "old_" prefix
+
+            // Replace all old(arrayName[...]) occurrences, preserving the index expression
+            // Use balanced paren matching to correctly handle nested brackets
+            var pattern = @"\bold\s*\(" + Regex.Escape(arrayName) + @"\[";
+            while (Regex.IsMatch(result, pattern))
+            {
+                var match = Regex.Match(result, pattern);
+                // Find the matching closing paren of old(...)
+                int afterOpen = match.Index + match.Length; // position after 'arrayName['
+                int depth = 1; // we're inside the '[' already
+                int bracketPos = afterOpen;
+                // First find end of the bracket expression
+                while (bracketPos < result.Length && depth > 0)
+                {
+                    if (result[bracketPos] == '[') depth++;
+                    else if (result[bracketPos] == ']') depth--;
+                    bracketPos++;
+                }
+                // Now we need to find and remove the closing ')' of old(...)
+                // Skip any whitespace after ']'
+                int closePos = bracketPos;
+                while (closePos < result.Length && result[closePos] == ' ') closePos++;
+                if (closePos < result.Length && result[closePos] == ')')
+                {
+                    // Extract the index expression
+                    var indexExpr = result.Substring(afterOpen, bracketPos - 1 - afterOpen);
+                    // Replace: old(a[indexExpr]) -> old_a[indexExpr]
+                    result = result.Substring(0, match.Index) + varName + "[" + indexExpr + "]" +
+                             result.Substring(closePos + 1);
+                }
+                else break; // safety: avoid infinite loop
+            }
+        }
+
+        // Then handle non-array captures: old(expr) -> varName
+        foreach (var (innerExpr, varName, isArrayCapture) in oldCaptures)
+        {
+            if (isArrayCapture) continue;
             var pattern = @"\bold\s*\(" + Regex.Escape(innerExpr) + @"\)";
             result = Regex.Replace(result, pattern, varName);
         }
@@ -2852,6 +2913,10 @@ class Program
         sb.AppendLine($"method GeneratedTests_{methodName}()");
         sb.AppendLine("{");
 
+        // Collect array parameter names for old() capture handling
+        var arrayParamNames = new HashSet<string>(
+            method.Ins.Where(inp => IsArrayType(inp.Type.ToString())).Select(inp => inp.Name));
+
         foreach (var (label, values, literals) in testCases)
         {
             sb.AppendLine($"  // Test case for combination {label}:");
@@ -2873,10 +2938,10 @@ class Program
             }
 
             // Capture old() expressions before the method call.
-            // For each old(expr) found in postcondition literals, emit a variable
-            // capturing the pre-call value, e.g.: var old_a_seq := a[..];
-            var oldCaptures = ExtractOldCaptures(literals);
-            foreach (var (oldExpr, varName) in oldCaptures)
+            // For array params, capture the whole array as a sequence (a[..])
+            // so quantifier-bound indices like old(a[k+1]) work correctly.
+            var oldCaptures = ExtractOldCaptures(literals, arrayParamNames);
+            foreach (var (oldExpr, varName, _) in oldCaptures)
             {
                 sb.AppendLine($"    var {varName} := {oldExpr};");
             }
@@ -2895,7 +2960,7 @@ class Program
             // Replace old() references in literals for expect statements
             var expectLiterals = literals
                 .Where(lit => !IsSpecOnlyLiteral(lit))
-                .Select(lit => ReplaceOldReferences(lit, oldCaptures))
+                .Select(lit => ReplaceOldReferences(lit, oldCaptures, arrayParamNames))
                 .ToList();
 
             // Emit expect assertions
