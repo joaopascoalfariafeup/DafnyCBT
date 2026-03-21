@@ -58,6 +58,12 @@ static class SmtTranslator
             // Constrain nat-typed variables to be non-negative
             if (type == "nat")
                 sb.AppendLine($"(assert (>= {name} 0))");
+            // Constrain standalone char variables to printable ASCII (32-126)
+            if (type == "char")
+            {
+                sb.AppendLine($"(assert (>= {name} 32))");
+                sb.AppendLine($"(assert (<= {name} 126))");
+            }
         }
 
         // For array params, declare a companion sequence and length alias
@@ -552,21 +558,36 @@ static class SmtTranslator
             return $"{arrToSeqMatch.Groups[1].Value}_seq";
         }
 
-        // Handle arithmetic operators: +, -, *, /, %
-        // Must come after comparisons but before literals/identifiers
-        var arithOps = new[] { ("+", "+"), ("-", "-"), ("*", "*"), ("/", "div"), ("%", "mod") };
-        foreach (var (dOp, sOp) in arithOps)
+        // Handle arithmetic operators with correct left-associativity.
+        // Same-precedence operators must split on the RIGHTMOST occurrence so that
+        // "a * b / c" becomes (div (* a b) c), not (* a (div b c)).
+        // Additive level: +, - (lower precedence, tried first)
         {
-            var parts = SplitOnOperator(expr, dOp);
-            if (parts != null)
+            var addResult = SplitOnRightmostOfAny(expr, new[] { "+", "-" });
+            if (addResult != null)
             {
-                var left = DafnyExprToSmt(parts.Value.left, inputs);
-                var right = DafnyExprToSmt(parts.Value.right, inputs);
+                var (leftStr, op, rightStr) = addResult.Value;
+                var left = DafnyExprToSmt(leftStr, inputs);
+                var right = DafnyExprToSmt(rightStr, inputs);
                 if (left != null && right != null)
                 {
-                    // For '+', detect sequence operands and use seq.++ instead of arithmetic +
-                    if (dOp == "+" && (IsSeqExpr(parts.Value.left, inputs) || IsSeqExpr(parts.Value.right, inputs)))
+                    if (op == "+" && (IsSeqExpr(leftStr, inputs) || IsSeqExpr(rightStr, inputs)))
                         return $"(seq.++ {left} {right})";
+                    return $"({op} {left} {right})";
+                }
+            }
+        }
+        // Multiplicative level: *, /, % (higher precedence)
+        {
+            var mulResult = SplitOnRightmostOfAny(expr, new[] { "*", "/", "%" });
+            if (mulResult != null)
+            {
+                var (leftStr, op, rightStr) = mulResult.Value;
+                var left = DafnyExprToSmt(leftStr, inputs);
+                var right = DafnyExprToSmt(rightStr, inputs);
+                if (left != null && right != null)
+                {
+                    var sOp = op switch { "/" => "div", "%" => "mod", _ => op };
                     return $"({sOp} {left} {right})";
                 }
             }
@@ -707,6 +728,62 @@ static class SmtTranslator
                         return (left, right);
                 }
             }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Finds the rightmost occurrence of any operator from the given set at depth 0.
+    /// This ensures left-associativity for same-precedence operators:
+    /// "a * b / c" splits into ("a * b", "/", "c") instead of ("a", "*", "b / c").
+    /// </summary>
+    internal static (string left, string op, string right)? SplitOnRightmostOfAny(string expr, string[] ops)
+    {
+        int depth = 0;
+        int bestPos = -1;
+        string? bestOp = null;
+
+        for (int i = 0; i <= expr.Length - 1; i++)
+        {
+            if (expr[i] == '(') depth++;
+            else if (expr[i] == ')') depth--;
+            else if (depth == 0 && i + 6 <= expr.Length)
+            {
+                var remaining = expr.Substring(i);
+                if ((remaining.StartsWith("forall ") || remaining.StartsWith("exists ")) &&
+                    (i == 0 || !char.IsLetterOrDigit(expr[i - 1])))
+                    break;
+            }
+
+            if (depth == 0)
+            {
+                foreach (var op in ops)
+                {
+                    if (i <= expr.Length - op.Length && expr.Substring(i, op.Length) == op)
+                    {
+                        bool okLeft = i == 0 || !char.IsLetterOrDigit(expr[i - 1]);
+                        bool okRight = i + op.Length >= expr.Length || !char.IsLetterOrDigit(expr[i + op.Length]);
+                        if (op.All(c => !char.IsLetterOrDigit(c)) || (okLeft && okRight))
+                        {
+                            var left = expr.Substring(0, i).Trim();
+                            var right = expr.Substring(i + op.Length).Trim();
+                            if (left.Length > 0 && right.Length > 0)
+                            {
+                                bestPos = i;
+                                bestOp = op;
+                                // Continue scanning to find rightmost
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (bestPos >= 0 && bestOp != null)
+        {
+            var left = expr.Substring(0, bestPos).Trim();
+            var right = expr.Substring(bestPos + bestOp.Length).Trim();
+            return (left, bestOp, right);
         }
         return null;
     }
