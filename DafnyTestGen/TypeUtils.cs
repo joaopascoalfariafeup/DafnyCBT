@@ -112,6 +112,15 @@ static class TypeUtils
                     else
                         elements.Add("0.0"); // default for real
                 }
+                else if (elemType == "bool")
+                {
+                    var elemPattern = new Regex(@$"\(\(seq\.nth\s+{Regex.Escape(smtName)}\s+{i}\)\s+(true|false)\)");
+                    var elemMatch = elemPattern.Match(fullText);
+                    if (elemMatch.Success)
+                        elements.Add(elemMatch.Groups[1].Value);
+                    else
+                        elements.Add("false"); // default for bool
+                }
                 else
                 {
                     var elemPattern = new Regex(@$"\(\(seq\.nth\s+{Regex.Escape(smtName)}\s+{i}\)\s+([-\d]+|\(- \d+\))\)");

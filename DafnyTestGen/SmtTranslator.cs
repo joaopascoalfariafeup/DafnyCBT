@@ -5,6 +5,24 @@ namespace DafnyTestGen;
 
 static class SmtTranslator
 {
+    /// <summary>
+    /// Checks if a Dafny expression likely refers to a sequence/array type in the given context.
+    /// Used to decide whether '+' should be translated as seq.++ instead of arithmetic addition.
+    /// </summary>
+    static bool IsSeqExpr(string dafnyExpr, List<(string Name, string Type)> inputs)
+    {
+        dafnyExpr = dafnyExpr.Trim();
+        // a[..] is always a sequence
+        if (dafnyExpr.EndsWith("[..]")) return true;
+        // Bare identifier that is a seq or array input
+        var match = inputs.FirstOrDefault(v => v.Name == dafnyExpr);
+        if (match != default && (TypeUtils.IsSeqType(match.Type) || TypeUtils.IsArrayType(match.Type)))
+            return true;
+        // Sequence literal [...]
+        if (dafnyExpr.StartsWith("[") && dafnyExpr.EndsWith("]")) return true;
+        return false;
+    }
+
     // Collects well-formedness guards (e.g., bounds checks for seq[i])
     // during expression translation. Caller should assert these too.
     internal static List<string> _wfGuards = new();
@@ -12,6 +30,8 @@ static class SmtTranslator
     internal static HashSet<string> _boundVars = new();
     // Tracks uninterpreted functions discovered during expression translation
     internal static Dictionary<string, int> _uninterpFuncs = new();
+    // True if any postcondition literal could not be translated to SMT
+    internal static bool _hasUntranslatedPost = false;
 
     internal static string BuildSmt2Query(
         List<(string Name, string Type)> inputs,
@@ -74,9 +94,10 @@ static class SmtTranslator
 
         sb.AppendLine();
 
-        // Reset well-formedness guards and uninterpreted functions
+        // Reset well-formedness guards, uninterpreted functions, and translation status
         _wfGuards.Clear();
         _uninterpFuncs.Clear();
+        _hasUntranslatedPost = false;
 
         // Collect assertions in a separate buffer so we can discover uninterpreted functions first
         var assertions = new System.Text.StringBuilder();
@@ -93,7 +114,10 @@ static class SmtTranslator
             if (smtExpr != null)
                 assertions.AppendLine($"(assert {smtExpr})");
             else
+            {
                 assertions.AppendLine($"; Could not translate: {literal}");
+                _hasUntranslatedPost = true;
+            }
         }
 
         // Encode preconditions
@@ -464,7 +488,12 @@ static class SmtTranslator
                 var left = DafnyExprToSmt(parts.Value.left, inputs);
                 var right = DafnyExprToSmt(parts.Value.right, inputs);
                 if (left != null && right != null)
+                {
+                    // For '+', detect sequence operands and use seq.++ instead of arithmetic +
+                    if (dOp == "+" && (IsSeqExpr(parts.Value.left, inputs) || IsSeqExpr(parts.Value.right, inputs)))
+                        return $"(seq.++ {left} {right})";
                     return $"({sOp} {left} {right})";
+                }
             }
         }
 

@@ -664,7 +664,10 @@ class Program
                 if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
                 {
                     if (values.TryGetValue(name + "_len", out var lenVal))
-                        eqParts.Add($"(= {name}_len {lenVal})");
+                    {
+                        var smtLen = TypeUtils.IsArrayType(type) ? $"{name}_len" : $"(seq.len {name})";
+                        eqParts.Add($"(= {smtLen} {lenVal})");
+                    }
                 }
                 else if (values.TryGetValue(name, out var val))
                 {
@@ -789,8 +792,8 @@ class Program
         if (deduped.Count < testCases.Count)
             Console.WriteLine($"  Deduplicated: {testCases.Count} -> {deduped.Count} unique test cases");
 
-        // Check if uninterpreted functions are involved (output values may be unreliable)
-        bool hasUninterpFuncs = SmtTranslator._uninterpFuncs.Count > 0;
+        // Check if output values from Z3 may be unreliable (uninterpreted functions or untranslated postconditions)
+        bool hasUninterpFuncs = SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
         // Emit Dafny test file
         return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, deduped, dnfClauses, preClauses, hasArrayParam, hasUninterpFuncs);

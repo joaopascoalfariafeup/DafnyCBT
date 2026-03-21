@@ -128,6 +128,17 @@ static class TestEmitter
         return result;
     }
 
+    /// <summary>
+    /// Substitutes type parameters in a type string, e.g. "seq&lt;T&gt;" -> "seq&lt;int&gt;"
+    /// </summary>
+    internal static string SubstTypeParams(string typeStr, Dictionary<string, string> typeParamMap)
+    {
+        if (typeParamMap.Count == 0) return typeStr;
+        foreach (var (param, concrete) in typeParamMap)
+            typeStr = Regex.Replace(typeStr, @"\b" + Regex.Escape(param) + @"\b", concrete);
+        return typeStr;
+    }
+
     internal static string EmitVarDecl(string name, string typeStr, Dictionary<string, string> values)
     {
         if (TypeUtils.IsArrayType(typeStr))
@@ -136,7 +147,7 @@ static class TestEmitter
                 ? typeStr.Substring(6, typeStr.Length - 7)
                 : "int";
 
-            var defaultElem = elemType == "real" ? "0.0" : "0";
+            var defaultElem = elemType == "bool" ? "false" : elemType == "real" ? "0.0" : "0";
 
             if (values.TryGetValue(name + "_len", out var lenStr) && int.TryParse(lenStr, out var len) && len >= 0)
             {
@@ -149,6 +160,10 @@ static class TestEmitter
                 // Ensure real elements have decimal points
                 if (elemType == "real")
                     elems = elems.Select(e => e.Contains('.') ? e : e + ".0").ToArray();
+
+                // Ensure bool elements are true/false (not 0/1)
+                if (elemType == "bool")
+                    elems = elems.Select(e => e == "true" ? "true" : "false").ToArray();
 
                 if (len == 0)
                     return $"    var {name} := new {elemType}[0] [];";
@@ -167,6 +182,14 @@ static class TestEmitter
                     elems = elemsStr.Split(',');
                 else
                     elems = Enumerable.Range(0, len).Select(i => "0").ToArray();
+
+                if (typeStr == "seq<bool>")
+                {
+                    elems = elems.Select(e => e == "true" ? "true" : "false").ToArray();
+                    if (len == 0)
+                        return $"    var {name}: seq<bool> := [];";
+                    return $"    var {name}: seq<bool> := [{string.Join(", ", elems)}];";
+                }
 
                 if (typeStr == "seq<char>" || typeStr == "string")
                 {
@@ -227,6 +250,17 @@ static class TestEmitter
         sb.AppendLine(testSource);
         sb.AppendLine();
 
+        // Build type parameter substitution map: T -> int (since SMT maps generics to Int)
+        var typeParamMap = new Dictionary<string, string>();
+        if (method.TypeArgs != null)
+            foreach (var tp in method.TypeArgs)
+                typeParamMap[tp.Name] = "int";
+
+        // Build the method call name with type instantiation if generic
+        var methodCallName = typeParamMap.Count > 0
+            ? $"{methodName}<{string.Join(", ", typeParamMap.Values)}>"
+            : methodName;
+
         sb.AppendLine($"method GeneratedTests_{methodName}()");
         sb.AppendLine("{");
 
@@ -247,10 +281,10 @@ static class TestEmitter
 
             sb.AppendLine("  {");
 
-            // Emit variable declarations from Z3 model
+            // Emit variable declarations from Z3 model, substituting type parameters
             foreach (var inp in method.Ins)
             {
-                var typeStr = inp.Type.ToString();
+                var typeStr = SubstTypeParams(inp.Type.ToString(), typeParamMap);
                 sb.AppendLine(EmitVarDecl(inp.Name, typeStr, values));
             }
 
@@ -267,11 +301,11 @@ static class TestEmitter
             if (method.Outs.Count > 0)
             {
                 var outNames = string.Join(", ", method.Outs.Select(o => o.Name));
-                sb.AppendLine($"    var {outNames} := {methodName}({string.Join(", ", method.Ins.Select(i => i.Name))});");
+                sb.AppendLine($"    var {outNames} := {methodCallName}({string.Join(", ", method.Ins.Select(i => i.Name))});");
             }
             else
             {
-                sb.AppendLine($"    {methodName}({string.Join(", ", method.Ins.Select(i => i.Name))});");
+                sb.AppendLine($"    {methodCallName}({string.Join(", ", method.Ins.Select(i => i.Name))});");
             }
 
             // Replace old() references in literals for expect statements
@@ -290,7 +324,7 @@ static class TestEmitter
             }
             else foreach (var outp in method.Outs)
             {
-                var typeStr = outp.Type.ToString();
+                var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
                 if (values.TryGetValue(outp.Name, out var val) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr))
                 {
                     // Ensure real output values have a decimal point
