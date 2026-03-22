@@ -23,6 +23,9 @@ static class SmtTranslator
         return false;
     }
 
+    // Maximum bounded sequence length used in SMT queries
+    internal const int MAX_SEQ_LEN = 8;
+
     // Collects well-formedness guards (e.g., bounds checks for seq[i])
     // during expression translation. Caller should assert these too.
     internal static List<string> _wfGuards = new();
@@ -87,7 +90,7 @@ static class SmtTranslator
             {
                 var smtName = TypeUtils.SeqSmtName(name, type);
                 sb.AppendLine($"(assert (>= (seq.len {smtName}) 0))");
-                sb.AppendLine($"(assert (<= (seq.len {smtName}) 8))");
+                sb.AppendLine($"(assert (<= (seq.len {smtName}) {MAX_SEQ_LEN}))");
 
                 // Constrain char elements to printable ASCII (32-126)
                 var elemType = TypeUtils.GetSeqElementType(type);
@@ -497,10 +500,9 @@ static class SmtTranslator
             var hasSlice = notInMatch.Groups[3].Success;
             if (valExpr != null)
             {
-                // Determine SMT seq name: arrays use name_seq, seq params use name directly
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
-                return $"(not (seq.contains {smtSeq} (seq.unit {valExpr})))";
+                return $"(not {ExpandSeqContains(smtSeq, valExpr)})";
             }
         }
 
@@ -515,7 +517,7 @@ static class SmtTranslator
             {
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
-                return $"(seq.contains {smtSeq} (seq.unit {valExpr}))";
+                return ExpandSeqContains(smtSeq, valExpr);
             }
         }
 
@@ -758,6 +760,21 @@ static class SmtTranslator
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// Expands "x in seq" to explicit disjunctions over bounded elements, avoiding
+    /// the implicit quantifier inside seq.contains that causes Z3 unknown results.
+    /// For a sequence bounded to MAX_SEQ_LEN, generates:
+    ///   (or (and (>= (seq.len s) 1) (= x (seq.nth s 0)))
+    ///       (and (>= (seq.len s) 2) (= x (seq.nth s 1))) ...)
+    /// </summary>
+    static string ExpandSeqContains(string smtSeq, string valExpr)
+    {
+        var disjuncts = new List<string>();
+        for (int i = 0; i < MAX_SEQ_LEN; i++)
+            disjuncts.Add($"(and (>= (seq.len {smtSeq}) {i + 1}) (= {valExpr} (seq.nth {smtSeq} {i})))");
+        return $"(or {string.Join(" ", disjuncts)})";
     }
 
     /// <summary>

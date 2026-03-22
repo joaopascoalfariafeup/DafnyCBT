@@ -217,6 +217,16 @@ class Program
         {
             Console.WriteLine($"[DafnyTestGen] Processing method: {method.Name}");
 
+            // Check for unsupported nested collection types (e.g., seq<seq<int>>)
+            var allParams = method.Ins.Concat(method.Outs).ToList();
+            var nestedParam = allParams.FirstOrDefault(f => TypeUtils.IsNestedCollectionType(f.Type.ToString()));
+            if (nestedParam != null)
+            {
+                Console.WriteLine($"  Skipping: nested collection type '{nestedParam.Type}' for parameter '{nestedParam.Name}' is not yet supported");
+                Console.WriteLine();
+                continue;
+            }
+
             if (verbose)
             {
                 DafnyParser.DisplayContracts(method);
@@ -710,7 +720,60 @@ class Program
                 Console.WriteLine($"  Combination {solveLabel}: TIMEOUT (skipping)");
             else
             {
-                Console.WriteLine($"  Combination {solveLabel}: unknown result");
+                // When Z3 returns unknown, retry without postconditions containing 'exists'
+                // (alternating forall-exists quantifiers are often undecidable for SMT solvers)
+                var existsLits = lits.Where(l => l.Contains("exists ")).ToList();
+                if (existsLits.Count > 0 && existsLits.Count < lits.Count)
+                {
+                    var simplifiedLits = lits.Where(l => !l.Contains("exists ")).ToList();
+                    Console.WriteLine($"  Combination {solveLabel}: unknown, retrying without {existsLits.Count} exists-quantified postcondition(s)...");
+                    var smt2 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, simplifiedLits, method, verbose, excl, extra, preLits);
+                    if (verbose)
+                    {
+                        Console.WriteLine($"  [DEBUG] Retry SMT2 query for {solveLabel}:");
+                        Console.WriteLine(smt2);
+                    }
+                    var result2 = await Z3Runner.RunZ3(z3Path, smt2);
+                    if (verbose)
+                        Console.WriteLine($"  [DEBUG] Retry Z3 output: {result2.Substring(0, Math.Min(result2.Length, 500))}");
+                    var resultLines2 = result2.Split('\n').Select(l => l.Trim()).ToList();
+                    if (resultLines2.Any(l => l == "sat"))
+                    {
+                        var values = TypeUtils.ParseZ3Model(result2, allVars);
+                        if (values.Count > 0)
+                        {
+                            Console.WriteLine($"  Combination {solveLabel}: SAT (retry) - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                            return values;
+                        }
+                    }
+                    Console.WriteLine($"  Combination {solveLabel}: still unknown after exists-retry");
+                }
+                // Final fallback: try input-only query (no postconditions) to generate valid inputs.
+                // The method will compute correct outputs at runtime; expects verify postconditions.
+                {
+                    var emptyLits = new List<string>();
+                    Console.WriteLine($"  Combination {solveLabel}: retrying with input-only constraints...");
+                    var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, emptyLits, method, verbose, excl, extra, preLits);
+                    if (verbose)
+                    {
+                        Console.WriteLine($"  [DEBUG] Input-only SMT2 query for {solveLabel}:");
+                        Console.WriteLine(smt3);
+                    }
+                    var result3 = await Z3Runner.RunZ3(z3Path, smt3);
+                    if (verbose)
+                        Console.WriteLine($"  [DEBUG] Input-only Z3 output: {result3.Substring(0, Math.Min(result3.Length, 500))}");
+                    var resultLines3 = result3.Split('\n').Select(l => l.Trim()).ToList();
+                    if (resultLines3.Any(l => l == "sat"))
+                    {
+                        var values = TypeUtils.ParseZ3Model(result3, allVars);
+                        if (values.Count > 0)
+                        {
+                            Console.WriteLine($"  Combination {solveLabel}: SAT (input-only) - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                            return values;
+                        }
+                    }
+                    Console.WriteLine($"  Combination {solveLabel}: UNSAT even with input-only (skipping)");
+                }
                 if (verbose) Console.WriteLine($"  Z3 output: {result}");
             }
             return null;

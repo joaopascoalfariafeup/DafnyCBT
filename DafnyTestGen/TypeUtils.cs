@@ -10,6 +10,17 @@ static class TypeUtils
     internal static bool IsArrayType(string type) =>
         type.StartsWith("array<") || type == "array";
 
+    /// <summary>
+    /// Returns true if the type is a nested collection (seq of seq, seq of array, array of seq, etc.)
+    /// These are not yet supported for SMT element parsing and Dafny emission.
+    /// </summary>
+    internal static bool IsNestedCollectionType(string type)
+    {
+        if (!IsSeqType(type) && !IsArrayType(type)) return false;
+        var elemType = GetSeqElementType(type);
+        return IsSeqType(elemType) || IsArrayType(elemType);
+    }
+
     internal static string GetSeqElementType(string type)
     {
         if (type.StartsWith("seq<")) return type.Substring(4, type.Length - 5);
