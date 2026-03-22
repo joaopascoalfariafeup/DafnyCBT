@@ -141,8 +141,36 @@ static class DafnyParser
                     if (args.Count != paramNames.Count)
                         break; // can't inline this call
 
-                    // Build substituted body, handling lambda arguments via beta-reduction
+                    // Build substituted body, handling lambda arguments via beta-reduction.
+                    // First, alpha-rename quantifier-bound variables that would conflict with arguments
+                    // to avoid variable capture (e.g., exists i :: ... && forall i :: 0 <= i < evenIndex
+                    // where evenIndex is replaced by outer i → forall i :: 0 <= i < i is wrong).
                     var inlined = body;
+                    var argNames = new HashSet<string>();
+                    for (int p = 0; p < paramNames.Count; p++)
+                    {
+                        var arg = args[p].Trim();
+                        // Collect identifiers used in the argument
+                        foreach (System.Text.RegularExpressions.Match idm in Regex.Matches(arg, @"\b([a-zA-Z_]\w*)\b"))
+                            argNames.Add(idm.Groups[1].Value);
+                    }
+                    // Rename quantifier-bound variables that conflict with argument names
+                    foreach (var conflictVar in argNames)
+                    {
+                        // Match "forall <var> ::" or "exists <var> ::" where var matches the conflict name
+                        var quantPattern = @"(forall|exists)\s+" + Regex.Escape(conflictVar) + @"\s*::";
+                        if (Regex.IsMatch(inlined, quantPattern))
+                        {
+                            // Find a fresh name that doesn't conflict
+                            var fresh = conflictVar + "_";
+                            while (argNames.Contains(fresh) || inlined.Contains(fresh))
+                                fresh += "_";
+                            // Replace the bound variable in the quantifier scope
+                            // Strategy: replace quantifier declaration and all occurrences of the var within the quantifier body
+                            inlined = RenameQuantifierVar(inlined, conflictVar, fresh);
+                        }
+                    }
+
                     for (int p = 0; p < paramNames.Count; p++)
                     {
                         var arg = args[p].Trim();
@@ -184,6 +212,61 @@ static class DafnyParser
             if (!changed) break;
         }
         return result;
+    }
+
+    /// <summary>
+    /// Renames a quantifier-bound variable in a Dafny expression to avoid capture.
+    /// Finds "forall oldVar ::" or "exists oldVar ::" and renames oldVar to newVar
+    /// within the quantifier's scope (up to the matching close paren or end of expression).
+    /// </summary>
+    internal static string RenameQuantifierVar(string expr, string oldVar, string newVar)
+    {
+        var quantPattern = @"(forall|exists)\s+" + Regex.Escape(oldVar) + @"(\s*::)";
+        var match = Regex.Match(expr, quantPattern);
+        if (!match.Success) return expr;
+
+        // Find the scope of the quantifier: from "::" to the end of the enclosing parenthesized group
+        int scopeStart = match.Index + match.Length;
+        int scopeEnd;
+        // Check if the quantifier is inside parentheses
+        int depth = 0;
+        bool foundParen = false;
+        // Walk backwards from match to find if we're inside parens
+        for (int i = match.Index - 1; i >= 0; i--)
+        {
+            if (expr[i] == '(') { foundParen = true; break; }
+            if (expr[i] == ')' || (!char.IsWhiteSpace(expr[i]) && expr[i] != '&' && expr[i] != '|' && expr[i] != '!')) break;
+        }
+        if (foundParen)
+        {
+            // Find the matching close paren
+            depth = 1;
+            scopeEnd = scopeStart;
+            // Walk back to the open paren
+            int openParen = match.Index - 1;
+            while (openParen >= 0 && expr[openParen] != '(') openParen--;
+            // Now find matching close from scopeStart
+            for (scopeEnd = scopeStart; scopeEnd < expr.Length && depth > 0; scopeEnd++)
+            {
+                if (expr[scopeEnd] == '(') depth++;
+                else if (expr[scopeEnd] == ')') depth--;
+            }
+        }
+        else
+        {
+            scopeEnd = expr.Length;
+        }
+
+        // Replace the quantifier declaration
+        var prefix = expr.Substring(0, match.Index);
+        var quantDecl = match.Groups[1].Value + " " + newVar + match.Groups[2].Value;
+        var scope = expr.Substring(scopeStart, scopeEnd - scopeStart);
+        var suffix = scopeEnd < expr.Length ? expr.Substring(scopeEnd) : "";
+
+        // Replace all occurrences of the old variable in the scope
+        scope = Regex.Replace(scope, @"\b" + Regex.Escape(oldVar) + @"\b", newVar);
+
+        return prefix + quantDecl + scope + suffix;
     }
 
     internal static void DisplayContracts(Method method)
