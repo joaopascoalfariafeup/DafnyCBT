@@ -62,7 +62,7 @@ static class TypeUtils
             if (type == "real")
             {
                 // Real values from Z3 can be: 1.0, (- 1.0), (/ 1.0 2.0), (- (/ 1.0 2.0))
-                var realPattern = new Regex(@$"define-fun\s+{Regex.Escape(name)}\s+\(\)\s+Real\s*\n?\s*((?:\([-/ \d.]+\)|\d+\.\d+|\d+))");
+                var realPattern = new Regex(@$"define-fun\s+{Regex.Escape(name)}\s+\(\)\s+Real\s*\n?\s*((?:\([^()]*(?:\([^()]*\)[^()]*)*\)|\d+\.\d+|\d+))");
                 var realMatch = realPattern.Match(fullText);
                 if (realMatch.Success)
                 {
@@ -116,7 +116,8 @@ static class TypeUtils
                 if (elemType == "real")
                 {
                     // Real elements: match integers, decimals, fractions, negatives
-                    var elemPattern = new Regex(@$"\(\(seq\.nth\s+{Regex.Escape(smtName)}\s+{i}\)\s+((?:\([-/ \d.]+\)|\d+\.\d+|\d+))\)");
+                    // including nested S-expressions like (- (/ 4875.0 2.0))
+                    var elemPattern = new Regex(@$"\(\(seq\.nth\s+{Regex.Escape(smtName)}\s+{i}\)\s+((?:\([^()]*(?:\([^()]*\)[^()]*)*\)|\d+\.\d+|\d+))\)");
                     var elemMatch = elemPattern.Match(fullText);
                     if (elemMatch.Success)
                         elements.Add(NormalizeZ3Real(elemMatch.Groups[1].Value));

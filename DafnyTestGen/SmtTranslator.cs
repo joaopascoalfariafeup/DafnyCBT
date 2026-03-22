@@ -338,6 +338,29 @@ static class SmtTranslator
 
             if (bodySmt != null)
             {
+                // For single-variable quantifiers whose body references seq.nth,
+                // expand into explicit conjunctions/disjunctions over 0..MAX_SEQ_LEN-1.
+                // Z3's quantifier instantiation is incomplete for seq.nth patterns,
+                // causing forall preconditions over array elements to be ignored.
+                if (boundVars.Count == 1 && boundVars[0].smtType == "Int"
+                    && bodySmt.Contains("seq.nth"))
+                {
+                    var varName = boundVars[0].name;
+                    var instances = new List<string>();
+                    for (int idx = 0; idx < MAX_SEQ_LEN; idx++)
+                    {
+                        // Replace the bound variable with the concrete index
+                        var instance = Regex.Replace(bodySmt,
+                            @"(?<![a-zA-Z_])" + Regex.Escape(varName) + @"(?![a-zA-Z_0-9])",
+                            idx.ToString());
+                        instances.Add(instance);
+                    }
+                    if (quantifier == "forall")
+                        return $"(and {string.Join(" ", instances)})";
+                    else // exists
+                        return $"(or {string.Join(" ", instances)})";
+                }
+
                 var bindings = string.Join(" ", boundVars.Select(v => $"({v.name} {v.smtType})"));
                 var result = $"({quantifier} ({bindings}) {bodySmt})";
 

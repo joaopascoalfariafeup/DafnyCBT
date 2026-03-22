@@ -28,10 +28,12 @@ class Program
         checkOpt.AddAlias("-c");
         var repeatOpt = new Option<int>("--repeat", () => 1, "Number of distinct test cases to generate per condition (default: 1)");
         repeatOpt.AddAlias("-r");
+        var minTestsOpt = new Option<int>("--min-tests", () => 4, "Minimum test count for progressive auto strategy (default: 4, 0 to disable)");
+        minTestsOpt.AddAlias("-n");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt, minTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -46,6 +48,7 @@ class Program
             var tiers = ctx.ParseResult.GetValueForOption(tiersOpt);
             var check = ctx.ParseResult.GetValueForOption(checkOpt);
             var repeat = ctx.ParseResult.GetValueForOption(repeatOpt);
+            var minTests = ctx.ParseResult.GetValueForOption(minTestsOpt);
 
             // Resolve input to a list of .dfy files
             var files = ResolveInputFiles(input);
@@ -86,7 +89,7 @@ class Program
                 if (files.Count > 1)
                     Console.WriteLine($"{'='} Processing: {file.Name} {'=',40}");
 
-                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat);
+                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat, minTests);
 
                 if (files.Count > 1)
                     Console.WriteLine();
@@ -129,7 +132,7 @@ class Program
         return new List<FileInfo>();
     }
 
-    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1)
+    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1, int minTests = 4)
     {
         if (!file.Exists)
         {
@@ -233,35 +236,23 @@ class Program
                 DafnyParser.DisplayDnf(method);
             }
 
-            // Determine strategy: -s forces simple, -a/-b are explicit, otherwise auto
+            // Determine strategy: -s forces simple, -a/-b are explicit, otherwise progressive auto
             bool useAllComb = allCombinations;
             bool useBoundary = boundary;
-            if (!simple && !allCombinations && !boundary)
+            bool progressive = false;
+            int useRepeat = repeat;
+            if (!simple && !allCombinations && !boundary && repeat == 1)
             {
-                // Auto strategy: if no disjunctive clauses, use boundary; otherwise use all-combinations
-                var ensuresClauses = method.Ens.Select(e => e.E).ToList();
-                if (ensuresClauses.Count > 0)
-                {
-                    var dnf = DnfEngine.ExprToDnf(ensuresClauses[0]);
-                    for (int i = 1; i < ensuresClauses.Count; i++)
-                        dnf = DnfEngine.CrossProduct(dnf, DnfEngine.ExprToDnf(ensuresClauses[i]));
-                    if (dnf.Count <= 1)
-                    {
-                        useBoundary = true;
-                        Console.WriteLine($"  Auto strategy: no disjunctive clauses -> using boundary mode");
-                    }
-                    else
-                    {
-                        useAllComb = true;
-                        Console.WriteLine($"  Auto strategy: {dnf.Count} disjunctive clauses -> using all-combinations mode");
-                    }
-                }
+                // No explicit flags: use progressive auto strategy
+                progressive = true;
+                useAllComb = true;
+                Console.WriteLine($"  Auto strategy: progressive (minTests={minTests})");
             }
 
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
             Console.WriteLine();
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, repeat, inlinablePredicates);
+            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive);
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -475,7 +466,7 @@ class Program
     /// For each test condition (PRE && POST_clause), we ask Z3 to find satisfying values.
     /// </summary>
     static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
-        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null)
+        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null, int minTests = 4, bool progressive = false)
     {
         var z3Path = @"C:\Users\jpf\.vscode\extensions\dafny-lang.ide-vscode-3.5.2\out\resources\4.11.0\github\dafny\z3\bin\z3-4.12.1.exe";
 
@@ -617,111 +608,108 @@ class Program
             preCombinations.Add(("", preDnfClauses[0], new List<string>()));
         }
 
-        // Build boundary tiers per precondition combination if requested
+        // Build boundary tiers per precondition combination (always compute when progressive or boundary)
         var boundaryTiersPerPre = new Dictionary<int, List<(string tierLabel, List<string> tierConstraints)>>();
-        if (boundary)
+        if (boundary || progressive)
         {
             for (int pi = 0; pi < preCombinations.Count; pi++)
             {
                 boundaryTiersPerPre[pi] = BoundaryAnalysis.BuildBoundaryTiers(inputs, preClauses, method, verbose, tierCount, preCombinations[pi].preLits);
             }
-            Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
+            if (boundary)
+                Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
         }
 
-        // Build test schedule: list of (label, postLiterals, preLiterals+preExclusions, postExclusions, extraConstraints)
-        var testSchedule = new List<(string label, List<string> literals, List<string> preLiterals, List<string> exclusions, List<string> extraConstraints)>();
-
-        // Cross-product: precondition combinations × postcondition schedule
-        for (int pi = 0; pi < preCombinations.Count; pi++)
+        // Helper: build schedule entries for a given mode (all-comb or simple, with or without boundary)
+        void BuildScheduleEntries(
+            List<(string label, List<string> literals, List<string> preLiterals, List<string> exclusions, List<string> extraConstraints)> schedule,
+            bool useAllComb, bool useBoundary)
         {
-            var (preLabel, preLits, preExclusions) = preCombinations[pi];
-            // Build full pre literals: positive assertions + negated exclusions
-            var fullPreLits = new List<string>(preLits);
-            foreach (var excl in preExclusions)
-                fullPreLits.Add($"!({excl})");
-            var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
-            var boundaryTiers = boundary ? boundaryTiersPerPre[pi] : new List<(string, List<string>)>();
-
-            if (allCombinations)
+            for (int pi = 0; pi < preCombinations.Count; pi++)
             {
-                // All non-empty subsets of {0..n-1} DNF clauses
-                int n = dnfClauses.Count;
-                int totalCombinations = (1 << n) - 1; // 2^n - 1
-                if (pi == 0)
-                    Console.WriteLine($"  All-combinations mode: {n} post clauses -> {totalCombinations} combinations");
+                var (preLabel, preLits, preExclusions) = preCombinations[pi];
+                var fullPreLits = new List<string>(preLits);
+                foreach (var excl in preExclusions)
+                    fullPreLits.Add($"!({excl})");
+                var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
+                var bTiers = useBoundary && boundaryTiersPerPre.ContainsKey(pi)
+                    ? boundaryTiersPerPre[pi]
+                    : new List<(string, List<string>)>();
 
-                for (int mask = 1; mask <= totalCombinations; mask++)
+                if (useAllComb)
                 {
-                    var included = new List<int>();
-                    for (int bit = 0; bit < n; bit++)
-                        if ((mask & (1 << bit)) != 0)
-                            included.Add(bit);
+                    int n = dnfClauses.Count;
+                    int totalCombinations = (1 << n) - 1;
 
-                    var label = fullPreLabel + "{" + string.Join(",", included.Select(i => (i + 1).ToString())) + "}";
-
-                    var mergedLiterals = new List<string>();
-                    foreach (var idx in included)
-                        foreach (var lit in dnfClauses[idx])
-                            if (!mergedLiterals.Contains(lit))
-                                mergedLiterals.Add(lit);
-
-                    // Build per-clause exclusions: negate each non-selected clause as a whole.
-                    // NOT(L1 && L2) = !L1 || !L2 — weaker than negating each literal individually,
-                    // which avoids over-constraining (e.g., n=2 for IsPrime being excluded).
-                    var exclusions = new List<string>();
-                    for (int bit = 0; bit < n; bit++)
+                    for (int mask = 1; mask <= totalCombinations; mask++)
                     {
-                        if ((mask & (1 << bit)) != 0) continue;
-                        var clauseLits = dnfClauses[bit]
-                            .Where(lit => !commonLiterals.Contains(lit) && !mergedLiterals.Contains(lit))
-                            .ToList();
-                        if (clauseLits.Count == 1)
-                            exclusions.Add(clauseLits[0]);
-                        else if (clauseLits.Count > 1)
-                            exclusions.Add(string.Join(" && ", clauseLits));
-                    }
+                        var included = new List<int>();
+                        for (int bit = 0; bit < n; bit++)
+                            if ((mask & (1 << bit)) != 0)
+                                included.Add(bit);
 
-                    if (boundary && boundaryTiers.Count > 0)
-                    {
-                        foreach (var (tierLabel, tierConstraints) in boundaryTiers)
-                            testSchedule.Add(($"{label}/B{tierLabel}", mergedLiterals, fullPreLits, exclusions, tierConstraints));
-                    }
-                    else
-                    {
-                        testSchedule.Add((label, mergedLiterals, fullPreLits, exclusions, new List<string>()));
+                        var label = fullPreLabel + "{" + string.Join(",", included.Select(i => (i + 1).ToString())) + "}";
+
+                        var mergedLiterals = new List<string>();
+                        foreach (var idx in included)
+                            foreach (var lit in dnfClauses[idx])
+                                if (!mergedLiterals.Contains(lit))
+                                    mergedLiterals.Add(lit);
+
+                        // Build per-clause exclusions: negate each non-selected clause as a whole.
+                        var exclusions = new List<string>();
+                        for (int bit = 0; bit < n; bit++)
+                        {
+                            if ((mask & (1 << bit)) != 0) continue;
+                            var clauseLits = dnfClauses[bit]
+                                .Where(lit => !commonLiterals.Contains(lit) && !mergedLiterals.Contains(lit))
+                                .ToList();
+                            if (clauseLits.Count == 1)
+                                exclusions.Add(clauseLits[0]);
+                            else if (clauseLits.Count > 1)
+                                exclusions.Add(string.Join(" && ", clauseLits));
+                        }
+
+                        if (useBoundary && bTiers.Count > 0)
+                        {
+                            foreach (var (tierLabel, tierConstraints) in bTiers)
+                                schedule.Add(($"{label}/B{tierLabel}", mergedLiterals, fullPreLits, exclusions, tierConstraints));
+                        }
+                        else
+                        {
+                            schedule.Add((label, mergedLiterals, fullPreLits, exclusions, new List<string>()));
+                        }
                     }
                 }
-            }
-            else
-            {
-                // Default: one test per clause, with exclusions for distinctness
-                for (int ci = 0; ci < dnfClauses.Count; ci++)
+                else
                 {
-                    var clause = dnfClauses[ci];
-                    var label = $"{fullPreLabel}{ci + 1}";
+                    for (int ci = 0; ci < dnfClauses.Count; ci++)
+                    {
+                        var clause = dnfClauses[ci];
+                        var label = $"{fullPreLabel}{ci + 1}";
 
-                    // Build per-clause exclusions: negate each non-selected clause as a whole
-                    var exclusions = new List<string>();
-                    for (int oi = 0; oi < dnfClauses.Count; oi++)
-                    {
-                        if (oi == ci) continue;
-                        var clauseLits = dnfClauses[oi]
-                            .Where(lit => !commonLiterals.Contains(lit) && !clause.Contains(lit))
-                            .ToList();
-                        if (clauseLits.Count == 1)
-                            exclusions.Add(clauseLits[0]);
-                        else if (clauseLits.Count > 1)
-                            exclusions.Add(string.Join(" && ", clauseLits));
-                    }
+                        var exclusions = new List<string>();
+                        for (int oi = 0; oi < dnfClauses.Count; oi++)
+                        {
+                            if (oi == ci) continue;
+                            var clauseLits = dnfClauses[oi]
+                                .Where(lit => !commonLiterals.Contains(lit) && !clause.Contains(lit))
+                                .ToList();
+                            if (clauseLits.Count == 1)
+                                exclusions.Add(clauseLits[0]);
+                            else if (clauseLits.Count > 1)
+                                exclusions.Add(string.Join(" && ", clauseLits));
+                        }
 
-                    if (boundary && boundaryTiers.Count > 0)
-                    {
-                        foreach (var (tierLabel, tierConstraints) in boundaryTiers)
-                            testSchedule.Add(($"{label}/B{tierLabel}", clause, fullPreLits, exclusions, tierConstraints));
-                    }
-                    else
-                    {
-                        testSchedule.Add((label, clause, fullPreLits, exclusions, new List<string>()));
+                        if (useBoundary && bTiers.Count > 0)
+                        {
+                            foreach (var (tierLabel, tierConstraints) in bTiers)
+                                schedule.Add(($"{label}/B{tierLabel}", clause, fullPreLits, exclusions, tierConstraints));
+                        }
+                        else
+                        {
+                            schedule.Add((label, clause, fullPreLits, exclusions, new List<string>()));
+                        }
                     }
                 }
             }
@@ -761,7 +749,6 @@ class Program
             else
             {
                 // When Z3 returns unknown, retry without postconditions containing 'exists'
-                // (alternating forall-exists quantifiers are often undecidable for SMT solvers)
                 var existsLits = lits.Where(l => l.Contains("exists ")).ToList();
                 if (existsLits.Count > 0 && existsLits.Count < lits.Count)
                 {
@@ -788,8 +775,7 @@ class Program
                     }
                     Console.WriteLine($"  Combination {solveLabel}: still unknown after exists-retry");
                 }
-                // Final fallback: try input-only query (no postconditions) to generate valid inputs.
-                // The method will compute correct outputs at runtime; expects verify postconditions.
+                // Final fallback: try input-only query (no postconditions)
                 {
                     var emptyLits = new List<string>();
                     Console.WriteLine($"  Combination {solveLabel}: retrying with input-only constraints...");
@@ -843,77 +829,160 @@ class Program
             return $"(not {conjunction})";
         }
 
-        // Solve each test condition
-        var testCases = new List<(string label, Dictionary<string, string> values, List<string> literals)>();
-        int total = testSchedule.Count;
-        int current = 0;
-
-        // Group schedule entries by base condition (literals + exclusions) to track
-        // inputs found across boundary tiers for the same condition.
-        // baseKey -> list of exclusion constraints on inputs found so far
-        var baseConditionExclusions = new Dictionary<string, List<string>>();
-
-        foreach (var (label, literals, preLits, exclusions, extraConstraints) in testSchedule)
+        // Helper: solve a range of schedule entries, return number of SAT results
+        async Task<int> SolveRange(
+            List<(string label, List<string> literals, List<string> preLiterals, List<string> exclusions, List<string> extraConstraints)> schedule,
+            int from, int to, int displayTotal,
+            List<(string label, Dictionary<string, string> values, List<string> literals)> results,
+            Dictionary<string, List<string>> baseExclusions,
+            int earlyStopCount = 0)
         {
-            current++;
-            // Base key: identifies the postcondition combination (without boundary tier)
-            var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions) + "||" + string.Join("|", preLits);
-
-            if (!baseConditionExclusions.ContainsKey(baseKey))
-                baseConditionExclusions[baseKey] = new List<string>();
-            var inputExclusions = baseConditionExclusions[baseKey];
-
-            // Solve with boundary/extra constraints + exclusions from previous inputs
-            var allExtra = new List<string>(extraConstraints);
-            allExtra.AddRange(inputExclusions);
-
-            var values = await SolveOne(label, current, total, literals, preLits, exclusions, allExtra);
-            if (values != null)
+            int satCount = 0;
+            for (int i = from; i < to; i++)
             {
-                testCases.Add((label, values, literals));
-                var excl = BuildInputExclusion(values);
-                if (excl != null) inputExclusions.Add(excl);
-            }
-        }
-
-        // Repeat phase: generate additional test cases per base condition (without boundary constraints)
-        if (repeat > 1)
-        {
-            // Collect the distinct base conditions (literals + exclusions, no boundary)
-            var baseConditions = new List<(string baseLabel, List<string> literals, List<string> preLits, List<string> exclusions, string baseKey)>();
-            var seenBaseKeys = new HashSet<string>();
-
-            foreach (var (label, literals, preLits, exclusions, _) in testSchedule)
-            {
+                var (label, literals, preLits, exclusions, extraConstraints) = schedule[i];
                 var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions) + "||" + string.Join("|", preLits);
-                if (seenBaseKeys.Add(baseKey))
+
+                if (!baseExclusions.ContainsKey(baseKey))
+                    baseExclusions[baseKey] = new List<string>();
+                var inputExclusions = baseExclusions[baseKey];
+
+                var allExtra = new List<string>(extraConstraints);
+                allExtra.AddRange(inputExclusions);
+
+                var values = await SolveOne(label, i + 1, displayTotal, literals, preLits, exclusions, allExtra);
+                if (values != null)
                 {
-                    // Strip boundary tier suffix from label for the base label
-                    var baseLabel = label.Contains("/B") ? label.Substring(0, label.IndexOf("/B")) : label;
-                    baseConditions.Add((baseLabel, literals, preLits, exclusions, baseKey));
+                    results.Add((label, values, literals));
+                    var excl = BuildInputExclusion(values);
+                    if (excl != null) inputExclusions.Add(excl);
+                    satCount++;
+                    if (earlyStopCount > 0 && results.Count >= earlyStopCount)
+                        break;
                 }
             }
+            return satCount;
+        }
 
-            foreach (var (baseLabel, literals, preLits, exclusions, baseKey) in baseConditions)
+        // Build test schedule and solve in phases
+        var testSchedule = new List<(string label, List<string> literals, List<string> preLiterals, List<string> exclusions, List<string> extraConstraints)>();
+        var testCases = new List<(string label, Dictionary<string, string> values, List<string> literals)>();
+        var baseConditionExclusions = new Dictionary<string, List<string>>();
+
+        if (progressive)
+        {
+            // --- Phase 1: all-combinations, no boundary ---
+            BuildScheduleEntries(testSchedule, useAllComb: true, useBoundary: false);
+            int n = dnfClauses.Count;
+            int totalCombinations = (1 << n) - 1;
+            Console.WriteLine($"  Phase 1: all-combinations ({n} clauses -> {totalCombinations} combinations)");
+
+            await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count, testCases, baseConditionExclusions);
+            Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
+
+            if (testCases.Count < minTests && boundaryTiersPerPre.Count > 0)
             {
-                var inputExclusions = baseConditionExclusions[baseKey];
-                int found = inputExclusions.Count; // tests already found (from boundary phase)
-                int needed = repeat - found;
+                // --- Phase 2: add boundary tiers ---
+                int phase2Start = testSchedule.Count;
+                BuildScheduleEntries(testSchedule, useAllComb: true, useBoundary: true);
+                int newEntries = testSchedule.Count - phase2Start;
+                Console.WriteLine($"  Phase 2: adding boundary analysis ({newEntries} new entries)");
 
-                for (int rep = 0; rep < needed; rep++)
+                await SolveRange(testSchedule, phase2Start, testSchedule.Count, testSchedule.Count,
+                    testCases, baseConditionExclusions, minTests);
+                Console.WriteLine($"  Phase 2 complete: {testCases.Count} test(s)");
+            }
+
+            if (testCases.Count < minTests)
+            {
+                // --- Phase 3: repeats ---
+                int effectiveRepeat = Math.Max(3, (int)Math.Ceiling((double)minTests / Math.Max(testCases.Count, 1)));
+                Console.WriteLine($"  Phase 3: repeats (up to {effectiveRepeat} per condition)");
+
+                var baseConditions = new List<(string baseLabel, List<string> literals, List<string> preLits, List<string> exclusions, string baseKey)>();
+                var seenBaseKeys = new HashSet<string>();
+                foreach (var (label, literals, preLits, exclusions, _) in testSchedule)
                 {
-                    var repLabel = $"{baseLabel}/R{found + rep + 1}";
-                    // Solve without boundary constraints, only postcondition + input exclusions
-                    var values = await SolveOne(repLabel, current, total, literals, preLits, exclusions, inputExclusions.ToList());
-                    if (values != null)
+                    var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions) + "||" + string.Join("|", preLits);
+                    if (seenBaseKeys.Add(baseKey))
                     {
-                        testCases.Add((repLabel, values, literals));
-                        var excl = BuildInputExclusion(values);
-                        if (excl != null) inputExclusions.Add(excl);
+                        var baseLabel = label.Contains("/B") ? label.Substring(0, label.IndexOf("/B")) : label;
+                        baseConditions.Add((baseLabel, literals, preLits, exclusions, baseKey));
                     }
-                    else
+                }
+
+                foreach (var (baseLabel, literals, preLits, exclusions, baseKey) in baseConditions)
+                {
+                    if (testCases.Count >= minTests) break;
+                    var inputExclusions = baseConditionExclusions.ContainsKey(baseKey)
+                        ? baseConditionExclusions[baseKey] : new List<string>();
+                    int found = inputExclusions.Count;
+                    int needed = effectiveRepeat - found;
+
+                    for (int rep = 0; rep < needed; rep++)
                     {
-                        break; // no more distinct inputs
+                        if (testCases.Count >= minTests) break;
+                        var repLabel = $"{baseLabel}/R{found + rep + 1}";
+                        var values = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, inputExclusions.ToList());
+                        if (values != null)
+                        {
+                            testCases.Add((repLabel, values, literals));
+                            var excl = BuildInputExclusion(values);
+                            if (excl != null) inputExclusions.Add(excl);
+                        }
+                        else break;
+                    }
+                }
+                Console.WriteLine($"  Phase 3 complete: {testCases.Count} test(s)");
+            }
+        }
+        else
+        {
+            // Non-progressive: build schedule with the given flags and solve all at once
+            BuildScheduleEntries(testSchedule, allCombinations, boundary);
+            if (allCombinations)
+            {
+                int n = dnfClauses.Count;
+                Console.WriteLine($"  All-combinations mode: {n} post clauses -> {(1 << n) - 1} combinations");
+            }
+            if (boundary && boundaryTiersPerPre.Count > 0)
+                Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
+
+            await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count, testCases, baseConditionExclusions);
+
+            // Repeat phase
+            if (repeat > 1)
+            {
+                var baseConditions = new List<(string baseLabel, List<string> literals, List<string> preLits, List<string> exclusions, string baseKey)>();
+                var seenBaseKeys = new HashSet<string>();
+
+                foreach (var (label, literals, preLits, exclusions, _) in testSchedule)
+                {
+                    var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions) + "||" + string.Join("|", preLits);
+                    if (seenBaseKeys.Add(baseKey))
+                    {
+                        var baseLabel = label.Contains("/B") ? label.Substring(0, label.IndexOf("/B")) : label;
+                        baseConditions.Add((baseLabel, literals, preLits, exclusions, baseKey));
+                    }
+                }
+
+                foreach (var (baseLabel, literals, preLits, exclusions, baseKey) in baseConditions)
+                {
+                    var inputExclusions = baseConditionExclusions[baseKey];
+                    int found = inputExclusions.Count;
+                    int needed = repeat - found;
+
+                    for (int rep = 0; rep < needed; rep++)
+                    {
+                        var repLabel = $"{baseLabel}/R{found + rep + 1}";
+                        var values = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, inputExclusions.ToList());
+                        if (values != null)
+                        {
+                            testCases.Add((repLabel, values, literals));
+                            var excl = BuildInputExclusion(values);
+                            if (excl != null) inputExclusions.Add(excl);
+                        }
+                        else break;
                     }
                 }
             }
