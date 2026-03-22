@@ -485,13 +485,37 @@ class Program
         for (int i = 1; i < ensuresClauses.Count; i++)
             dnfClauses = DnfEngine.CrossProduct(dnfClauses, DnfEngine.ExprToDnf(ensuresClauses[i]));
 
-        // Keep original DNF clauses for expect emission, create inlined versions for SMT translation
+        // Build background postconditions: full (un-decomposed) ensures expressions as strings.
+        // These are asserted as background constraints to catch cases where DNF decomposition
+        // loses quantifier range guards (e.g., forall vacuously true at boundary values).
+        var backgroundPostconditions = ensuresClauses.Select(e => DnfEngine.ExprToString(e)).ToList();
+        if (inlinablePredicates != null && inlinablePredicates.Count > 0)
+        {
+            var smtBuiltins = new HashSet<string> { "IsSorted" };
+            var bgPredsToInline = inlinablePredicates
+                .Where(p => !smtBuiltins.Contains(p.name))
+                .ToList();
+            if (bgPredsToInline.Count > 0)
+                backgroundPostconditions = backgroundPostconditions
+                    .Select(p => DafnyParser.InlinePredicates(p, bgPredsToInline)).ToList();
+        }
+
+        // Keep original DNF clauses for expect emission, create inlined versions for SMT translation.
+        // Skip predicates with built-in SMT handlers (e.g., IsSorted) to preserve patterns
+        // that the SMT translator recognizes.
         var originalDnfClauses = dnfClauses;
         if (inlinablePredicates != null && inlinablePredicates.Count > 0)
         {
-            dnfClauses = dnfClauses.Select(clause =>
-                clause.Select(lit => DafnyParser.InlinePredicates(lit, inlinablePredicates)).ToList()
-            ).ToList();
+            var smtBuiltins = new HashSet<string> { "IsSorted" };
+            var predsToInline = inlinablePredicates
+                .Where(p => !smtBuiltins.Contains(p.name))
+                .ToList();
+            if (predsToInline.Count > 0)
+            {
+                dnfClauses = dnfClauses.Select(clause =>
+                    clause.Select(lit => DafnyParser.InlinePredicates(lit, predsToInline)).ToList()
+                ).ToList();
+            }
         }
 
         var preClauses = method.Req.Select(r => r.E).ToList();
@@ -505,12 +529,21 @@ class Program
         }
         // Remove the empty "true" elements from single-clause results
         preDnfClauses = preDnfClauses.Select(c => c.Where(s => s.Length > 0).ToList()).ToList();
-        // Inline predicates in precondition literals too
+        // Inline predicates in precondition literals too, but skip predicates with
+        // built-in SMT handlers (e.g., IsSorted) — inlining would destroy the pattern
+        // that the SMT translator recognizes
         if (inlinablePredicates != null && inlinablePredicates.Count > 0)
         {
-            preDnfClauses = preDnfClauses.Select(clause =>
-                clause.Select(lit => DafnyParser.InlinePredicates(lit, inlinablePredicates)).ToList()
-            ).ToList();
+            var smtBuiltins = new HashSet<string> { "IsSorted" };
+            var predsToInline = inlinablePredicates
+                .Where(p => !smtBuiltins.Contains(p.name))
+                .ToList();
+            if (predsToInline.Count > 0)
+            {
+                preDnfClauses = preDnfClauses.Select(clause =>
+                    clause.Select(lit => DafnyParser.InlinePredicates(lit, predsToInline)).ToList()
+                ).ToList();
+            }
         }
         bool hasDisjunctivePre = preDnfClauses.Count > 1;
         if (hasDisjunctivePre)
@@ -561,15 +594,18 @@ class Program
                         if (!mergedPreLits.Contains(lit))
                             mergedPreLits.Add(lit);
 
+                // Build per-clause exclusions for preconditions
                 var preExclusions = new List<string>();
                 for (int bit = 0; bit < pm; bit++)
                 {
                     if ((mask & (1 << bit)) != 0) continue;
-                    foreach (var lit in preDnfClauses[bit])
-                    {
-                        if (!preCommonLiterals.Contains(lit) && !mergedPreLits.Contains(lit) && !preExclusions.Contains(lit))
-                            preExclusions.Add(lit);
-                    }
+                    var clauseLits = preDnfClauses[bit]
+                        .Where(lit => !preCommonLiterals.Contains(lit) && !mergedPreLits.Contains(lit))
+                        .ToList();
+                    if (clauseLits.Count == 1)
+                        preExclusions.Add(clauseLits[0]);
+                    else if (clauseLits.Count > 1)
+                        preExclusions.Add(string.Join(" && ", clauseLits));
                 }
 
                 preCombinations.Add((label, mergedPreLits, preExclusions));
@@ -629,19 +665,21 @@ class Program
                             if (!mergedLiterals.Contains(lit))
                                 mergedLiterals.Add(lit);
 
+                    // Build per-clause exclusions: negate each non-selected clause as a whole.
+                    // NOT(L1 && L2) = !L1 || !L2 — weaker than negating each literal individually,
+                    // which avoids over-constraining (e.g., n=2 for IsPrime being excluded).
                     var exclusions = new List<string>();
                     for (int bit = 0; bit < n; bit++)
                     {
                         if ((mask & (1 << bit)) != 0) continue;
-                        foreach (var lit in dnfClauses[bit])
-                        {
-                            if (!commonLiterals.Contains(lit) && !mergedLiterals.Contains(lit) && !exclusions.Contains(lit))
-                                exclusions.Add(lit);
-                        }
+                        var clauseLits = dnfClauses[bit]
+                            .Where(lit => !commonLiterals.Contains(lit) && !mergedLiterals.Contains(lit))
+                            .ToList();
+                        if (clauseLits.Count == 1)
+                            exclusions.Add(clauseLits[0]);
+                        else if (clauseLits.Count > 1)
+                            exclusions.Add(string.Join(" && ", clauseLits));
                     }
-                    // Remove complementary exclusions: if both L and !(L) are exclusions,
-                    // negating both creates a contradiction. Drop both.
-                    exclusions = FilterComplementaryExclusions(exclusions);
 
                     if (boundary && boundaryTiers.Count > 0)
                     {
@@ -662,17 +700,19 @@ class Program
                     var clause = dnfClauses[ci];
                     var label = $"{fullPreLabel}{ci + 1}";
 
+                    // Build per-clause exclusions: negate each non-selected clause as a whole
                     var exclusions = new List<string>();
                     for (int oi = 0; oi < dnfClauses.Count; oi++)
                     {
                         if (oi == ci) continue;
-                        foreach (var lit in dnfClauses[oi])
-                        {
-                            if (!commonLiterals.Contains(lit) && !clause.Contains(lit) && !exclusions.Contains(lit))
-                                exclusions.Add(lit);
-                        }
+                        var clauseLits = dnfClauses[oi]
+                            .Where(lit => !commonLiterals.Contains(lit) && !clause.Contains(lit))
+                            .ToList();
+                        if (clauseLits.Count == 1)
+                            exclusions.Add(clauseLits[0]);
+                        else if (clauseLits.Count > 1)
+                            exclusions.Add(string.Join(" && ", clauseLits));
                     }
-                    exclusions = FilterComplementaryExclusions(exclusions);
 
                     if (boundary && boundaryTiers.Count > 0)
                     {
@@ -692,7 +732,7 @@ class Program
             List<string> lits, List<string> preLits, List<string> excl, List<string> extra)
         {
             Console.WriteLine($"  Solving combination {solveLabel} ({schedIdx}/{schedTotal})...");
-            var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits);
+            var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits, backgroundPostconditions);
             if (verbose)
             {
                 Console.WriteLine($"  [DEBUG] SMT2 query for {solveLabel}:");
@@ -727,7 +767,7 @@ class Program
                 {
                     var simplifiedLits = lits.Where(l => !l.Contains("exists ")).ToList();
                     Console.WriteLine($"  Combination {solveLabel}: unknown, retrying without {existsLits.Count} exists-quantified postcondition(s)...");
-                    var smt2 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, simplifiedLits, method, verbose, excl, extra, preLits);
+                    var smt2 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, simplifiedLits, method, verbose, excl, extra, preLits, backgroundPostconditions);
                     if (verbose)
                     {
                         Console.WriteLine($"  [DEBUG] Retry SMT2 query for {solveLabel}:");
@@ -753,7 +793,7 @@ class Program
                 {
                     var emptyLits = new List<string>();
                     Console.WriteLine($"  Combination {solveLabel}: retrying with input-only constraints...");
-                    var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, emptyLits, method, verbose, excl, extra, preLits);
+                    var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, emptyLits, method, verbose, excl, extra, preLits, backgroundPostconditions);
                     if (verbose)
                     {
                         Console.WriteLine($"  [DEBUG] Input-only SMT2 query for {solveLabel}:");

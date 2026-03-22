@@ -45,7 +45,8 @@ static class SmtTranslator
         bool verbose,
         List<string>? exclusions = null,
         List<string>? extraConstraints = null,
-        List<string>? preLiterals = null)
+        List<string>? preLiterals = null,
+        List<string>? backgroundPostconditions = null)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("(set-option :produce-models true)");
@@ -126,6 +127,19 @@ static class SmtTranslator
             {
                 assertions.AppendLine($"; Could not translate: {literal}");
                 _hasUntranslatedPost = true;
+            }
+        }
+
+        // Assert full (un-decomposed) postconditions as background constraints.
+        // This catches cases where DNF decomposition loses quantifier range guards,
+        // e.g., exists k :: 2<=k<n && P(k) decomposed into P(2) without guard n>2.
+        if (backgroundPostconditions != null)
+        {
+            foreach (var bgPost in backgroundPostconditions)
+            {
+                var smtExpr = DafnyExprToSmt(bgPost, inputs);
+                if (smtExpr != null)
+                    assertions.AppendLine($"(assert {smtExpr})");
             }
         }
 
@@ -327,35 +341,24 @@ static class SmtTranslator
                 var bindings = string.Join(" ", boundVars.Select(v => $"({v.name} {v.smtType})"));
                 var result = $"({quantifier} ({bindings}) {bodySmt})";
 
-                // Add a WF guard for the quantifier's domain being non-empty.
-                // When this forall is negated as an exclusion, the guard ensures the
-                // negation (exists ...) only applies when a witness can exist.
-                // Extract range from implication body: lo <= var < hi ==> P
-                if (quantifier == "forall" && boundVars.Count == 1)
-                {
-                    var impBody = SplitOnOperator(body, "==>");
-                    if (impBody != null)
-                    {
-                        // Try to find upper bound of the form "var < hi" or "var <= hi" in the range
-                        var rangeStr = impBody.Value.left.Trim();
-                        var bvName = boundVars[0].name;
-                        // Match patterns like "0 <= k < |s|" or "lo <= k < hi"
-                        var rangeMatch = Regex.Match(rangeStr, @"(.+?)\s*<=\s*" + Regex.Escape(bvName) + @"\s*<\s*(.+)");
-                        if (rangeMatch.Success)
-                        {
-                            var lo = DafnyExprToSmt(rangeMatch.Groups[1].Value.Trim(), inputs);
-                            var hi = DafnyExprToSmt(rangeMatch.Groups[2].Value.Trim(), inputs);
-                            if (lo != null && hi != null)
-                                _wfGuards.Add($"(< {lo} {hi})");
-                        }
-                    }
-                }
+                // Note: no WF guard for forall domain non-emptiness.
+                // A forall with empty domain is vacuously true, which is a valid boundary case
+                // (e.g., IsPrime with n=2: forall k :: 2 <= k < 2 ==> ... is true).
 
                 return result;
             }
         }
 
-        // Handle ==> (implication) - lowest precedence, so split first
+        // Handle <==> (biconditional/iff) - lowest precedence
+        var iffParts = SplitOnOperator(expr, "<==>");
+        if (iffParts != null)
+        {
+            var left = DafnyExprToSmt(iffParts.Value.left, inputs);
+            var right = DafnyExprToSmt(iffParts.Value.right, inputs);
+            if (left != null && right != null) return $"(= {left} {right})";
+        }
+
+        // Handle ==> (implication)
         var impParts = SplitOnOperator(expr, "==>");
         if (impParts != null)
         {
@@ -491,32 +494,46 @@ static class SmtTranslator
             return $"(= (seq.nth {arrName}_seq {idxName}) {valName})";
         }
 
-        // Handle !in pattern: x !in a[..] or x !in s (seq variable)
-        var notInMatch = Regex.Match(expr, @"^(.+?)\s+!in\s+(\w+)(\[\.\.?\])?$");
+        // Handle !in pattern: x !in a[..] or x !in a[..len] or x !in s
+        var notInMatch = Regex.Match(expr, @"^(.+?)\s+!in\s+(\w+)(\[\.\.(\w+)?\])?$");
         if (notInMatch.Success)
         {
             var valExpr = DafnyExprToSmt(notInMatch.Groups[1].Value.Trim(), inputs);
             var seqName = notInMatch.Groups[2].Value;
             var hasSlice = notInMatch.Groups[3].Success;
+            var sliceBound = notInMatch.Groups[4].Success ? notInMatch.Groups[4].Value : null;
             if (valExpr != null)
             {
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
+                if (sliceBound != null)
+                {
+                    var boundSmt = DafnyExprToSmt(sliceBound, inputs);
+                    if (boundSmt != null)
+                        return $"(not {ExpandSeqContainsBounded(smtSeq, valExpr, boundSmt)})";
+                }
                 return $"(not {ExpandSeqContains(smtSeq, valExpr)})";
             }
         }
 
-        // Handle 'in' pattern: x in a[..] or x in s
-        var inMatch = Regex.Match(expr, @"^(.+?)\s+in\s+(\w+)(\[\.\.?\])?$");
+        // Handle 'in' pattern: x in a[..] or x in a[..len] or x in s
+        var inMatch = Regex.Match(expr, @"^(.+?)\s+in\s+(\w+)(\[\.\.(\w+)?\])?$");
         if (inMatch.Success)
         {
             var valExpr = DafnyExprToSmt(inMatch.Groups[1].Value.Trim(), inputs);
             var seqName = inMatch.Groups[2].Value;
             var hasSlice = inMatch.Groups[3].Success;
+            var sliceBound = inMatch.Groups[4].Success ? inMatch.Groups[4].Value : null;
             if (valExpr != null)
             {
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
+                if (sliceBound != null)
+                {
+                    var boundSmt = DafnyExprToSmt(sliceBound, inputs);
+                    if (boundSmt != null)
+                        return ExpandSeqContainsBounded(smtSeq, valExpr, boundSmt);
+                }
                 return ExpandSeqContains(smtSeq, valExpr);
             }
         }
@@ -774,6 +791,18 @@ static class SmtTranslator
         var disjuncts = new List<string>();
         for (int i = 0; i < MAX_SEQ_LEN; i++)
             disjuncts.Add($"(and (>= (seq.len {smtSeq}) {i + 1}) (= {valExpr} (seq.nth {smtSeq} {i})))");
+        return $"(or {string.Join(" ", disjuncts)})";
+    }
+
+    /// <summary>
+    /// Like ExpandSeqContains but with a symbolic upper bound instead of seq.len.
+    /// For "x in a[..len]": generates disjunctions guarded by (>= len i+1) instead of seq.len.
+    /// </summary>
+    static string ExpandSeqContainsBounded(string smtSeq, string valExpr, string boundSmt)
+    {
+        var disjuncts = new List<string>();
+        for (int i = 0; i < MAX_SEQ_LEN; i++)
+            disjuncts.Add($"(and (>= {boundSmt} {i + 1}) (>= (seq.len {smtSeq}) {i + 1}) (= {valExpr} (seq.nth {smtSeq} {i})))");
         return $"(or {string.Join(" ", disjuncts)})";
     }
 
