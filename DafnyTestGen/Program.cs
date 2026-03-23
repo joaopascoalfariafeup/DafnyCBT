@@ -30,10 +30,11 @@ class Program
         repeatOpt.AddAlias("-r");
         var minTestsOpt = new Option<int>("--min-tests", () => 4, "Minimum test count for progressive auto strategy (default: 4, 0 to disable)");
         minTestsOpt.AddAlias("-n");
+        var z3PathOpt = new Option<string?>("--z3-path", "Path to Z3 executable (default: auto-discover from VS Code extension, Z3_PATH env var, or PATH)");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt, minTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt, minTestsOpt, z3PathOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -49,6 +50,11 @@ class Program
             var check = ctx.ParseResult.GetValueForOption(checkOpt);
             var repeat = ctx.ParseResult.GetValueForOption(repeatOpt);
             var minTests = ctx.ParseResult.GetValueForOption(minTestsOpt);
+            var z3PathCli = ctx.ParseResult.GetValueForOption(z3PathOpt);
+
+            // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
+            var z3Path = Z3Runner.FindZ3Path(z3PathCli);
+            Console.WriteLine($"[DafnyTestGen] Z3: {z3Path}");
 
             // Resolve input to a list of .dfy files
             var files = ResolveInputFiles(input);
@@ -89,7 +95,7 @@ class Program
                 if (files.Count > 1)
                     Console.WriteLine($"{'='} Processing: {file.Name} {'=',40}");
 
-                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat, minTests);
+                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat, minTests, z3Path);
 
                 if (files.Count > 1)
                     Console.WriteLine();
@@ -132,7 +138,7 @@ class Program
         return new List<FileInfo>();
     }
 
-    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1, int minTests = 4)
+    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1, int minTests = 4, string? z3Path = null)
     {
         if (!file.Exists)
         {
@@ -252,7 +258,7 @@ class Program
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
             Console.WriteLine();
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive);
+            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path);
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -466,9 +472,9 @@ class Program
     /// For each test condition (PRE && POST_clause), we ask Z3 to find satisfying values.
     /// </summary>
     static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
-        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null, int minTests = 4, bool progressive = false)
+        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null)
     {
-        var z3Path = @"C:\Users\jpf\.vscode\extensions\dafny-lang.ide-vscode-3.5.2\out\resources\4.11.0\github\dafny\z3\bin\z3-4.12.1.exe";
+        z3Path ??= Z3Runner.FindZ3Path();
 
         // Get DNF clauses
         var ensuresClauses = method.Ens.Select(e => e.E).ToList();
