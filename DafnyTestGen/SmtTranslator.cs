@@ -180,8 +180,11 @@ static class SmtTranslator
 
         // Assert full (un-decomposed) postconditions as background constraints.
         // This catches cases where DNF decomposition loses quantifier range guards.
+        // Save WF guard count — background postconditions are disjunctive, so their
+        // WF guards (e.g., index bounds for one disjunct) must not be asserted unconditionally.
         if (backgroundPostconditions != null)
         {
+            var wfCountBefore = _wfGuards.Count;
             foreach (var bgPost in backgroundPostconditions)
             {
                 var rewritten = RewriteForPostState(bgPost, mutableNames);
@@ -189,6 +192,11 @@ static class SmtTranslator
                 if (smtExpr != null)
                     assertions.AppendLine($"(assert {smtExpr})");
             }
+            // Discard WF guards from background postconditions — they may over-constrain
+            // when only some disjuncts are active (e.g., bounds for str1[|prefix|] conflict
+            // with |prefix| == |str1| when the access disjunct is not selected).
+            if (_wfGuards.Count > wfCountBefore)
+                _wfGuards.RemoveRange(wfCountBefore, _wfGuards.Count - wfCountBefore);
         }
 
         // Encode preconditions (constrain pre-state variables)

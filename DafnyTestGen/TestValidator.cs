@@ -23,6 +23,11 @@ static class TestValidator
         }
         var sourceHeader = generatedCode.Substring(0, genMethodMatch.Index);
 
+        // If the source header contains a Main() method, rename it to avoid conflicts
+        // with the Main() we generate for test execution.
+        sourceHeader = Regex.Replace(sourceHeader, @"\bmethod\s+Main\s*\(\s*\)", "method OriginalMain()");
+        sourceHeader = Regex.Replace(sourceHeader, @"\bMain\s*\(\s*\)\s*;", "OriginalMain();");
+
         // Extract individual test case blocks
         var testBlocks = new List<(string comment, string body)>();
         var blockPattern = new Regex(
@@ -91,7 +96,7 @@ static class TestValidator
             var psi = new ProcessStartInfo
             {
                 FileName = dafnyPath,
-                Arguments = $"run --no-verify \"{tempFile}\"",
+                Arguments = $"run --allow-warnings --no-verify \"{tempFile}\"",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
