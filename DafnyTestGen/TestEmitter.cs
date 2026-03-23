@@ -345,6 +345,13 @@ static class TestEmitter
             }
             else foreach (var outp in method.Outs)
             {
+                // If no active postcondition literal mentions this output variable,
+                // the postcondition doesn't constrain it — the Z3 value is arbitrary,
+                // so skip the concrete expect to avoid false negatives.
+                var outPattern = @"\b" + Regex.Escape(outp.Name) + @"\b";
+                if (!literals.Any(lit => Regex.IsMatch(lit, outPattern)))
+                    continue;
+
                 var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
                 if (values.TryGetValue(outp.Name, out var val) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr))
                 {

@@ -546,6 +546,26 @@ class Program
         if (hasDisjunctivePre)
             Console.WriteLine($"  Disjunctive precondition: {preDnfClauses.Count} branches");
 
+        // Check for unsolvable patterns after predicate inlining.
+        // Ghost predicates that internally slice sequences with variable indices
+        // (e.g., multiset(b[..i+j])) produce SMT constraints Z3 cannot solve,
+        // causing every query to timeout.
+        var allInlinedLiterals = dnfClauses.SelectMany(c => c)
+            .Concat(preDnfClauses.SelectMany(c => c))
+            .Concat(backgroundPostconditions);
+        // Pattern: variable-indexed slice inside multiset(), e.g., multiset(b[..][..i0 + j0])
+        // or multiset(b[..expr]) where expr is not empty (contains identifiers)
+        var varSliceMultiset = new Regex(@"multiset\([^)]*\[\.\.(?!\])[^)]*\)");
+        // Pattern: double-indexing on variable slices, e.g., b[..][..expr][i]
+        var doubleSlice = new Regex(@"\w+\[\.\.?\][^=]*\[\.\.(?!\])");
+        if (allInlinedLiterals.Any(lit => varSliceMultiset.IsMatch(lit) || doubleSlice.IsMatch(lit)))
+        {
+            Console.WriteLine($"  Skipping: contracts contain multiset or quantifiers on variable-indexed " +
+                $"sequence slices (after predicate inlining), which are unsolvable in SMT");
+            Console.WriteLine();
+            return "";
+        }
+
         // Collect input/output variable info
         var inputs = method.Ins.Select(f => (f.Name, Type: f.Type.ToString())).ToList();
         var outputs = method.Outs.Select(f => (f.Name, Type: f.Type.ToString())).ToList();
