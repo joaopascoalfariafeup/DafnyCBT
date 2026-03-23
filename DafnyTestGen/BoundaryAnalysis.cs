@@ -17,8 +17,11 @@ static class BoundaryAnalysis
         Method method,
         bool verbose,
         int tierCount = 4,
-        List<string>? preLiterals = null)
+        List<string>? preLiterals = null,
+        HashSet<string>? mutableNames = null)
     {
+        mutableNames ??= new HashSet<string>();
+
         // Use precondition literals from DNF decomposition if available, otherwise from raw expressions
         var preStrings = preLiterals != null && preLiterals.Count > 0
             ? preLiterals
@@ -33,7 +36,9 @@ static class BoundaryAnalysis
 
             if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
             {
-                var smtName = TypeUtils.SeqSmtName(name, type);
+                // Boundary tiers constrain input (pre-state) sizes
+                var smtBase = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                var smtName = TypeUtils.SeqSmtName(smtBase, type);
                 // Size tiers: 0, 1, ..., tierCount-1
                 // For seq/string with size > 1, add distinctness constraints on elements
                 // to help Z3 avoid spurious SAT from incomplete quantifier reasoning

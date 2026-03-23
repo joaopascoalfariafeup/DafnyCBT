@@ -549,7 +549,31 @@ class Program
         // Collect input/output variable info
         var inputs = method.Ins.Select(f => (f.Name, Type: f.Type.ToString())).ToList();
         var outputs = method.Outs.Select(f => (f.Name, Type: f.Type.ToString())).ToList();
-        var allVars = inputs.Concat(outputs).ToList();
+
+        // Determine mutable parameters from method's modifies clause
+        var mutableNames = new HashSet<string>();
+        if (method.Mod?.Expressions != null)
+            foreach (var fe in method.Mod.Expressions)
+            {
+                var exprStr = DnfEngine.ExprToString(fe.E);
+                if (Regex.IsMatch(exprStr, @"^\w+$"))
+                    mutableNames.Add(exprStr);
+            }
+        if (mutableNames.Count > 0 && verbose)
+            Console.WriteLine($"  Mutable parameters (pre/post split): {string.Join(", ", mutableNames)}");
+
+        // Build allVars for Z3 model parsing — split mutable arrays into _pre and _post
+        var allVars = new List<(string Name, string Type)>();
+        foreach (var v in inputs.Concat(outputs))
+        {
+            if (mutableNames.Contains(v.Name) && TypeUtils.IsArrayType(v.Type))
+            {
+                allVars.Add(($"{v.Name}_pre", v.Type));
+                allVars.Add(($"{v.Name}_post", v.Type));
+            }
+            else
+                allVars.Add(v);
+        }
 
         // Determine if we need sequences (for array params)
         bool hasArrayParam = inputs.Any(v => v.Type.StartsWith("array<") || v.Type == "array");
@@ -620,7 +644,7 @@ class Program
         {
             for (int pi = 0; pi < preCombinations.Count; pi++)
             {
-                boundaryTiersPerPre[pi] = BoundaryAnalysis.BuildBoundaryTiers(inputs, preClauses, method, verbose, tierCount, preCombinations[pi].preLits);
+                boundaryTiersPerPre[pi] = BoundaryAnalysis.BuildBoundaryTiers(inputs, preClauses, method, verbose, tierCount, preCombinations[pi].preLits, mutableNames);
             }
             if (boundary)
                 Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
@@ -726,7 +750,7 @@ class Program
             List<string> lits, List<string> preLits, List<string> excl, List<string> extra)
         {
             Console.WriteLine($"  Solving combination {solveLabel} ({schedIdx}/{schedTotal})...");
-            var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits, backgroundPostconditions);
+            var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
             if (verbose)
             {
                 Console.WriteLine($"  [DEBUG] SMT2 query for {solveLabel}:");
@@ -760,7 +784,7 @@ class Program
                 {
                     var simplifiedLits = lits.Where(l => !l.Contains("exists ")).ToList();
                     Console.WriteLine($"  Combination {solveLabel}: unknown, retrying without {existsLits.Count} exists-quantified postcondition(s)...");
-                    var smt2 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, simplifiedLits, method, verbose, excl, extra, preLits, backgroundPostconditions);
+                    var smt2 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, simplifiedLits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
                     if (verbose)
                     {
                         Console.WriteLine($"  [DEBUG] Retry SMT2 query for {solveLabel}:");
@@ -785,7 +809,7 @@ class Program
                 {
                     var emptyLits = new List<string>();
                     Console.WriteLine($"  Combination {solveLabel}: retrying with input-only constraints...");
-                    var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, emptyLits, method, verbose, excl, extra, preLits, backgroundPostconditions);
+                    var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, emptyLits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
                     if (verbose)
                     {
                         Console.WriteLine($"  [DEBUG] Input-only SMT2 query for {solveLabel}:");
@@ -811,7 +835,8 @@ class Program
             return null;
         }
 
-        // Helper: build an SMT exclusion constraint from a set of input values
+        // Helper: build an SMT exclusion constraint from a set of input values.
+        // For mutable arrays, use _pre names (we're excluding based on input values).
         string? BuildInputExclusion(Dictionary<string, string> values)
         {
             var eqParts = new List<string>();
@@ -819,9 +844,10 @@ class Program
             {
                 if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
                 {
-                    if (values.TryGetValue(name + "_len", out var lenVal))
+                    var prefix = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                    if (values.TryGetValue(prefix + "_len", out var lenVal))
                     {
-                        var smtLen = TypeUtils.IsArrayType(type) ? $"{name}_len" : $"(seq.len {name})";
+                        var smtLen = TypeUtils.IsArrayType(type) ? $"{prefix}_len" : $"(seq.len {prefix})";
                         eqParts.Add($"(= {smtLen} {lenVal})");
                     }
                 }
@@ -1003,18 +1029,19 @@ class Program
         var seenKeys = new Dictionary<string, int>(); // key -> index in deduped
         foreach (var tc in testCases)
         {
-            // Build a key from input values only
+            // Build a key from input values only (use _pre for mutable arrays)
             var key = string.Join("|", method.Ins.Select(inp =>
             {
                 var name = inp.Name;
                 var type = inp.Type.ToString();
+                var prefix = mutableNames.Contains(name) ? $"{name}_pre" : name;
                 if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
                 {
-                    tc.values.TryGetValue(name + "_len", out var len);
-                    tc.values.TryGetValue(name + "_elems", out var elems);
+                    tc.values.TryGetValue(prefix + "_len", out var len);
+                    tc.values.TryGetValue(prefix + "_elems", out var elems);
                     return $"{name}:{len}:{elems}";
                 }
-                tc.values.TryGetValue(name, out var val);
+                tc.values.TryGetValue(prefix, out var val);
                 return $"{name}:{val}";
             }));
             if (!seenKeys.ContainsKey(key))
@@ -1049,7 +1076,7 @@ class Program
         }
 
         // Emit Dafny test file
-        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, deduped, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs);
+        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, deduped, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames);
     }
 
 }

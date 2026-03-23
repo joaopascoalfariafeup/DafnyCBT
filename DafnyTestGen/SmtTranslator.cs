@@ -46,31 +46,48 @@ static class SmtTranslator
         List<string>? exclusions = null,
         List<string>? extraConstraints = null,
         List<string>? preLiterals = null,
-        List<string>? backgroundPostconditions = null)
+        List<string>? backgroundPostconditions = null,
+        HashSet<string>? mutableNames = null)
     {
+        mutableNames ??= new HashSet<string>();
+
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("(set-option :produce-models true)");
         sb.AppendLine("(set-logic ALL)");
         sb.AppendLine();
 
-        // Declare variables for inputs and outputs
+        // Declare variables for inputs and outputs.
+        // For mutable array params (listed in method's modifies clause), declare separate
+        // _pre and _post variables so Z3 can independently assign pre-state (input) and
+        // post-state (output) values. This prevents postconditions like IsSorted(a[..])
+        // from constraining inputs.
         var allVars = inputs.Concat(outputs).ToList();
         foreach (var (name, type) in allVars)
         {
-            var smtType = TypeUtils.DafnyTypeToSmt(type);
-            sb.AppendLine($"(declare-const {name} {smtType})");
-            // Constrain nat-typed variables to be non-negative
-            if (type == "nat")
-                sb.AppendLine($"(assert (>= {name} 0))");
-            // Constrain standalone char variables to printable ASCII (32-126)
-            if (type == "char")
+            if (mutableNames.Contains(name) && TypeUtils.IsArrayType(type))
             {
-                sb.AppendLine($"(assert (>= {name} 32))");
-                sb.AppendLine($"(assert (<= {name} 126))");
+                var smtType = TypeUtils.DafnyTypeToSmt(type);
+                sb.AppendLine($"(declare-const {name}_pre {smtType})");
+                sb.AppendLine($"(declare-const {name}_post {smtType})");
+                sb.AppendLine($"(assert (= {name}_pre {name}_post))"); // length preserved
+                if (type == "nat")
+                    sb.AppendLine($"(assert (>= {name}_pre 0))");
+            }
+            else
+            {
+                var smtType = TypeUtils.DafnyTypeToSmt(type);
+                sb.AppendLine($"(declare-const {name} {smtType})");
+                if (type == "nat")
+                    sb.AppendLine($"(assert (>= {name} 0))");
+                if (type == "char")
+                {
+                    sb.AppendLine($"(assert (>= {name} 32))");
+                    sb.AppendLine($"(assert (<= {name} 126))");
+                }
             }
         }
 
-        // For array params, declare a companion sequence and length alias
+        // For array params, declare companion sequence(s) and length alias(es)
         foreach (var (name, type) in inputs)
         {
             if (TypeUtils.IsArrayType(type))
@@ -78,31 +95,60 @@ static class SmtTranslator
                 var elemType = type.StartsWith("array<")
                     ? TypeUtils.DafnyTypeToSmt(type.Substring(6, type.Length - 7))
                     : "Int";
-                sb.AppendLine($"(declare-const {name}_seq (Seq {elemType}))");
-                sb.AppendLine($"(define-fun {name}_len () Int (seq.len {name}_seq))");
+                if (mutableNames.Contains(name))
+                {
+                    // Naming: a_pre -> a_pre_seq, a_pre_len (matches TypeUtils.SeqSmtName)
+                    sb.AppendLine($"(declare-const {name}_pre_seq (Seq {elemType}))");
+                    sb.AppendLine($"(declare-const {name}_post_seq (Seq {elemType}))");
+                    sb.AppendLine($"(define-fun {name}_pre_len () Int (seq.len {name}_pre_seq))");
+                    sb.AppendLine($"(define-fun {name}_post_len () Int (seq.len {name}_post_seq))");
+                    sb.AppendLine($"(assert (= (seq.len {name}_pre_seq) (seq.len {name}_post_seq)))");
+                }
+                else
+                {
+                    sb.AppendLine($"(declare-const {name}_seq (Seq {elemType}))");
+                    sb.AppendLine($"(define-fun {name}_len () Int (seq.len {name}_seq))");
+                }
             }
         }
 
-        // Bound all sequence lengths (seq and array) for tractability
-        // For char sequences, also constrain elements to printable ASCII
+        // Bound all sequence lengths for tractability; constrain char elements to printable ASCII
         foreach (var (name, type) in inputs.Concat(outputs).ToList())
         {
             if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
             {
-                var smtName = TypeUtils.SeqSmtName(name, type);
-                sb.AppendLine($"(assert (>= (seq.len {smtName}) 0))");
-                sb.AppendLine($"(assert (<= (seq.len {smtName}) {MAX_SEQ_LEN}))");
-
-                // Constrain char elements to printable ASCII (32-126)
-                var elemType = TypeUtils.GetSeqElementType(type);
-                if (elemType == "char")
+                if (mutableNames.Contains(name) && TypeUtils.IsArrayType(type))
                 {
-                    sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
+                    foreach (var smtName in new[] { $"{name}_pre_seq", $"{name}_post_seq" })
+                    {
+                        sb.AppendLine($"(assert (>= (seq.len {smtName}) 0))");
+                        sb.AppendLine($"(assert (<= (seq.len {smtName}) {MAX_SEQ_LEN}))");
+                        var elemTypeStr = TypeUtils.GetSeqElementType(type);
+                        if (elemTypeStr == "char")
+                            sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
+                    }
+                }
+                else
+                {
+                    var smtName = TypeUtils.SeqSmtName(name, type);
+                    sb.AppendLine($"(assert (>= (seq.len {smtName}) 0))");
+                    sb.AppendLine($"(assert (<= (seq.len {smtName}) {MAX_SEQ_LEN}))");
+                    var elemType = TypeUtils.GetSeqElementType(type);
+                    if (elemType == "char")
+                        sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
                 }
             }
         }
 
         sb.AppendLine();
+
+        // Build renamed input lists for DafnyExprToSmt context.
+        // Mutable param "a" becomes "a_pre" in preconditions, "a_post" in postconditions.
+        // DafnyExprToSmt then naturally produces a_pre_seq, a_pre_len, a_post_seq, etc.
+        var preInputs = inputs.Select(v =>
+            mutableNames.Contains(v.Name) ? ($"{v.Name}_pre", v.Type) : v).ToList();
+        var postInputs = inputs.Select(v =>
+            mutableNames.Contains(v.Name) ? ($"{v.Name}_post", v.Type) : v).ToList();
 
         // Reset well-formedness guards, uninterpreted functions, and translation status
         _wfGuards.Clear();
@@ -112,7 +158,8 @@ static class SmtTranslator
         // Collect assertions in a separate buffer so we can discover uninterpreted functions first
         var assertions = new System.Text.StringBuilder();
 
-        // Encode postcondition literals (skip fresh() which is specification-only)
+        // Encode postcondition literals (skip fresh() which is specification-only).
+        // For mutable params, rewrite: old(a[..]) -> a_pre[..], bare a[..] -> a_post[..]
         foreach (var literal in postLiterals)
         {
             if (TypeUtils.IsSpecOnlyLiteral(literal))
@@ -120,7 +167,8 @@ static class SmtTranslator
                 assertions.AppendLine($"; Skipped specification-only literal: {literal}");
                 continue;
             }
-            var smtExpr = DafnyExprToSmt(literal, inputs);
+            var rewritten = RewriteForPostState(literal, mutableNames);
+            var smtExpr = DafnyExprToSmt(rewritten, postInputs);
             if (smtExpr != null)
                 assertions.AppendLine($"(assert {smtExpr})");
             else
@@ -131,25 +179,25 @@ static class SmtTranslator
         }
 
         // Assert full (un-decomposed) postconditions as background constraints.
-        // This catches cases where DNF decomposition loses quantifier range guards,
-        // e.g., exists k :: 2<=k<n && P(k) decomposed into P(2) without guard n>2.
+        // This catches cases where DNF decomposition loses quantifier range guards.
         if (backgroundPostconditions != null)
         {
             foreach (var bgPost in backgroundPostconditions)
             {
-                var smtExpr = DafnyExprToSmt(bgPost, inputs);
+                var rewritten = RewriteForPostState(bgPost, mutableNames);
+                var smtExpr = DafnyExprToSmt(rewritten, postInputs);
                 if (smtExpr != null)
                     assertions.AppendLine($"(assert {smtExpr})");
             }
         }
 
-        // Encode preconditions
+        // Encode preconditions (constrain pre-state variables)
         if (preLiterals != null && preLiterals.Count > 0)
         {
-            // Use decomposed precondition literals (from DNF decomposition)
             foreach (var preLit in preLiterals)
             {
-                var smtExpr = DafnyExprToSmt(preLit, inputs);
+                var rewritten = RewriteForPreState(preLit, mutableNames);
+                var smtExpr = DafnyExprToSmt(rewritten, preInputs);
                 if (smtExpr != null)
                     assertions.AppendLine($"(assert {smtExpr})");
                 else
@@ -158,11 +206,11 @@ static class SmtTranslator
         }
         else
         {
-            // Fallback: use raw precondition expressions
             foreach (var pre in preClauses)
             {
                 var preStr = DnfEngine.ExprToString(pre);
-                var smtExpr = DafnyExprToSmt(preStr, inputs);
+                var rewritten = RewriteForPreState(preStr, mutableNames);
+                var smtExpr = DafnyExprToSmt(rewritten, preInputs);
                 if (smtExpr != null)
                     assertions.AppendLine($"(assert {smtExpr})");
                 else
@@ -182,14 +230,30 @@ static class SmtTranslator
 
         // Assert well-formedness guards (e.g., seq index bounds)
         // Filter out guards that reference quantifier-bound variables (not declared at top level)
-        var declaredNames = new HashSet<string>(allVars.Select(v => v.Name));
+        var declaredNames = new HashSet<string>(allVars.SelectMany(v =>
+        {
+            if (mutableNames.Contains(v.Name) && TypeUtils.IsArrayType(v.Type))
+                return new[] { $"{v.Name}_pre", $"{v.Name}_post" };
+            return new[] { v.Name };
+        }));
         // Also include companion names (_len, _seq) for arrays/sequences
         foreach (var (name, type) in allVars)
         {
             if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
             {
-                declaredNames.Add(name + "_len");
-                declaredNames.Add(name + "_seq");
+                if (mutableNames.Contains(name))
+                {
+                    foreach (var suffix in new[] { "_pre", "_post" })
+                    {
+                        declaredNames.Add(name + suffix + "_len");
+                        declaredNames.Add(name + suffix + "_seq");
+                    }
+                }
+                else
+                {
+                    declaredNames.Add(name + "_len");
+                    declaredNames.Add(name + "_seq");
+                }
             }
         }
         foreach (var guard in _wfGuards)
@@ -211,7 +275,9 @@ static class SmtTranslator
             foreach (var excl in exclusions)
             {
                 var wfBefore = _wfGuards.Count;
-                var smtExpr = DafnyExprToSmt(excl, inputs);
+                // Exclusions are postcondition literals — rewrite for post-state
+                var rewrittenExcl = RewriteForPostState(excl, mutableNames);
+                var smtExpr = DafnyExprToSmt(rewrittenExcl, postInputs);
                 if (smtExpr != null)
                 {
                     // Collect WF guards generated specifically by this exclusion
@@ -257,14 +323,92 @@ static class SmtTranslator
         {
             if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
             {
-                var smtName = TypeUtils.SeqSmtName(name, type);
-                sb.AppendLine($"(get-value ((seq.len {smtName})))");
-                for (int i = 0; i < 8; i++)
-                    sb.AppendLine($"(get-value ((seq.nth {smtName} {i})))");
+                if (mutableNames.Contains(name) && TypeUtils.IsArrayType(type))
+                {
+                    // Get both pre and post sequence values
+                    foreach (var suffix in new[] { "_pre", "_post" })
+                    {
+                        var smtName = $"{name}{suffix}_seq";
+                        sb.AppendLine($"(get-value ((seq.len {smtName})))");
+                        for (int i = 0; i < 8; i++)
+                            sb.AppendLine($"(get-value ((seq.nth {smtName} {i})))");
+                    }
+                }
+                else
+                {
+                    var smtName = TypeUtils.SeqSmtName(name, type);
+                    sb.AppendLine($"(get-value ((seq.len {smtName})))");
+                    for (int i = 0; i < 8; i++)
+                        sb.AppendLine($"(get-value ((seq.nth {smtName} {i})))");
+                }
             }
         }
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Rewrites a precondition literal so that mutable variable references point to pre-state.
+    /// For each mutable name "a", renames bare occurrences to "a_pre".
+    /// </summary>
+    internal static string RewriteForPreState(string literal, HashSet<string> mutableNames)
+    {
+        if (mutableNames.Count == 0) return literal;
+        var result = literal;
+        foreach (var name in mutableNames)
+            result = Regex.Replace(result,
+                @"(?<![a-zA-Z_])" + Regex.Escape(name) + @"(?![a-zA-Z_0-9])",
+                $"{name}_pre");
+        return result;
+    }
+
+    /// <summary>
+    /// Rewrites a postcondition literal so that:
+    /// - old(a[expr]) / old(a[..]) / old(a.Length) -> a_pre[expr] / a_pre[..] / a_pre.Length
+    /// - bare a[expr] / a[..] / a.Length -> a_post[expr] / a_post[..] / a_post.Length
+    /// Non-mutable variables are left unchanged.
+    /// </summary>
+    internal static string RewriteForPostState(string literal, HashSet<string> mutableNames)
+    {
+        if (mutableNames.Count == 0) return literal;
+        var result = literal;
+
+        // Step 1: Handle old() expressions — strip old() and rename mutable refs to _pre.
+        // Process all old(...) occurrences with balanced parenthesis matching.
+        while (true)
+        {
+            var oldMatch = Regex.Match(result, @"\bold\s*\(");
+            if (!oldMatch.Success) break;
+
+            int start = oldMatch.Index + oldMatch.Length; // position after the '('
+            int depth = 1;
+            int pos = start;
+            while (pos < result.Length && depth > 0)
+            {
+                if (result[pos] == '(') depth++;
+                else if (result[pos] == ')') depth--;
+                pos++;
+            }
+            if (depth != 0) break; // unbalanced — safety exit
+
+            var innerExpr = result.Substring(start, pos - 1 - start);
+            // Rename mutable refs in the inner expression to _pre
+            var rewrittenInner = innerExpr;
+            foreach (var name in mutableNames)
+                rewrittenInner = Regex.Replace(rewrittenInner,
+                    @"(?<![a-zA-Z_])" + Regex.Escape(name) + @"(?![a-zA-Z_0-9])",
+                    $"{name}_pre");
+
+            result = result.Substring(0, oldMatch.Index) + rewrittenInner + result.Substring(pos);
+        }
+
+        // Step 2: Rename remaining bare mutable references to _post
+        foreach (var name in mutableNames)
+            result = Regex.Replace(result,
+                @"(?<![a-zA-Z_])" + Regex.Escape(name) + @"(?![a-zA-Z_0-9])",
+                $"{name}_post");
+
+        return result;
     }
 
     /// <summary>

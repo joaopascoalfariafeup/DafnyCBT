@@ -242,7 +242,8 @@ static class TestEmitter
         List<List<string>> dnfClauses,
         List<Expression> preClauses,
         bool hasArrayParam,
-        bool hasUninterpFuncs = false)
+        bool hasUninterpFuncs = false,
+        HashSet<string>? mutableNames = null)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("// Auto-generated test cases by DafnyTestGen");
@@ -289,11 +290,22 @@ static class TestEmitter
 
             sb.AppendLine("  {");
 
-            // Emit variable declarations from Z3 model, substituting type parameters
+            // Emit variable declarations from Z3 model, substituting type parameters.
+            // For mutable arrays, use _pre values (the input/pre-state).
             foreach (var inp in method.Ins)
             {
                 var typeStr = SubstTypeParams(inp.Type.ToString(), typeParamMap);
-                sb.AppendLine(EmitVarDecl(inp.Name, typeStr, values));
+                var emitValues = values;
+                if (mutableNames != null && mutableNames.Contains(inp.Name) && TypeUtils.IsArrayType(typeStr))
+                {
+                    // Remap: look up a_pre_len/a_pre_elems and present as a_len/a_elems
+                    emitValues = new Dictionary<string, string>(values);
+                    if (values.TryGetValue($"{inp.Name}_pre_len", out var preLen))
+                        emitValues[inp.Name + "_len"] = preLen;
+                    if (values.TryGetValue($"{inp.Name}_pre_elems", out var preElems))
+                        emitValues[inp.Name + "_elems"] = preElems;
+                }
+                sb.AppendLine(EmitVarDecl(inp.Name, typeStr, emitValues));
             }
 
             // Capture old() expressions before the method call.
@@ -322,11 +334,12 @@ static class TestEmitter
                 .Select(lit => ReplaceOldReferences(lit, oldCaptures, arrayParamNames))
                 .ToList();
 
-            // Emit expect assertions
-            if (hasUninterpFuncs)
+            // Emit expect assertions.
+            // Use postcondition literals when: uninterpreted functions, or method modifies
+            // state (the interesting outputs are in the modified variables, not return values).
+            bool useLiteralExpects = hasUninterpFuncs || (mutableNames != null && mutableNames.Count > 0);
+            if (useLiteralExpects)
             {
-                // Output values from Z3 are not meaningful (uninterpreted functions).
-                // Instead, emit the postcondition literals as expect statements.
                 foreach (var lit in expectLiterals)
                     sb.AppendLine($"    expect {lit};");
             }
