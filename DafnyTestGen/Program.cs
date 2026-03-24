@@ -248,6 +248,24 @@ class Program
                 continue;
             }
 
+            // Check for non-inlinable function calls in postconditions (e.g., recursive/ghost functions)
+            // These become uninterpreted in SMT and produce incorrect test values.
+            var builtInFuncs = new HashSet<string> { "IsSorted" };
+            var inlinableNames = new HashSet<string>(inlinablePredicates.Select(p => p.name));
+            var allFuncCalls = new HashSet<string>();
+            foreach (var ens in method.Ens)
+                foreach (var name in FindFunctionCalls(ens.E))
+                    allFuncCalls.Add(name);
+            var unsupportedFuncs = allFuncCalls
+                .Where(f => !builtInFuncs.Contains(f) && !inlinableNames.Contains(f))
+                .ToList();
+            if (unsupportedFuncs.Count > 0)
+            {
+                Console.WriteLine($"  Skipping: postcondition calls non-inlinable function(s) {string.Join(", ", unsupportedFuncs.Select(f => $"'{f}'"))} (recursive or ghost — cannot translate to SMT)");
+                Console.WriteLine();
+                continue;
+            }
+
             if (verbose)
             {
                 DafnyParser.DisplayContracts(method);
@@ -1111,6 +1129,27 @@ class Program
 
         // Emit Dafny test file
         return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames);
+    }
+
+    /// <summary>
+    /// Collect all function call names from an expression tree (recursive walk).
+    /// </summary>
+    static HashSet<string> FindFunctionCalls(Expression expr)
+    {
+        var names = new HashSet<string>();
+        CollectFunctionCalls(expr, names);
+        return names;
+    }
+
+    static void CollectFunctionCalls(Expression expr, HashSet<string> names)
+    {
+        if (expr is FunctionCallExpr funcCall)
+            names.Add(funcCall.Name);
+        // Unresolved function calls appear as ApplySuffix with a NameSegment as Lhs
+        if (expr is ApplySuffix apply && apply.Lhs is NameSegment ns)
+            names.Add(ns.Name);
+        foreach (var sub in expr.SubExpressions)
+            CollectFunctionCalls(sub, names);
     }
 
     /// <summary>
