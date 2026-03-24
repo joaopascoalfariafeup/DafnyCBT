@@ -667,7 +667,7 @@ static class SmtTranslator
             if (match != default && (TypeUtils.IsSeqType(match.Type) || TypeUtils.IsArrayType(match.Type)))
                 return true;
         }
-        if (expr is SeqSelectExpr) return true;
+        if (expr is SeqSelectExpr sel && !sel.SelectOne) return true;
         if (expr is OldExpr oldE) return IsSeqExprAst(oldE.Expr, inputs);
         return false;
     }
