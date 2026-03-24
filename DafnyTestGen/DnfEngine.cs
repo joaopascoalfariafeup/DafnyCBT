@@ -486,6 +486,276 @@ static class DnfEngine
         return new LeafExpression(dafnyExpr);
     }
 
+    // ───────── Contradiction detection (pre-Z3 pruning) ─────────
+
+    /// <summary>
+    /// Checks if a set of literals (conjuncts) contains a syntactic contradiction,
+    /// making the conjunction trivially UNSAT without needing Z3.
+    /// Detects:
+    ///   1. Direct complements: L and !(L) both present
+    ///   2. Relational contradictions: e.g., x &lt; 0 and x &gt; 0, or x == 0 and x != 0
+    ///   3. Equality contradictions: x == v1 and x == v2 where v1 != v2
+    /// Returns a human-readable reason string, or null if no contradiction is found.
+    /// </summary>
+    internal static string? FindContradiction(List<Expression> literals)
+    {
+        // Convert all literals to string keys for complement checking
+        var litKeys = literals.Select(ExprToString).ToList();
+
+        // 1. Direct complement detection: L and !(L)
+        var positiveSet = new HashSet<string>();
+        var negativeSet = new HashSet<string>(); // stores the inner expression of !(...)
+        foreach (var key in litKeys)
+        {
+            if (key.StartsWith("!(") && key.EndsWith(")"))
+            {
+                var inner = key.Substring(2, key.Length - 3);
+                negativeSet.Add(inner);
+                if (positiveSet.Contains(inner))
+                    return $"complement: {inner} ∧ !({inner})";
+            }
+            else
+            {
+                positiveSet.Add(key);
+                if (negativeSet.Contains(key))
+                    return $"complement: {key} ∧ !({key})";
+            }
+        }
+
+        // 2 & 3. Relational contradiction detection via AST analysis
+        // Extract relational facts: (variable_key, operator, value_key) triples
+        var facts = new List<(string varKey, BinaryExpr.Opcode op, string valKey, string original)>();
+        foreach (var lit in literals)
+        {
+            ExtractRelationalFacts(lit, facts);
+        }
+
+        // Group facts by variable and check for incompatibilities
+        var byVar = facts.GroupBy(f => f.varKey);
+        foreach (var group in byVar)
+        {
+            var flist = group.ToList();
+            for (int i = 0; i < flist.Count; i++)
+            {
+                for (int j = i + 1; j < flist.Count; j++)
+                {
+                    var reason = CheckRelationalContradiction(flist[i], flist[j]);
+                    if (reason != null)
+                        return reason;
+                }
+            }
+        }
+
+        return null; // No contradiction found
+    }
+
+    /// <summary>
+    /// Extract relational facts from a literal expression (possibly negated).
+    /// Handles patterns: x op y, !(x op y), where op is a comparison.
+    /// </summary>
+    static void ExtractRelationalFacts(Expression expr, List<(string varKey, BinaryExpr.Opcode op, string valKey, string original)> facts)
+    {
+        var unwrapped = Unwrap(expr);
+
+        // Handle negation: !(x op y) -> flip the operator
+        bool isNegated = false;
+        if (unwrapped is UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not } neg)
+        {
+            unwrapped = Unwrap(neg.E);
+            isNegated = true;
+        }
+
+        if (unwrapped is BinaryExpr bin)
+        {
+            var op = bin.Op;
+            // Only handle comparison operators
+            if (op == BinaryExpr.Opcode.Lt || op == BinaryExpr.Opcode.Le ||
+                op == BinaryExpr.Opcode.Gt || op == BinaryExpr.Opcode.Ge ||
+                op == BinaryExpr.Opcode.Eq || op == BinaryExpr.Opcode.Neq)
+            {
+                var lhs = ExprToString(bin.E0);
+                var rhs = ExprToString(bin.E1);
+                var effectiveOp = isNegated ? NegateOp(op) : op;
+                var original = ExprToString(expr);
+
+                // Try both orientations: lhs op rhs -> fact about lhs, and rhs flipped-op lhs -> fact about rhs
+                facts.Add((lhs, effectiveOp, rhs, original));
+                facts.Add((rhs, FlipOp(effectiveOp), lhs, original));
+            }
+        }
+
+        // Also handle LeafExpression with string-based patterns
+        if (unwrapped is LeafExpression leaf)
+        {
+            ExtractRelationalFactsFromString(ExprToString(expr), facts);
+        }
+    }
+
+    /// <summary>
+    /// Extract relational facts from a string representation (for LeafExpression).
+    /// Handles patterns like "x &lt; 0", "!(x == 5)", etc.
+    /// </summary>
+    static void ExtractRelationalFactsFromString(string litStr, List<(string varKey, BinaryExpr.Opcode op, string valKey, string original)> facts)
+    {
+        var s = litStr.Trim();
+        bool isNegated = false;
+        if (s.StartsWith("!(") && s.EndsWith(")"))
+        {
+            s = s.Substring(2, s.Length - 3).Trim();
+            isNegated = true;
+        }
+
+        // Match patterns: LHS op RHS where op is ==, !=, <, <=, >, >=
+        var m = Regex.Match(s, @"^(.+?)\s*(==|!=|<=|>=|<|>)\s*(.+)$");
+        if (m.Success)
+        {
+            var lhs = m.Groups[1].Value.Trim();
+            var opStr = m.Groups[2].Value;
+            var rhs = m.Groups[3].Value.Trim();
+            var op = ParseOp(opStr);
+            if (op.HasValue)
+            {
+                var effectiveOp = isNegated ? NegateOp(op.Value) : op.Value;
+                facts.Add((lhs, effectiveOp, rhs, litStr));
+                facts.Add((rhs, FlipOp(effectiveOp), lhs, litStr));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Parse a string comparison operator into a BinaryExpr.Opcode.
+    /// </summary>
+    static BinaryExpr.Opcode? ParseOp(string opStr) => opStr switch
+    {
+        "==" => BinaryExpr.Opcode.Eq,
+        "!=" => BinaryExpr.Opcode.Neq,
+        "<" => BinaryExpr.Opcode.Lt,
+        "<=" => BinaryExpr.Opcode.Le,
+        ">" => BinaryExpr.Opcode.Gt,
+        ">=" => BinaryExpr.Opcode.Ge,
+        _ => null
+    };
+
+    /// <summary>
+    /// Negate a comparison operator: !(x &lt; y) = x &gt;= y, etc.
+    /// </summary>
+    static BinaryExpr.Opcode NegateOp(BinaryExpr.Opcode op) => op switch
+    {
+        BinaryExpr.Opcode.Lt => BinaryExpr.Opcode.Ge,
+        BinaryExpr.Opcode.Le => BinaryExpr.Opcode.Gt,
+        BinaryExpr.Opcode.Gt => BinaryExpr.Opcode.Le,
+        BinaryExpr.Opcode.Ge => BinaryExpr.Opcode.Lt,
+        BinaryExpr.Opcode.Eq => BinaryExpr.Opcode.Neq,
+        BinaryExpr.Opcode.Neq => BinaryExpr.Opcode.Eq,
+        _ => op
+    };
+
+    /// <summary>
+    /// Flip a comparison operator for the other operand: (x &lt; y) means (y &gt; x).
+    /// </summary>
+    static BinaryExpr.Opcode FlipOp(BinaryExpr.Opcode op) => op switch
+    {
+        BinaryExpr.Opcode.Lt => BinaryExpr.Opcode.Gt,
+        BinaryExpr.Opcode.Le => BinaryExpr.Opcode.Ge,
+        BinaryExpr.Opcode.Gt => BinaryExpr.Opcode.Lt,
+        BinaryExpr.Opcode.Ge => BinaryExpr.Opcode.Le,
+        _ => op  // Eq and Neq are symmetric
+    };
+
+    /// <summary>
+    /// Check if two relational facts about the same variable are contradictory.
+    /// Returns a reason string or null.
+    /// </summary>
+    static string? CheckRelationalContradiction(
+        (string varKey, BinaryExpr.Opcode op, string valKey, string original) a,
+        (string varKey, BinaryExpr.Opcode op, string valKey, string original) b)
+    {
+        // Same variable, same value, contradictory operators
+        if (a.valKey == b.valKey)
+        {
+            // x == v and x != v
+            if ((a.op == BinaryExpr.Opcode.Eq && b.op == BinaryExpr.Opcode.Neq) ||
+                (a.op == BinaryExpr.Opcode.Neq && b.op == BinaryExpr.Opcode.Eq))
+                return $"contradiction: {a.original} ∧ {b.original}";
+
+            // x < v and x >= v (or x > v and x <= v, etc.)
+            if ((a.op == BinaryExpr.Opcode.Lt && b.op == BinaryExpr.Opcode.Ge) ||
+                (a.op == BinaryExpr.Opcode.Ge && b.op == BinaryExpr.Opcode.Lt) ||
+                (a.op == BinaryExpr.Opcode.Le && b.op == BinaryExpr.Opcode.Gt) ||
+                (a.op == BinaryExpr.Opcode.Gt && b.op == BinaryExpr.Opcode.Le))
+                return $"contradiction: {a.original} ∧ {b.original}";
+
+            // x < v and x > v, x < v and x == v, x > v and x == v
+            if ((a.op == BinaryExpr.Opcode.Lt && b.op == BinaryExpr.Opcode.Gt) ||
+                (a.op == BinaryExpr.Opcode.Gt && b.op == BinaryExpr.Opcode.Lt))
+                return $"contradiction: {a.original} ∧ {b.original}";
+            if ((a.op == BinaryExpr.Opcode.Lt && b.op == BinaryExpr.Opcode.Eq) ||
+                (a.op == BinaryExpr.Opcode.Eq && b.op == BinaryExpr.Opcode.Lt))
+                return $"contradiction: {a.original} ∧ {b.original}";
+            if ((a.op == BinaryExpr.Opcode.Gt && b.op == BinaryExpr.Opcode.Eq) ||
+                (a.op == BinaryExpr.Opcode.Eq && b.op == BinaryExpr.Opcode.Gt))
+                return $"contradiction: {a.original} ∧ {b.original}";
+        }
+
+        // Different values: x == v1 and x == v2 where v1 != v2
+        if (a.op == BinaryExpr.Opcode.Eq && b.op == BinaryExpr.Opcode.Eq && a.valKey != b.valKey)
+            return $"contradiction: {a.original} ∧ {b.original} (distinct equalities)";
+
+        // Try numeric comparison: x < a and x > b where a <= b (impossible for integers when a <= b)
+        // x < a and x > b -> needs a > b + 1 for integers (a > b for reals), conservatively use a <= b
+        if (TryParseNumeric(a.valKey, out var va) && TryParseNumeric(b.valKey, out var vb))
+        {
+            // x < va and x > vb: needs va > vb + 1 (integer), so contradiction when va <= vb
+            if (a.op == BinaryExpr.Opcode.Lt && b.op == BinaryExpr.Opcode.Gt && va <= vb)
+                return $"contradiction: {a.original} ∧ {b.original} (numeric: {a.varKey} < {va} ∧ {a.varKey} > {vb})";
+            if (a.op == BinaryExpr.Opcode.Gt && b.op == BinaryExpr.Opcode.Lt && vb <= va)
+                return $"contradiction: {a.original} ∧ {b.original} (numeric: {a.varKey} > {va} ∧ {a.varKey} < {vb})";
+
+            // x < va and x >= vb: contradiction when va <= vb
+            if (a.op == BinaryExpr.Opcode.Lt && b.op == BinaryExpr.Opcode.Ge && va <= vb)
+                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
+            if (a.op == BinaryExpr.Opcode.Ge && b.op == BinaryExpr.Opcode.Lt && vb <= va)
+                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
+
+            // x <= va and x > vb: contradiction when va < vb
+            if (a.op == BinaryExpr.Opcode.Le && b.op == BinaryExpr.Opcode.Gt && va < vb)
+                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
+            if (a.op == BinaryExpr.Opcode.Gt && b.op == BinaryExpr.Opcode.Le && vb < va)
+                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
+
+            // x == va and x < vb: contradiction when va >= vb
+            if (a.op == BinaryExpr.Opcode.Eq && b.op == BinaryExpr.Opcode.Lt && va >= vb)
+                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
+            if (a.op == BinaryExpr.Opcode.Lt && b.op == BinaryExpr.Opcode.Eq && vb >= va)
+                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
+
+            // x == va and x > vb: contradiction when va <= vb
+            if (a.op == BinaryExpr.Opcode.Eq && b.op == BinaryExpr.Opcode.Gt && va <= vb)
+                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
+            if (a.op == BinaryExpr.Opcode.Gt && b.op == BinaryExpr.Opcode.Eq && vb <= va)
+                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
+
+            // x == va and x != vb: not a contradiction (different values)
+            // x == va and x == vb where va != vb: already handled above
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Try to parse a string as a numeric value (integer or decimal).
+    /// </summary>
+    static bool TryParseNumeric(string s, out double value)
+    {
+        s = s.Trim();
+        // Handle negative numbers in parens: (- 5) or (-5)
+        if (s.StartsWith("(") && s.EndsWith(")"))
+            s = s.Substring(1, s.Length - 2).Trim();
+        if (s.StartsWith("- "))
+            s = "-" + s.Substring(2);
+        return double.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out value);
+    }
+
     // ──────────── SplitTopLevel (kept for backward compat) ──────────────
 
     /// <summary>

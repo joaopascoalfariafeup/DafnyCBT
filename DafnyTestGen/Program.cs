@@ -703,7 +703,7 @@ class Program
 
         // Helper: build schedule entries for a given mode (all-comb or simple, with or without boundary)
         void BuildScheduleEntries(
-            List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints)> schedule,
+            List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule,
             bool useAllComb, bool useBoundary)
         {
             for (int pi = 0; pi < preCombinations.Count; pi++)
@@ -755,11 +755,11 @@ class Program
                         if (useBoundary && bTiers.Count > 0)
                         {
                             foreach (var (tierLabel, tierConstraints) in bTiers)
-                                schedule.Add(($"{label}/B{tierLabel}", mergedLiterals, fullPreLits, exclusions, tierConstraints));
+                                schedule.Add(($"{label}/B{tierLabel}", mergedLiterals, fullPreLits, exclusions, tierConstraints, mask, pi));
                         }
                         else
                         {
-                            schedule.Add((label, mergedLiterals, fullPreLits, exclusions, new List<string>()));
+                            schedule.Add((label, mergedLiterals, fullPreLits, exclusions, new List<string>(), mask, pi));
                         }
                     }
                 }
@@ -769,6 +769,7 @@ class Program
                     {
                         var clause = dnfExprs[ci];
                         var label = $"{fullPreLabel}{ci + 1}";
+                        int simpleMask = 1 << ci; // single clause = single bit
                         var clauseKeys = new HashSet<string>(clause.Select(EKey));
 
                         var exclusions = new List<Expression>();
@@ -787,11 +788,11 @@ class Program
                         if (useBoundary && bTiers.Count > 0)
                         {
                             foreach (var (tierLabel, tierConstraints) in bTiers)
-                                schedule.Add(($"{label}/B{tierLabel}", clause, fullPreLits, exclusions, tierConstraints));
+                                schedule.Add(($"{label}/B{tierLabel}", clause, fullPreLits, exclusions, tierConstraints, simpleMask, pi));
                         }
                         else
                         {
-                            schedule.Add((label, clause, fullPreLits, exclusions, new List<string>()));
+                            schedule.Add((label, clause, fullPreLits, exclusions, new List<string>(), simpleMask, pi));
                         }
                     }
                 }
@@ -917,21 +918,66 @@ class Program
         static string ScheduleKey(List<Expression> literals, List<Expression> exclusions, List<Expression> preLits) =>
             string.Join("|", literals.Select(EKey)) + "||" + string.Join("|", exclusions.Select(EKey)) + "||" + string.Join("|", preLits.Select(EKey));
 
-        // Helper: solve a range of schedule entries, return number of SAT results
+        // Helper: solve a range of schedule entries, return number of SAT results.
+        // Includes UNSAT superset pruning and syntactic contradiction detection.
+        // knownUnsatLiteralMasks: per (preIdx), masks whose merged literals alone are contradictory.
+        //   Any superset mask is also guaranteed UNSAT → skip without calling Z3.
         async Task<int> SolveRange(
-            List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints)> schedule,
+            List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule,
             int from, int to, int displayTotal,
             List<(string label, Dictionary<string, string> values, List<Expression> literals)> results,
             Dictionary<string, List<string>> baseExclusions,
+            Dictionary<int, List<int>> knownUnsatLiteralMasks,
             int earlyStopCount = 0)
         {
             int satCount = 0;
+            int prunedCount = 0;
+            int contradictionCount = 0;
             for (int i = from; i < to; i++)
             {
                 if (TimedOut()) { Console.WriteLine("  Timeout reached, stopping."); break; }
                 if (maxTests > 0 && results.Count >= maxTests) { Console.WriteLine($"  Max tests ({maxTests}) reached, stopping."); break; }
 
-                var (label, literals, preLits, exclusions, extraConstraints) = schedule[i];
+                var (label, literals, preLits, exclusions, extraConstraints, postMask, preIdx) = schedule[i];
+
+                // --- Optimization 1: UNSAT Superset Pruning ---
+                // If any previously-seen mask (whose literals alone were contradictory)
+                // is a subset of the current mask, skip — the merged literals of the
+                // superset will contain the same contradiction.
+                if (knownUnsatLiteralMasks.TryGetValue(preIdx, out var unsatMasks))
+                {
+                    bool pruned = false;
+                    foreach (var unsatMask in unsatMasks)
+                    {
+                        if ((postMask & unsatMask) == unsatMask)
+                        {
+                            Console.WriteLine($"  Combination {label}: UNSAT (pruned: superset of known-UNSAT mask 0x{unsatMask:X})");
+                            pruned = true;
+                            prunedCount++;
+                            break;
+                        }
+                    }
+                    if (pruned) continue;
+                }
+
+                // --- Optimization 2: Syntactic Contradiction Detection ---
+                // Check if the merged literals + preLiterals contain an obvious contradiction
+                // before invoking Z3. This catches e.g. x < 0 ∧ x > 0, r == 0 ∧ r == 1.
+                var allLiterals = new List<Expression>(literals);
+                allLiterals.AddRange(preLits);
+                var contradictionReason = DnfEngine.FindContradiction(allLiterals);
+                if (contradictionReason != null)
+                {
+                    Console.WriteLine($"  Combination {label}: UNSAT (syntactic {contradictionReason})");
+                    contradictionCount++;
+                    // Record this mask for superset pruning (contradiction is in literals only,
+                    // not in exclusions, so any superset mask will have the same literals + more).
+                    if (!knownUnsatLiteralMasks.ContainsKey(preIdx))
+                        knownUnsatLiteralMasks[preIdx] = new List<int>();
+                    knownUnsatLiteralMasks[preIdx].Add(postMask);
+                    continue;
+                }
+
                 var baseKey = ScheduleKey(literals, exclusions, preLits);
 
                 if (!baseExclusions.ContainsKey(baseKey))
@@ -952,13 +998,16 @@ class Program
                         break;
                 }
             }
+            if (prunedCount > 0 || contradictionCount > 0)
+                Console.WriteLine($"  Pruning stats: {contradictionCount} syntactic contradiction(s), {prunedCount} superset-pruned");
             return satCount;
         }
 
         // Build test schedule and solve in phases
-        var testSchedule = new List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints)>();
+        var testSchedule = new List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)>();
         var testCases = new List<(string label, Dictionary<string, string> values, List<Expression> literals)>();
         var baseConditionExclusions = new Dictionary<string, List<string>>();
+        var knownUnsatLiteralMasks = new Dictionary<int, List<int>>(); // per preIdx, masks whose literals are contradictory
 
         if (progressive)
         {
@@ -968,7 +1017,7 @@ class Program
             int totalCombinations = (1 << n) - 1;
             Console.WriteLine($"  Phase 1: all-combinations ({n} clauses -> {totalCombinations} combinations)");
 
-            await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count, testCases, baseConditionExclusions);
+            await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count, testCases, baseConditionExclusions, knownUnsatLiteralMasks);
             Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
 
             if (testCases.Count < minTests && boundaryTiersPerPre.Count > 0
@@ -981,7 +1030,7 @@ class Program
                 Console.WriteLine($"  Phase 2: adding boundary analysis ({newEntries} new entries)");
 
                 await SolveRange(testSchedule, phase2Start, testSchedule.Count, testSchedule.Count,
-                    testCases, baseConditionExclusions, minTests);
+                    testCases, baseConditionExclusions, knownUnsatLiteralMasks, minTests);
                 Console.WriteLine($"  Phase 2 complete: {testCases.Count} test(s)");
             }
 
@@ -993,7 +1042,7 @@ class Program
 
                 var baseConditions = new List<(string baseLabel, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, string baseKey)>();
                 var seenBaseKeys = new HashSet<string>();
-                foreach (var (label, literals, preLits, exclusions, _) in testSchedule)
+                foreach (var (label, literals, preLits, exclusions, _, _, _) in testSchedule)
                 {
                     var baseKey = ScheduleKey(literals, exclusions, preLits);
                     if (seenBaseKeys.Add(baseKey))
@@ -1042,7 +1091,7 @@ class Program
             if (boundary && boundaryTiersPerPre.Count > 0)
                 Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
 
-            await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count, testCases, baseConditionExclusions);
+            await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count, testCases, baseConditionExclusions, knownUnsatLiteralMasks);
 
             // Repeat phase
             if (repeat > 1)
@@ -1050,7 +1099,7 @@ class Program
                 var baseConditions = new List<(string baseLabel, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, string baseKey)>();
                 var seenBaseKeys = new HashSet<string>();
 
-                foreach (var (label, literals, preLits, exclusions, _) in testSchedule)
+                foreach (var (label, literals, preLits, exclusions, _, _, _) in testSchedule)
                 {
                     var baseKey = ScheduleKey(literals, exclusions, preLits);
                     if (seenBaseKeys.Add(baseKey))
