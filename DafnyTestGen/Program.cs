@@ -31,10 +31,13 @@ class Program
         var minTestsOpt = new Option<int>("--min-tests", () => 4, "Minimum test count for progressive auto strategy (default: 4, 0 to disable)");
         minTestsOpt.AddAlias("-n");
         var z3PathOpt = new Option<string?>("--z3-path", "Path to Z3 executable (default: auto-discover from VS Code extension, Z3_PATH env var, or PATH)");
+        var maxTestsOpt = new Option<int>("--max-tests", () => 0, "Maximum number of generated tests per method (0 = unlimited)");
+        maxTestsOpt.AddAlias("-x");
+        var timeoutOpt = new Option<int>("--timeout", () => 0, "Timeout in seconds for test generation per method (0 = unlimited)");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt, minTestsOpt, z3PathOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -51,6 +54,8 @@ class Program
             var repeat = ctx.ParseResult.GetValueForOption(repeatOpt);
             var minTests = ctx.ParseResult.GetValueForOption(minTestsOpt);
             var z3PathCli = ctx.ParseResult.GetValueForOption(z3PathOpt);
+            var maxTests = ctx.ParseResult.GetValueForOption(maxTestsOpt);
+            var timeout = ctx.ParseResult.GetValueForOption(timeoutOpt);
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
             var z3Path = Z3Runner.FindZ3Path(z3PathCli);
@@ -95,7 +100,7 @@ class Program
                 if (files.Count > 1)
                     Console.WriteLine($"{'='} Processing: {file.Name} {'=',40}");
 
-                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat, minTests, z3Path);
+                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat, minTests, z3Path, maxTests, timeout);
 
                 if (files.Count > 1)
                     Console.WriteLine();
@@ -138,7 +143,7 @@ class Program
         return new List<FileInfo>();
     }
 
-    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1, int minTests = 4, string? z3Path = null)
+    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1, int minTests = 4, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0)
     {
         if (!file.Exists)
         {
@@ -258,7 +263,7 @@ class Program
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
             Console.WriteLine();
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path);
+            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs);
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -472,113 +477,72 @@ class Program
     /// For each test condition (PRE && POST_clause), we ask Z3 to find satisfying values.
     /// </summary>
     static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
-        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null)
+        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0)
     {
         z3Path ??= Z3Runner.FindZ3Path();
+        var deadline = timeoutSecs > 0 ? DateTime.UtcNow.AddSeconds(timeoutSecs) : DateTime.MaxValue;
+        bool TimedOut() => DateTime.UtcNow >= deadline;
 
-        // Get DNF clauses (as AST Expressions, then convert to strings for downstream pipeline)
+        // Get DNF clauses as AST Expressions — kept as Expressions throughout the pipeline.
+        // Strings are only used for display, dedup keys, and at the TestEmitter boundary.
         var ensuresClauses = method.Ens.Select(e => e.E).ToList();
         var dnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
         for (int i = 1; i < ensuresClauses.Count; i++)
             dnfExprs = DnfEngine.CrossProduct(dnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
-        var dnfClauses = DnfEngine.ToStringDnf(dnfExprs);
-
-        // Build a map from literal strings to their original AST Expressions.
-        // This avoids the lossy string round-trip (e.g., "!result" → LeafExpression → DafnyExprToSmt fails).
-        var literalExprMap = new Dictionary<string, Expression>();
-        foreach (var clause in dnfExprs)
-            foreach (var expr in clause)
-            {
-                var str = DnfEngine.ExprToString(expr);
-                literalExprMap.TryAdd(str, expr);
-            }
 
         // Build background postconditions: full (un-decomposed) ensures expressions.
         // These are asserted as background constraints to catch cases where DNF decomposition
         // loses quantifier range guards (e.g., forall vacuously true at boundary values).
         var backgroundPostconditions = new List<Expression>(ensuresClauses);
-        if (inlinablePredicates != null && inlinablePredicates.Count > 0)
-        {
-            var smtBuiltins = new HashSet<string> { "IsSorted" };
-            var bgPredsToInline = inlinablePredicates
-                .Where(p => !smtBuiltins.Contains(p.name))
-                .ToList();
-            if (bgPredsToInline.Count > 0)
-                backgroundPostconditions = backgroundPostconditions
-                    .Select(e => {
-                        var str = DnfEngine.ExprToString(e);
-                        var inlined = DafnyParser.InlinePredicates(str, bgPredsToInline);
-                        return inlined != str ? (Expression)new LeafExpression(inlined) : e;
-                    }).ToList();
-        }
 
-        // Keep original DNF clauses for expect emission, create inlined versions for SMT translation.
+        // Keep original DNF for expect emission, create inlined version for SMT translation.
         // Skip predicates with built-in SMT handlers (e.g., IsSorted) to preserve patterns
         // that the SMT translator recognizes.
-        var originalDnfClauses = dnfClauses;
+        var originalDnfExprs = dnfExprs;
+        List<(string name, List<string> paramNames, string body)>? predsToInline = null;
         if (inlinablePredicates != null && inlinablePredicates.Count > 0)
         {
             var smtBuiltins = new HashSet<string> { "IsSorted" };
-            var predsToInline = inlinablePredicates
+            predsToInline = inlinablePredicates
                 .Where(p => !smtBuiltins.Contains(p.name))
                 .ToList();
             if (predsToInline.Count > 0)
             {
-                dnfClauses = dnfClauses.Select(clause =>
-                    clause.Select(lit => DafnyParser.InlinePredicates(lit, predsToInline)).ToList()
+                backgroundPostconditions = backgroundPostconditions
+                    .Select(e => InlineExpr(e, predsToInline)).ToList();
+                dnfExprs = dnfExprs.Select(clause =>
+                    clause.Select(lit => InlineExpr(lit, predsToInline)).ToList()
                 ).ToList();
             }
         }
 
         var preClauses = method.Req.Select(r => r.E).ToList();
 
-        // Decompose preconditions into DNF (as AST, then convert to strings)
+        // Decompose preconditions into DNF as AST
         var preDnfExprs = new List<List<Expression>> { new List<Expression>() }; // trivial "true"
         foreach (var pre in preClauses)
         {
             var preDnf = DnfEngine.ExprToDnf(pre);
             preDnfExprs = DnfEngine.CrossProduct(preDnfExprs, preDnf);
         }
-        var preDnfClauses = DnfEngine.ToStringDnf(preDnfExprs);
-        foreach (var clause in preDnfExprs)
-            foreach (var expr in clause)
-            {
-                var str = DnfEngine.ExprToString(expr);
-                literalExprMap.TryAdd(str, expr);
-            }
         // Remove the empty "true" elements from single-clause results
-        preDnfClauses = preDnfClauses.Select(c => c.Where(s => s.Length > 0).ToList()).ToList();
-        // Inline predicates in precondition literals too, but skip predicates with
-        // built-in SMT handlers (e.g., IsSorted) — inlining would destroy the pattern
-        // that the SMT translator recognizes
-        if (inlinablePredicates != null && inlinablePredicates.Count > 0)
+        preDnfExprs = preDnfExprs.Select(c => c.Where(e => DnfEngine.ExprToString(e).Length > 0).ToList()).ToList();
+        // Inline predicates in precondition literals
+        if (predsToInline != null && predsToInline.Count > 0)
         {
-            var smtBuiltins = new HashSet<string> { "IsSorted" };
-            var predsToInline = inlinablePredicates
-                .Where(p => !smtBuiltins.Contains(p.name))
-                .ToList();
-            if (predsToInline.Count > 0)
-            {
-                preDnfClauses = preDnfClauses.Select(clause =>
-                    clause.Select(lit => DafnyParser.InlinePredicates(lit, predsToInline)).ToList()
-                ).ToList();
-            }
+            preDnfExprs = preDnfExprs.Select(clause =>
+                clause.Select(lit => InlineExpr(lit, predsToInline)).ToList()
+            ).ToList();
         }
-        bool hasDisjunctivePre = preDnfClauses.Count > 1;
+        bool hasDisjunctivePre = preDnfExprs.Count > 1;
         if (hasDisjunctivePre)
-            Console.WriteLine($"  Disjunctive precondition: {preDnfClauses.Count} branches");
+            Console.WriteLine($"  Disjunctive precondition: {preDnfExprs.Count} branches");
 
         // Check for unsolvable patterns after predicate inlining.
-        // Ghost predicates that internally slice sequences with variable indices
-        // (e.g., multiset(b[..i+j])) produce SMT constraints Z3 cannot solve,
-        // causing every query to timeout.
-        var allInlinedLiterals = dnfClauses.SelectMany(c => c)
-            .Concat(preDnfClauses.SelectMany(c => c))
+        var allInlinedLiterals = dnfExprs.SelectMany(c => c).Select(e => DnfEngine.ExprToString(e))
+            .Concat(preDnfExprs.SelectMany(c => c).Select(e => DnfEngine.ExprToString(e)))
             .Concat(backgroundPostconditions.Select(e => DnfEngine.ExprToString(e)));
-        // Pattern: variable-indexed slice inside multiset(), e.g., multiset(b[..][..i0 + j0])
-        // or multiset(b[..expr]) where expr is not empty (contains identifiers)
         var varSliceMultiset = new Regex(@"multiset\([^)]*\[\.\.(?!\])[^)]*\)");
-        // Pattern: double-indexing on variable slices, e.g., b[..][..expr][i]
         var doubleSlice = new Regex(@"\w+\[\.\.?\][^=]*\[\.\.(?!\])");
         if (allInlinedLiterals.Any(lit => varSliceMultiset.IsMatch(lit) || doubleSlice.IsMatch(lit)))
         {
@@ -620,25 +584,27 @@ class Program
         // Determine if we need sequences (for array params)
         bool hasArrayParam = inputs.Any(v => v.Type.StartsWith("array<") || v.Type == "array");
 
-        // Find the common literals shared by all clauses
-        var commonLiterals = dnfClauses.Count > 0
-            ? new HashSet<string>(dnfClauses[0])
+        // Helper: convert Expression to string key for set operations and dedup
+        static string EKey(Expression e) => DnfEngine.ExprToString(e);
+
+        // Find the common literals shared by all clauses (using string keys)
+        var commonLiteralKeys = dnfExprs.Count > 0
+            ? new HashSet<string>(dnfExprs[0].Select(EKey))
             : new HashSet<string>();
-        foreach (var clause in dnfClauses)
-            commonLiterals.IntersectWith(clause);
+        foreach (var clause in dnfExprs)
+            commonLiteralKeys.IntersectWith(clause.Select(EKey));
 
         // Build precondition combinations (all-combinations with exclusions, like postconditions)
-        // Each entry: (label, mergedPreLiterals, preExclusions)
-        var preCommonLiterals = preDnfClauses.Count > 0
-            ? new HashSet<string>(preDnfClauses[0])
+        var preCommonKeys = preDnfExprs.Count > 0
+            ? new HashSet<string>(preDnfExprs[0].Select(EKey))
             : new HashSet<string>();
-        foreach (var pc in preDnfClauses)
-            preCommonLiterals.IntersectWith(pc);
+        foreach (var pc in preDnfExprs)
+            preCommonKeys.IntersectWith(pc.Select(EKey));
 
-        var preCombinations = new List<(string label, List<string> preLits, List<string> preExclusions)>();
+        var preCombinations = new List<(string label, List<Expression> preLits, List<Expression> preExclusions)>();
         if (hasDisjunctivePre)
         {
-            int pm = preDnfClauses.Count;
+            int pm = preDnfExprs.Count;
             int preTotalComb = (1 << pm) - 1;
             Console.WriteLine($"  Disjunctive precondition: {pm} branches -> {preTotalComb} combinations");
 
@@ -651,24 +617,25 @@ class Program
 
                 var label = "P{" + string.Join(",", included.Select(i => (i + 1).ToString())) + "}";
 
-                var mergedPreLits = new List<string>();
+                var mergedPreLits = new List<Expression>();
+                var mergedKeys = new HashSet<string>();
                 foreach (var idx in included)
-                    foreach (var lit in preDnfClauses[idx])
-                        if (!mergedPreLits.Contains(lit))
+                    foreach (var lit in preDnfExprs[idx])
+                        if (mergedKeys.Add(EKey(lit)))
                             mergedPreLits.Add(lit);
 
                 // Build per-clause exclusions for preconditions
-                var preExclusions = new List<string>();
+                var preExclusions = new List<Expression>();
                 for (int bit = 0; bit < pm; bit++)
                 {
                     if ((mask & (1 << bit)) != 0) continue;
-                    var clauseLits = preDnfClauses[bit]
-                        .Where(lit => !preCommonLiterals.Contains(lit) && !mergedPreLits.Contains(lit))
+                    var clauseLits = preDnfExprs[bit]
+                        .Where(lit => !preCommonKeys.Contains(EKey(lit)) && !mergedKeys.Contains(EKey(lit)))
                         .ToList();
                     if (clauseLits.Count == 1)
                         preExclusions.Add(clauseLits[0]);
                     else if (clauseLits.Count > 1)
-                        preExclusions.Add(string.Join(" && ", clauseLits));
+                        preExclusions.Add(ConjoinExprs(clauseLits));
                 }
 
                 preCombinations.Add((label, mergedPreLits, preExclusions));
@@ -677,7 +644,7 @@ class Program
         else
         {
             // Single precondition branch, no exclusions
-            preCombinations.Add(("", preDnfClauses[0], new List<string>()));
+            preCombinations.Add(("", preDnfExprs[0], new List<Expression>()));
         }
 
         // Build boundary tiers per precondition combination (always compute when progressive or boundary)
@@ -686,7 +653,8 @@ class Program
         {
             for (int pi = 0; pi < preCombinations.Count; pi++)
             {
-                boundaryTiersPerPre[pi] = BoundaryAnalysis.BuildBoundaryTiers(inputs, preClauses, method, verbose, tierCount, preCombinations[pi].preLits, mutableNames);
+                var preLitStrings = preCombinations[pi].preLits.Select(EKey).ToList();
+                boundaryTiersPerPre[pi] = BoundaryAnalysis.BuildBoundaryTiers(inputs, preClauses, method, verbose, tierCount, preLitStrings, mutableNames);
             }
             if (boundary)
                 Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
@@ -694,15 +662,15 @@ class Program
 
         // Helper: build schedule entries for a given mode (all-comb or simple, with or without boundary)
         void BuildScheduleEntries(
-            List<(string label, List<string> literals, List<string> preLiterals, List<string> exclusions, List<string> extraConstraints)> schedule,
+            List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints)> schedule,
             bool useAllComb, bool useBoundary)
         {
             for (int pi = 0; pi < preCombinations.Count; pi++)
             {
                 var (preLabel, preLits, preExclusions) = preCombinations[pi];
-                var fullPreLits = new List<string>(preLits);
+                var fullPreLits = new List<Expression>(preLits);
                 foreach (var excl in preExclusions)
-                    fullPreLits.Add($"!({excl})");
+                    fullPreLits.Add(DnfEngine.Negate(excl));
                 var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
                 var bTiers = useBoundary && boundaryTiersPerPre.ContainsKey(pi)
                     ? boundaryTiersPerPre[pi]
@@ -710,7 +678,7 @@ class Program
 
                 if (useAllComb)
                 {
-                    int n = dnfClauses.Count;
+                    int n = dnfExprs.Count;
                     int totalCombinations = (1 << n) - 1;
 
                     for (int mask = 1; mask <= totalCombinations; mask++)
@@ -722,24 +690,25 @@ class Program
 
                         var label = fullPreLabel + "{" + string.Join(",", included.Select(i => (i + 1).ToString())) + "}";
 
-                        var mergedLiterals = new List<string>();
+                        var mergedLiterals = new List<Expression>();
+                        var mergedKeys = new HashSet<string>();
                         foreach (var idx in included)
-                            foreach (var lit in dnfClauses[idx])
-                                if (!mergedLiterals.Contains(lit))
+                            foreach (var lit in dnfExprs[idx])
+                                if (mergedKeys.Add(EKey(lit)))
                                     mergedLiterals.Add(lit);
 
                         // Build per-clause exclusions: negate each non-selected clause as a whole.
-                        var exclusions = new List<string>();
+                        var exclusions = new List<Expression>();
                         for (int bit = 0; bit < n; bit++)
                         {
                             if ((mask & (1 << bit)) != 0) continue;
-                            var clauseLits = dnfClauses[bit]
-                                .Where(lit => !commonLiterals.Contains(lit) && !mergedLiterals.Contains(lit))
+                            var clauseLits = dnfExprs[bit]
+                                .Where(lit => !commonLiteralKeys.Contains(EKey(lit)) && !mergedKeys.Contains(EKey(lit)))
                                 .ToList();
                             if (clauseLits.Count == 1)
                                 exclusions.Add(clauseLits[0]);
                             else if (clauseLits.Count > 1)
-                                exclusions.Add(string.Join(" && ", clauseLits));
+                                exclusions.Add(ConjoinExprs(clauseLits));
                         }
 
                         if (useBoundary && bTiers.Count > 0)
@@ -755,22 +724,23 @@ class Program
                 }
                 else
                 {
-                    for (int ci = 0; ci < dnfClauses.Count; ci++)
+                    for (int ci = 0; ci < dnfExprs.Count; ci++)
                     {
-                        var clause = dnfClauses[ci];
+                        var clause = dnfExprs[ci];
                         var label = $"{fullPreLabel}{ci + 1}";
+                        var clauseKeys = new HashSet<string>(clause.Select(EKey));
 
-                        var exclusions = new List<string>();
-                        for (int oi = 0; oi < dnfClauses.Count; oi++)
+                        var exclusions = new List<Expression>();
+                        for (int oi = 0; oi < dnfExprs.Count; oi++)
                         {
                             if (oi == ci) continue;
-                            var clauseLits = dnfClauses[oi]
-                                .Where(lit => !commonLiterals.Contains(lit) && !clause.Contains(lit))
+                            var clauseLits = dnfExprs[oi]
+                                .Where(lit => !commonLiteralKeys.Contains(EKey(lit)) && !clauseKeys.Contains(EKey(lit)))
                                 .ToList();
                             if (clauseLits.Count == 1)
                                 exclusions.Add(clauseLits[0]);
                             else if (clauseLits.Count > 1)
-                                exclusions.Add(string.Join(" && ", clauseLits));
+                                exclusions.Add(ConjoinExprs(clauseLits));
                         }
 
                         if (useBoundary && bTiers.Count > 0)
@@ -787,19 +757,12 @@ class Program
             }
         }
 
-        // Helper: convert string literals to Expressions for BuildSmt2Query.
-        // Uses the literal→AST map to recover original Expression objects when available,
-        // falling back to LeafExpression for synthesized/inlined strings.
-        List<Expression> ToExprs(List<string> strs) =>
-            strs.Select(s => literalExprMap.TryGetValue(s, out var expr)
-                ? expr : (Expression)new LeafExpression(s)).ToList();
-
         // Helper: solve one SMT query and return parsed values (or null)
         async Task<Dictionary<string, string>?> SolveOne(string solveLabel, int schedIdx, int schedTotal,
-            List<string> lits, List<string> preLits, List<string> excl, List<string> extra)
+            List<Expression> lits, List<Expression> preLits, List<Expression> excl, List<string> extra)
         {
             Console.WriteLine($"  Solving combination {solveLabel} ({schedIdx}/{schedTotal})...");
-            var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, ToExprs(lits), method, verbose, ToExprs(excl), extra, ToExprs(preLits), backgroundPostconditions, mutableNames);
+            var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
             if (verbose)
             {
                 Console.WriteLine($"  [DEBUG] SMT2 query for {solveLabel}:");
@@ -828,12 +791,12 @@ class Program
             else
             {
                 // When Z3 returns unknown, retry without postconditions containing 'exists'
-                var existsLits = lits.Where(l => l.Contains("exists ")).ToList();
+                var existsLits = lits.Where(l => EKey(l).Contains("exists ")).ToList();
                 if (existsLits.Count > 0 && existsLits.Count < lits.Count)
                 {
-                    var simplifiedLits = lits.Where(l => !l.Contains("exists ")).ToList();
+                    var simplifiedLits = lits.Where(l => !EKey(l).Contains("exists ")).ToList();
                     Console.WriteLine($"  Combination {solveLabel}: unknown, retrying without {existsLits.Count} exists-quantified postcondition(s)...");
-                    var smt2 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, ToExprs(simplifiedLits), method, verbose, ToExprs(excl), extra, ToExprs(preLits), backgroundPostconditions, mutableNames);
+                    var smt2 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, simplifiedLits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
                     if (verbose)
                     {
                         Console.WriteLine($"  [DEBUG] Retry SMT2 query for {solveLabel}:");
@@ -857,7 +820,7 @@ class Program
                 // Final fallback: try input-only query (no postconditions)
                 {
                     Console.WriteLine($"  Combination {solveLabel}: retrying with input-only constraints...");
-                    var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, new List<Expression>(), method, verbose, ToExprs(excl), extra, ToExprs(preLits), backgroundPostconditions, mutableNames);
+                    var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, new List<Expression>(), method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
                     if (verbose)
                     {
                         Console.WriteLine($"  [DEBUG] Input-only SMT2 query for {solveLabel}:");
@@ -909,19 +872,26 @@ class Program
             return $"(not {conjunction})";
         }
 
+        // Helper: build string key for a schedule entry (for dedup and input exclusion tracking)
+        static string ScheduleKey(List<Expression> literals, List<Expression> exclusions, List<Expression> preLits) =>
+            string.Join("|", literals.Select(EKey)) + "||" + string.Join("|", exclusions.Select(EKey)) + "||" + string.Join("|", preLits.Select(EKey));
+
         // Helper: solve a range of schedule entries, return number of SAT results
         async Task<int> SolveRange(
-            List<(string label, List<string> literals, List<string> preLiterals, List<string> exclusions, List<string> extraConstraints)> schedule,
+            List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints)> schedule,
             int from, int to, int displayTotal,
-            List<(string label, Dictionary<string, string> values, List<string> literals)> results,
+            List<(string label, Dictionary<string, string> values, List<Expression> literals)> results,
             Dictionary<string, List<string>> baseExclusions,
             int earlyStopCount = 0)
         {
             int satCount = 0;
             for (int i = from; i < to; i++)
             {
+                if (TimedOut()) { Console.WriteLine("  Timeout reached, stopping."); break; }
+                if (maxTests > 0 && results.Count >= maxTests) { Console.WriteLine($"  Max tests ({maxTests}) reached, stopping."); break; }
+
                 var (label, literals, preLits, exclusions, extraConstraints) = schedule[i];
-                var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions) + "||" + string.Join("|", preLits);
+                var baseKey = ScheduleKey(literals, exclusions, preLits);
 
                 if (!baseExclusions.ContainsKey(baseKey))
                     baseExclusions[baseKey] = new List<string>();
@@ -945,22 +915,23 @@ class Program
         }
 
         // Build test schedule and solve in phases
-        var testSchedule = new List<(string label, List<string> literals, List<string> preLiterals, List<string> exclusions, List<string> extraConstraints)>();
-        var testCases = new List<(string label, Dictionary<string, string> values, List<string> literals)>();
+        var testSchedule = new List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints)>();
+        var testCases = new List<(string label, Dictionary<string, string> values, List<Expression> literals)>();
         var baseConditionExclusions = new Dictionary<string, List<string>>();
 
         if (progressive)
         {
             // --- Phase 1: all-combinations, no boundary ---
             BuildScheduleEntries(testSchedule, useAllComb: true, useBoundary: false);
-            int n = dnfClauses.Count;
+            int n = dnfExprs.Count;
             int totalCombinations = (1 << n) - 1;
             Console.WriteLine($"  Phase 1: all-combinations ({n} clauses -> {totalCombinations} combinations)");
 
             await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count, testCases, baseConditionExclusions);
             Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
 
-            if (testCases.Count < minTests && boundaryTiersPerPre.Count > 0)
+            if (testCases.Count < minTests && boundaryTiersPerPre.Count > 0
+                && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
             {
                 // --- Phase 2: add boundary tiers ---
                 int phase2Start = testSchedule.Count;
@@ -973,17 +944,17 @@ class Program
                 Console.WriteLine($"  Phase 2 complete: {testCases.Count} test(s)");
             }
 
-            if (testCases.Count < minTests)
+            if (testCases.Count < minTests && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
             {
                 // --- Phase 3: repeats ---
                 int effectiveRepeat = Math.Max(3, (int)Math.Ceiling((double)minTests / Math.Max(testCases.Count, 1)));
                 Console.WriteLine($"  Phase 3: repeats (up to {effectiveRepeat} per condition)");
 
-                var baseConditions = new List<(string baseLabel, List<string> literals, List<string> preLits, List<string> exclusions, string baseKey)>();
+                var baseConditions = new List<(string baseLabel, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, string baseKey)>();
                 var seenBaseKeys = new HashSet<string>();
                 foreach (var (label, literals, preLits, exclusions, _) in testSchedule)
                 {
-                    var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions) + "||" + string.Join("|", preLits);
+                    var baseKey = ScheduleKey(literals, exclusions, preLits);
                     if (seenBaseKeys.Add(baseKey))
                     {
                         var baseLabel = label.Contains("/B") ? label.Substring(0, label.IndexOf("/B")) : label;
@@ -993,7 +964,8 @@ class Program
 
                 foreach (var (baseLabel, literals, preLits, exclusions, baseKey) in baseConditions)
                 {
-                    if (testCases.Count >= minTests) break;
+                    if (testCases.Count >= minTests || TimedOut()) break;
+                    if (maxTests > 0 && testCases.Count >= maxTests) break;
                     var inputExclusions = baseConditionExclusions.ContainsKey(baseKey)
                         ? baseConditionExclusions[baseKey] : new List<string>();
                     int found = inputExclusions.Count;
@@ -1001,7 +973,8 @@ class Program
 
                     for (int rep = 0; rep < needed; rep++)
                     {
-                        if (testCases.Count >= minTests) break;
+                        if (testCases.Count >= minTests || TimedOut()) break;
+                        if (maxTests > 0 && testCases.Count >= maxTests) break;
                         var repLabel = $"{baseLabel}/R{found + rep + 1}";
                         var values = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, inputExclusions.ToList());
                         if (values != null)
@@ -1022,7 +995,7 @@ class Program
             BuildScheduleEntries(testSchedule, allCombinations, boundary);
             if (allCombinations)
             {
-                int n = dnfClauses.Count;
+                int n = dnfExprs.Count;
                 Console.WriteLine($"  All-combinations mode: {n} post clauses -> {(1 << n) - 1} combinations");
             }
             if (boundary && boundaryTiersPerPre.Count > 0)
@@ -1033,12 +1006,12 @@ class Program
             // Repeat phase
             if (repeat > 1)
             {
-                var baseConditions = new List<(string baseLabel, List<string> literals, List<string> preLits, List<string> exclusions, string baseKey)>();
+                var baseConditions = new List<(string baseLabel, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, string baseKey)>();
                 var seenBaseKeys = new HashSet<string>();
 
                 foreach (var (label, literals, preLits, exclusions, _) in testSchedule)
                 {
-                    var baseKey = string.Join("|", literals) + "||" + string.Join("|", exclusions) + "||" + string.Join("|", preLits);
+                    var baseKey = ScheduleKey(literals, exclusions, preLits);
                     if (seenBaseKeys.Add(baseKey))
                     {
                         var baseLabel = label.Contains("/B") ? label.Substring(0, label.IndexOf("/B")) : label;
@@ -1048,12 +1021,15 @@ class Program
 
                 foreach (var (baseLabel, literals, preLits, exclusions, baseKey) in baseConditions)
                 {
+                    if (TimedOut()) break;
+                    if (maxTests > 0 && testCases.Count >= maxTests) break;
                     var inputExclusions = baseConditionExclusions[baseKey];
                     int found = inputExclusions.Count;
                     int needed = repeat - found;
 
                     for (int rep = 0; rep < needed; rep++)
                     {
+                        if (TimedOut() || (maxTests > 0 && testCases.Count >= maxTests)) break;
                         var repLabel = $"{baseLabel}/R{found + rep + 1}";
                         var values = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, inputExclusions.ToList());
                         if (values != null)
@@ -1071,13 +1047,31 @@ class Program
         if (!testCases.Any())
             return "";
 
+        // Convert Expression-based test cases to string-based for TestEmitter.
+        // Restore original (non-inlined) literals for expect emission.
+        var originalDnfClauses = DnfEngine.ToStringDnf(originalDnfExprs);
+        var inlinedToOriginal = new Dictionary<string, string>();
+        if (predsToInline != null && predsToInline.Count > 0)
+        {
+            var inlinedDnfClauses = DnfEngine.ToStringDnf(dnfExprs);
+            for (int ci = 0; ci < originalDnfClauses.Count && ci < inlinedDnfClauses.Count; ci++)
+                for (int li = 0; li < originalDnfClauses[ci].Count && li < inlinedDnfClauses[ci].Count; li++)
+                    inlinedToOriginal[inlinedDnfClauses[ci][li]] = originalDnfClauses[ci][li];
+        }
+
         // Deduplicate test cases with identical input values.
         // When duplicates exist, prefer the one with more literals (more constrained outputs).
-        var deduped = new List<(string label, Dictionary<string, string> values, List<string> literals)>();
-        var seenKeys = new Dictionary<string, int>(); // key -> index in deduped
+        var dedupedStr = new List<(string label, Dictionary<string, string> values, List<string> literals)>();
+        var seenKeys = new Dictionary<string, int>();
         foreach (var tc in testCases)
         {
-            // Build a key from input values only (use _pre for mutable arrays)
+            // Convert literals to original (non-inlined) strings for expects
+            var litStrings = tc.literals.Select(e =>
+            {
+                var s = EKey(e);
+                return inlinedToOriginal.TryGetValue(s, out var orig) ? orig : s;
+            }).ToList();
+
             var key = string.Join("|", method.Ins.Select(inp =>
             {
                 var name = inp.Name;
@@ -1094,37 +1088,48 @@ class Program
             }));
             if (!seenKeys.ContainsKey(key))
             {
-                seenKeys[key] = deduped.Count;
-                deduped.Add(tc);
+                seenKeys[key] = dedupedStr.Count;
+                dedupedStr.Add((tc.label, tc.values, litStrings));
             }
-            else if (tc.literals.Count > deduped[seenKeys[key]].literals.Count)
+            else if (litStrings.Count > dedupedStr[seenKeys[key]].literals.Count)
             {
-                // Replace with the more constrained version (better output values)
-                deduped[seenKeys[key]] = tc;
+                dedupedStr[seenKeys[key]] = (tc.label, tc.values, litStrings);
             }
         }
-        if (deduped.Count < testCases.Count)
-            Console.WriteLine($"  Deduplicated: {testCases.Count} -> {deduped.Count} unique test cases");
+        if (dedupedStr.Count < testCases.Count)
+            Console.WriteLine($"  Deduplicated: {testCases.Count} -> {dedupedStr.Count} unique test cases");
 
         // Check if output values from Z3 may be unreliable (uninterpreted functions or untranslated postconditions)
         bool hasUninterpFuncs = SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
-        // Restore original (non-inlined) literals for expect emission.
-        // Inlined versions were needed for SMT translation; originals are needed for valid Dafny expects.
-        if (inlinablePredicates != null && inlinablePredicates.Count > 0)
-        {
-            var inlinedToOriginal = new Dictionary<string, string>();
-            for (int ci = 0; ci < originalDnfClauses.Count && ci < dnfClauses.Count; ci++)
-                for (int li = 0; li < originalDnfClauses[ci].Count && li < dnfClauses[ci].Count; li++)
-                    inlinedToOriginal[dnfClauses[ci][li]] = originalDnfClauses[ci][li];
-
-            deduped = deduped.Select(tc => (tc.label, tc.values,
-                tc.literals.Select(lit => inlinedToOriginal.TryGetValue(lit, out var orig) ? orig : lit).ToList()
-            )).ToList();
-        }
-
         // Emit Dafny test file
-        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, deduped, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames);
+        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames);
+    }
+
+    /// <summary>
+    /// Inline predicates in an Expression. If the string representation changes after inlining,
+    /// return a LeafExpression with the inlined text; otherwise return the original AST node.
+    /// </summary>
+    static Expression InlineExpr(Expression expr, List<(string name, List<string> paramNames, string body)> predsToInline)
+    {
+        var original = DnfEngine.ExprToString(expr);
+        var inlined = DafnyParser.InlinePredicates(original, predsToInline);
+        if (inlined == original)
+            return expr;
+        return new LeafExpression(inlined);
+    }
+
+    /// <summary>
+    /// Build a left-folded conjunction (And) of multiple expressions.
+    /// </summary>
+    static Expression ConjoinExprs(List<Expression> exprs)
+    {
+        if (exprs.Count == 0)
+            throw new ArgumentException("Cannot conjoin zero expressions");
+        var result = exprs[0];
+        for (int i = 1; i < exprs.Count; i++)
+            result = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.And, result, exprs[i]);
+        return result;
     }
 
 }
