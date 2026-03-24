@@ -800,8 +800,10 @@ class Program
             }
         }
 
-        // Helper: solve one SMT query and return parsed values (or null)
-        async Task<Dictionary<string, string>?> SolveOne(string solveLabel, int schedIdx, int schedTotal,
+        // Helper: solve one SMT query and return parsed values (or null).
+        // isDefinitiveUnsat is set to true only when Z3 returns "unsat" on the primary query
+        // (not after fallback retries for "unknown"), so callers can safely prune.
+        async Task<(Dictionary<string, string>? values, bool isDefinitiveUnsat)> SolveOne(string solveLabel, int schedIdx, int schedTotal,
             List<Expression> lits, List<Expression> preLits, List<Expression> excl, List<string> extra)
         {
             Console.WriteLine($"  Solving combination {solveLabel} ({schedIdx}/{schedTotal})...");
@@ -822,14 +824,17 @@ class Program
                 if (values.Count > 0)
                 {
                     Console.WriteLine($"  Combination {solveLabel}: SAT - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
-                    return values;
+                    return (values, false);
                 }
                 Console.WriteLine($"  Combination {solveLabel}: SAT but could not parse model");
-                return null;
+                return (null, false);
             }
             if (resultLines.Any(l => l == "unsat"))
+            {
                 Console.WriteLine($"  Combination {solveLabel}: UNSAT (skipping)");
-            else if (result.Trim() == "timeout" || resultLines.Any(l => l == "timeout"))
+                return (null, true); // definitive UNSAT
+            }
+            if (result.Trim() == "timeout" || resultLines.Any(l => l == "timeout"))
                 Console.WriteLine($"  Combination {solveLabel}: TIMEOUT (skipping)");
             else
             {
@@ -855,7 +860,7 @@ class Program
                         if (values.Count > 0)
                         {
                             Console.WriteLine($"  Combination {solveLabel}: SAT (retry) - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
-                            return values;
+                            return (values, false);
                         }
                     }
                     Console.WriteLine($"  Combination {solveLabel}: still unknown after exists-retry");
@@ -879,14 +884,14 @@ class Program
                         if (values.Count > 0)
                         {
                             Console.WriteLine($"  Combination {solveLabel}: SAT (input-only) - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
-                            return values;
+                            return (values, false);
                         }
                     }
                     Console.WriteLine($"  Combination {solveLabel}: UNSAT even with input-only (skipping)");
                 }
                 if (verbose) Console.WriteLine($"  Z3 output: {result}");
             }
-            return null;
+            return (null, false); // not definitive UNSAT (was unknown/timeout/fallback)
         }
 
         // Helper: build an SMT exclusion constraint from a set of input values.
@@ -1003,19 +1008,21 @@ class Program
                 var allExtra = new List<string>(extraConstraints);
                 allExtra.AddRange(inputExclusions);
 
-                var values = await SolveOne(label, i + 1, displayTotal, literals, preLits, exclusions, allExtra);
-                if (values != null)
+                var (solvedValues, isDefinitiveUnsat) = await SolveOne(label, i + 1, displayTotal, literals, preLits, exclusions, allExtra);
+                if (solvedValues != null)
                 {
-                    results.Add((label, values, literals));
-                    var excl = BuildInputExclusion(values);
+                    results.Add((label, solvedValues, literals));
+                    var excl = BuildInputExclusion(solvedValues);
                     if (excl != null) inputExclusions.Add(excl);
                     satCount++;
                     if (earlyStopCount > 0 && results.Count >= earlyStopCount)
                         break;
                 }
-                else if (!isBoundaryTier)
+                else if (!isBoundaryTier && isDefinitiveUnsat)
                 {
-                    // Base entry was UNSAT (or timeout) → record so boundary tiers can be skipped.
+                    // Base entry was definitively UNSAT → record so boundary tiers can be skipped.
+                    // Only for definitive UNSAT (not "unknown" or timeout), because boundary
+                    // constraints might make an "unknown" query solvable.
                     baseUnsatMasks.Add((preIdx, postMask));
                 }
             }
@@ -1089,11 +1096,11 @@ class Program
                         if (testCases.Count >= minTests || TimedOut()) break;
                         if (maxTests > 0 && testCases.Count >= maxTests) break;
                         var repLabel = $"{baseLabel}/R{found + rep + 1}";
-                        var values = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, inputExclusions.ToList());
-                        if (values != null)
+                        var (repValues, _) = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, inputExclusions.ToList());
+                        if (repValues != null)
                         {
-                            testCases.Add((repLabel, values, literals));
-                            var excl = BuildInputExclusion(values);
+                            testCases.Add((repLabel, repValues, literals));
+                            var excl = BuildInputExclusion(repValues);
                             if (excl != null) inputExclusions.Add(excl);
                         }
                         else break;
@@ -1147,11 +1154,11 @@ class Program
                     {
                         if (TimedOut() || (maxTests > 0 && testCases.Count >= maxTests)) break;
                         var repLabel = $"{baseLabel}/R{found + rep + 1}";
-                        var values = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, inputExclusions.ToList());
-                        if (values != null)
+                        var (repValues2, _) = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, inputExclusions.ToList());
+                        if (repValues2 != null)
                         {
-                            testCases.Add((repLabel, values, literals));
-                            var excl = BuildInputExclusion(values);
+                            testCases.Add((repLabel, repValues2, literals));
+                            var excl = BuildInputExclusion(repValues2);
                             if (excl != null) inputExclusions.Add(excl);
                         }
                         else break;
