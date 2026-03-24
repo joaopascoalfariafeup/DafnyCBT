@@ -231,8 +231,15 @@ class Program
         {
             Console.WriteLine($"[DafnyTestGen] Processing method: {method.Name}");
 
-            // Check for unsupported nested collection types (e.g., seq<seq<int>>)
+            // Check for unsupported parameter types
             var allParams = method.Ins.Concat(method.Outs).ToList();
+            var tupleParam = allParams.FirstOrDefault(f => TypeUtils.IsTupleType(f.Type.ToString()));
+            if (tupleParam != null)
+            {
+                Console.WriteLine($"  Skipping: tuple type '{tupleParam.Type}' for parameter '{tupleParam.Name}' is not yet supported");
+                Console.WriteLine();
+                continue;
+            }
             var nestedParam = allParams.FirstOrDefault(f => TypeUtils.IsNestedCollectionType(f.Type.ToString()));
             if (nestedParam != null)
             {

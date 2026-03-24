@@ -14,6 +14,8 @@ static class TypeUtils
     /// Returns true if the type is a nested collection (seq of seq, seq of array, array of seq, etc.)
     /// These are not yet supported for SMT element parsing and Dafny emission.
     /// </summary>
+    internal static bool IsTupleType(string type) => type.StartsWith("(") && type.EndsWith(")");
+
     internal static bool IsNestedCollectionType(string type)
     {
         if (!IsSeqType(type) && !IsArrayType(type)) return false;
