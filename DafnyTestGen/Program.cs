@@ -1113,6 +1113,8 @@ class Program
                 {
                     if (TimedOut()) break;
                     if (maxTests > 0 && testCases.Count >= maxTests) break;
+                    if (!baseConditionExclusions.ContainsKey(baseKey))
+                        baseConditionExclusions[baseKey] = new List<string>();
                     var inputExclusions = baseConditionExclusions[baseKey];
                     int found = inputExclusions.Count;
                     int needed = repeat - found;

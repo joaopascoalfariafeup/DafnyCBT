@@ -698,8 +698,13 @@ static class DnfEngine
         }
 
         // Different values: x == v1 and x == v2 where v1 != v2
+        // Only flag when both values are numeric constants (variable expressions like x and -x
+        // can be equal for certain inputs, e.g., x=0 makes y==x and y==-x both true).
         if (a.op == BinaryExpr.Opcode.Eq && b.op == BinaryExpr.Opcode.Eq && a.valKey != b.valKey)
-            return $"contradiction: {a.original} ∧ {b.original} (distinct equalities)";
+        {
+            if (TryParseNumeric(a.valKey, out var numA) && TryParseNumeric(b.valKey, out var numB) && numA != numB)
+                return $"contradiction: {a.original} ∧ {b.original} (distinct equalities)";
+        }
 
         // Try numeric comparison: x < a and x > b where a <= b (impossible for integers when a <= b)
         // x < a and x > b -> needs a > b + 1 for integers (a > b for reals), conservatively use a <= b
