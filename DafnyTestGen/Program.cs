@@ -259,12 +259,9 @@ class Program
             var unsupportedFuncs = allFuncCalls
                 .Where(f => !builtInFuncs.Contains(f) && !inlinableNames.Contains(f))
                 .ToList();
-            if (unsupportedFuncs.Count > 0)
-            {
-                Console.WriteLine($"  Skipping: postcondition calls non-inlinable function(s) {string.Join(", ", unsupportedFuncs.Select(f => $"'{f}'"))} (recursive or ghost — cannot translate to SMT)");
-                Console.WriteLine();
-                continue;
-            }
+            bool hasNonInlinableFuncs = unsupportedFuncs.Count > 0;
+            if (hasNonInlinableFuncs)
+                Console.WriteLine($"  Note: postcondition uses non-inlinable function(s) {string.Join(", ", unsupportedFuncs.Select(f => $"'{f}'"))} — will test with full postcondition expects");
 
             if (verbose)
             {
@@ -288,7 +285,7 @@ class Program
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
             Console.WriteLine();
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs);
+            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs);
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -502,7 +499,7 @@ class Program
     /// For each test condition (PRE && POST_clause), we ask Z3 to find satisfying values.
     /// </summary>
     static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
-        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0)
+        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool hasNonInlinableFuncs = false)
     {
         z3Path ??= Z3Runner.FindZ3Path();
         var deadline = timeoutSecs > 0 ? DateTime.UtcNow.AddSeconds(timeoutSecs) : DateTime.MaxValue;
@@ -511,21 +508,40 @@ class Program
         // Get DNF clauses as AST Expressions — kept as Expressions throughout the pipeline.
         // Strings are only used for display, dedup keys, and at the TestEmitter boundary.
         var ensuresClauses = method.Ens.Select(e => e.E).ToList();
-        var dnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
-        for (int i = 1; i < ensuresClauses.Count; i++)
-            dnfExprs = DnfEngine.CrossProduct(dnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
 
-        // Build background postconditions: full (un-decomposed) ensures expressions.
-        // These are asserted as background constraints to catch cases where DNF decomposition
-        // loses quantifier range guards (e.g., forall vacuously true at boundary values).
-        var backgroundPostconditions = new List<Expression>(ensuresClauses);
+        // Build the full postcondition strings for use as expects when non-inlinable functions are present.
+        // These are the original ensures expressions before any decomposition.
+        var fullPostconditionStrings = ensuresClauses.Select(e => DnfEngine.ExprToString(e)).ToList();
+
+        List<List<Expression>> dnfExprs;
+        List<Expression> backgroundPostconditions;
+
+        if (hasNonInlinableFuncs)
+        {
+            // Skip postcondition DNF decomposition — we can't target specific branches
+            // since recursive/ghost functions become uninterpreted in SMT.
+            // Use a single empty clause so the schedule generates inputs from preconditions only.
+            dnfExprs = new List<List<Expression>> { new List<Expression>() };
+            backgroundPostconditions = new List<Expression>();
+        }
+        else
+        {
+            dnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
+            for (int i = 1; i < ensuresClauses.Count; i++)
+                dnfExprs = DnfEngine.CrossProduct(dnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
+
+            // Build background postconditions: full (un-decomposed) ensures expressions.
+            // These are asserted as background constraints to catch cases where DNF decomposition
+            // loses quantifier range guards (e.g., forall vacuously true at boundary values).
+            backgroundPostconditions = new List<Expression>(ensuresClauses);
+        }
 
         // Keep original DNF for expect emission, create inlined version for SMT translation.
         // Skip predicates with built-in SMT handlers (e.g., IsSorted) to preserve patterns
         // that the SMT translator recognizes.
         var originalDnfExprs = dnfExprs;
         List<(string name, List<string> paramNames, string body)>? predsToInline = null;
-        if (inlinablePredicates != null && inlinablePredicates.Count > 0)
+        if (!hasNonInlinableFuncs && inlinablePredicates != null && inlinablePredicates.Count > 0)
         {
             var smtBuiltins = new HashSet<string> { "IsSorted" };
             predsToInline = inlinablePredicates
@@ -1090,12 +1106,21 @@ class Program
         var seenKeys = new Dictionary<string, int>();
         foreach (var tc in testCases)
         {
-            // Convert literals to original (non-inlined) strings for expects
-            var litStrings = tc.literals.Select(e =>
+            // For non-inlinable function methods, use full postcondition expressions as expects.
+            // Otherwise, convert per-clause literals to original (non-inlined) strings.
+            List<string> litStrings;
+            if (hasNonInlinableFuncs)
             {
-                var s = EKey(e);
-                return inlinedToOriginal.TryGetValue(s, out var orig) ? orig : s;
-            }).ToList();
+                litStrings = fullPostconditionStrings;
+            }
+            else
+            {
+                litStrings = tc.literals.Select(e =>
+                {
+                    var s = EKey(e);
+                    return inlinedToOriginal.TryGetValue(s, out var orig) ? orig : s;
+                }).ToList();
+            }
 
             var key = string.Join("|", method.Ins.Select(inp =>
             {
@@ -1125,7 +1150,8 @@ class Program
             Console.WriteLine($"  Deduplicated: {testCases.Count} -> {dedupedStr.Count} unique test cases");
 
         // Check if output values from Z3 may be unreliable (uninterpreted functions or untranslated postconditions)
-        bool hasUninterpFuncs = SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
+        // Force literal expects when non-inlinable functions are present (full postcondition as expect)
+        bool hasUninterpFuncs = hasNonInlinableFuncs || SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
         // Emit Dafny test file
         return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames);
