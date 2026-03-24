@@ -825,6 +825,20 @@ static class SmtTranslator
             if (innerSmt != null) return $"(not {innerSmt})";
             return null;
         }
+        // Handle negation of bare identifier: !varName (entire expression is just !word)
+        if (Regex.IsMatch(expr, @"^!\w+$"))
+        {
+            var innerSmt = DafnyExprToSmt(expr.Substring(1), inputs);
+            if (innerSmt != null) return $"(not {innerSmt})";
+            return null;
+        }
+        // Handle negation before quantifier: !forall ... or !exists ...
+        if (Regex.IsMatch(expr, @"^!(forall|exists)\s"))
+        {
+            var innerSmt = DafnyExprToSmt(expr.Substring(1), inputs);
+            if (innerSmt != null) return $"(not {innerSmt})";
+            return null;
+        }
 
         // Handle quantifiers FIRST (before && splits the body)
         // Patterns: forall k :: BODY, exists k :: BODY, forall i, j :: BODY

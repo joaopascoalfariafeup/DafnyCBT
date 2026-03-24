@@ -483,6 +483,16 @@ class Program
             dnfExprs = DnfEngine.CrossProduct(dnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
         var dnfClauses = DnfEngine.ToStringDnf(dnfExprs);
 
+        // Build a map from literal strings to their original AST Expressions.
+        // This avoids the lossy string round-trip (e.g., "!result" → LeafExpression → DafnyExprToSmt fails).
+        var literalExprMap = new Dictionary<string, Expression>();
+        foreach (var clause in dnfExprs)
+            foreach (var expr in clause)
+            {
+                var str = DnfEngine.ExprToString(expr);
+                literalExprMap.TryAdd(str, expr);
+            }
+
         // Build background postconditions: full (un-decomposed) ensures expressions.
         // These are asserted as background constraints to catch cases where DNF decomposition
         // loses quantifier range guards (e.g., forall vacuously true at boundary values).
@@ -530,6 +540,12 @@ class Program
             preDnfExprs = DnfEngine.CrossProduct(preDnfExprs, preDnf);
         }
         var preDnfClauses = DnfEngine.ToStringDnf(preDnfExprs);
+        foreach (var clause in preDnfExprs)
+            foreach (var expr in clause)
+            {
+                var str = DnfEngine.ExprToString(expr);
+                literalExprMap.TryAdd(str, expr);
+            }
         // Remove the empty "true" elements from single-clause results
         preDnfClauses = preDnfClauses.Select(c => c.Where(s => s.Length > 0).ToList()).ToList();
         // Inline predicates in precondition literals too, but skip predicates with
@@ -771,9 +787,12 @@ class Program
             }
         }
 
-        // Helper: wrap string literals as Expression (LeafExpression) for BuildSmt2Query
-        static List<Expression> ToExprs(List<string> strs) =>
-            strs.Select(s => (Expression)new LeafExpression(s)).ToList();
+        // Helper: convert string literals to Expressions for BuildSmt2Query.
+        // Uses the literal→AST map to recover original Expression objects when available,
+        // falling back to LeafExpression for synthesized/inlined strings.
+        List<Expression> ToExprs(List<string> strs) =>
+            strs.Select(s => literalExprMap.TryGetValue(s, out var expr)
+                ? expr : (Expression)new LeafExpression(s)).ToList();
 
         // Helper: solve one SMT query and return parsed values (or null)
         async Task<Dictionary<string, string>?> SolveOne(string solveLabel, int schedIdx, int schedTotal,
