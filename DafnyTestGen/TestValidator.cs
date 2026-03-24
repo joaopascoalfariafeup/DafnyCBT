@@ -49,7 +49,25 @@ static class TestValidator
         Console.WriteLine($"[DafnyTestGen] Checking {testBlocks.Count} test case(s)...");
 
         // Run all tests in a single Dafny invocation
-        var failedIds = await RunAllTestsAtOnce(dafnyPath, sourceHeader, testBlocks, outputPath);
+        var (failedIds, incompleteIds) = await RunAllTestsAtOnce(dafnyPath, sourceHeader, testBlocks, outputPath);
+
+        // Tests that didn't complete (e.g., crash/abort in a prior test killed the process)
+        // need to be re-checked individually — they may actually pass.
+        var determined = testBlocks.Count - incompleteIds.Count;
+        if (incompleteIds.Count > 0)
+        {
+            Console.WriteLine($"  Batch: {determined}/{testBlocks.Count} determined, {incompleteIds.Count} incomplete (crash or timeout) — re-checking individually...");
+            int recheck = 0;
+            foreach (var idx in incompleteIds)
+            {
+                recheck++;
+                Console.Write($"  Re-checking test {idx + 1} ({recheck}/{incompleteIds.Count})...");
+                bool passed = await RunSingleTest(dafnyPath, sourceHeader, testBlocks[idx].body, idx, outputPath);
+                Console.WriteLine(passed ? " PASS" : " FAIL (timeout or error)");
+                if (!passed)
+                    failedIds.Add(idx);
+            }
+        }
 
         var passingBlocks = new List<(string comment, string body)>();
         var failingBlocks = new List<(string comment, string body)>();
@@ -79,14 +97,13 @@ static class TestValidator
     /// that prints "FAIL:N" on failure instead of aborting, so all tests run to completion.
     /// Returns the set of test indices that failed.
     /// </summary>
-    static async Task<HashSet<int>> RunAllTestsAtOnce(
+    static async Task<(HashSet<int> failedIds, HashSet<int> incompleteIds)> RunAllTestsAtOnce(
         string dafnyPath, string sourceHeader,
         List<(string comment, string body)> testBlocks, string outputPath)
     {
-        var tempDir = Path.Combine(Path.GetTempPath(), "DafnyTestGen");
-        if (!Directory.Exists(tempDir))
-            Directory.CreateDirectory(tempDir);
-        var tempFile = Path.Combine(tempDir, "_dafnytestgen_check_all.dfy");
+        var tempDir = Path.Combine(Path.GetTempPath(), "DafnyTestGen_" + Path.GetRandomFileName().Replace(".", ""));
+        Directory.CreateDirectory(tempDir);
+        var tempFile = Path.Combine(tempDir, "check_all.dfy");
 
         var sb = new System.Text.StringBuilder();
         sb.Append(sourceHeader);
@@ -140,52 +157,131 @@ static class TestValidator
 
             using var process = Process.Start(psi)!;
 
-            var outputTask = process.StandardOutput.ReadToEndAsync();
-            var errTask = process.StandardError.ReadToEndAsync();
-            var allDone = Task.WhenAll(outputTask, errTask);
-
-            // Generous timeout: 60s per test, but at least 120s
-            int timeoutMs = Math.Max(120000, testBlocks.Count * 60000);
-            if (await Task.WhenAny(allDone, Task.Delay(timeoutMs)) != allDone)
+            // Capture output incrementally so we don't lose it on timeout/kill
+            var outputLines = new List<string>();
+            process.OutputDataReceived += (_, e) =>
             {
-                try { process.Kill(); } catch { }
-                Console.Error.WriteLine("[DafnyTestGen] Dafny check timed out");
-                // On timeout, mark all tests as failed
-                for (int i = 0; i < testBlocks.Count; i++)
-                    failedIds.Add(i);
-                return failedIds;
+                if (e.Data != null)
+                    lock (outputLines) outputLines.Add(e.Data);
+            };
+            process.BeginOutputReadLine();
+
+            // Drain stderr incrementally to prevent pipe buffer deadlock
+            var stderrLines = new List<string>();
+            process.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data != null)
+                    lock (stderrLines) stderrLines.Add(e.Data);
+            };
+            process.BeginErrorReadLine();
+
+            int timeoutMs = 15000;
+            var tcs = new TaskCompletionSource<bool>();
+            process.EnableRaisingEvents = true;
+            process.Exited += (_, _) => tcs.TrySetResult(true);
+            if (process.HasExited) tcs.TrySetResult(true);
+
+            bool timedOut = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs)) != tcs.Task;
+            if (timedOut)
+            {
+                // Kill entire process tree (dafny + compiled child process)
+                try { process.Kill(entireProcessTree: true); } catch { }
+                Console.Error.WriteLine("[DafnyTestGen] Batch check timed out (possible infinite loop)");
             }
 
             if (!process.HasExited)
                 process.WaitForExit(5000);
 
-            var output = await outputTask;
+            string output;
+            lock (outputLines) { output = string.Join("\n", outputLines); }
 
-            // Parse FAIL and DONE markers from output
+            // Parse FAIL and DONE markers from captured output
             ParseFailMarkers(output, failedIds);
             var completedIds = ParseDoneMarkers(output);
 
-            // Any test that didn't complete (no DONE marker) is marked as failed
-            // (e.g., runtime abort, infinite loop, or compilation error)
+            // Tests that didn't complete (no DONE marker) go to incompleteIds
+            // for individual re-checking (they may pass when run alone)
+            var incompleteIds = new HashSet<int>();
             for (int i = 0; i < testBlocks.Count; i++)
             {
                 if (!completedIds.Contains(i) && !failedIds.Contains(i))
-                    failedIds.Add(i);
+                    incompleteIds.Add(i);
             }
 
-            if (process.ExitCode != 0 && completedIds.Count == 0)
-            {
-                var stderr = await errTask;
-                if (!string.IsNullOrWhiteSpace(stderr))
-                    Console.Error.WriteLine($"[DafnyTestGen] Dafny exited with code {process.ExitCode}");
-            }
+            return (failedIds, incompleteIds);
         }
         finally
         {
-            CleanupDafnyArtifacts(tempFile);
+            CleanupTempDir(tempDir);
         }
+    }
 
-        return failedIds;
+    /// <summary>
+    /// Runs a single test case in its own Dafny process.
+    /// Used as a fallback for tests that didn't complete in the batch run
+    /// (e.g., because a prior test crashed and killed the process).
+    /// Returns true if the test passes.
+    /// </summary>
+    static async Task<bool> RunSingleTest(
+        string dafnyPath, string sourceHeader,
+        string testBody, int index, string outputPath)
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "DafnyTestGen_" + Path.GetRandomFileName().Replace(".", ""));
+        Directory.CreateDirectory(tempDir);
+        var tempFile = Path.Combine(tempDir, $"check_{index}.dfy");
+
+        var sb = new System.Text.StringBuilder();
+        sb.Append(sourceHeader);
+
+        sb.AppendLine("method Main()");
+        sb.AppendLine("{");
+        sb.Append(testBody);
+        sb.AppendLine("}");
+
+        File.WriteAllText(tempFile, sb.ToString());
+
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = dafnyPath,
+                Arguments = $"run --allow-warnings --no-verify \"{tempFile}\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = Process.Start(psi)!;
+
+            // Use incremental capture for both stdout and stderr
+            // to avoid hanging on ReadToEndAsync when grandchild keeps pipes open
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            int timeoutMs = 15000;
+            var tcs = new TaskCompletionSource<bool>();
+            process.EnableRaisingEvents = true;
+            process.Exited += (_, _) => tcs.TrySetResult(true);
+            if (process.HasExited) tcs.TrySetResult(true);
+
+            bool timedOut = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs)) != tcs.Task;
+            if (timedOut)
+            {
+                // Kill entire process tree (dafny + compiled child process)
+                try { process.Kill(entireProcessTree: true); } catch { }
+                return false;
+            }
+
+            if (!process.HasExited)
+                process.WaitForExit(5000);
+
+            return process.ExitCode == 0;
+        }
+        finally
+        {
+            CleanupTempDir(tempDir);
+        }
     }
 
     /// <summary>
@@ -224,24 +320,12 @@ static class TestValidator
         return done;
     }
 
-    static void CleanupDafnyArtifacts(string dfyPath)
+    static void CleanupTempDir(string tempDir)
     {
         try
         {
-            var dir = Path.GetDirectoryName(dfyPath)!;
-            var baseName = Path.GetFileNameWithoutExtension(dfyPath);
-
-            if (File.Exists(dfyPath)) File.Delete(dfyPath);
-
-            foreach (var ext in new[] { ".cs", ".csproj", ".dll", ".exe", ".pdb", ".deps.json", ".runtimeconfig.json" })
-            {
-                var artifact = Path.Combine(dir, baseName + ext);
-                if (File.Exists(artifact)) File.Delete(artifact);
-            }
-
-            var objDir = Path.Combine(dir, "obj");
-            if (Directory.Exists(objDir))
-                Directory.Delete(objDir, true);
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, true);
         }
         catch { }
     }
