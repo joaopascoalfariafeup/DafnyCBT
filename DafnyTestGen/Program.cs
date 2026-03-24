@@ -752,14 +752,15 @@ class Program
                                 exclusions.Add(ConjoinExprs(clauseLits));
                         }
 
+                        // Always add the base entry (no boundary constraints).
+                        // When boundary is enabled, the base entry is solved first so that
+                        // its UNSAT result can prune all boundary-tier supersets.
+                        schedule.Add((label, mergedLiterals, fullPreLits, exclusions, new List<string>(), mask, pi));
+
                         if (useBoundary && bTiers.Count > 0)
                         {
                             foreach (var (tierLabel, tierConstraints) in bTiers)
                                 schedule.Add(($"{label}/B{tierLabel}", mergedLiterals, fullPreLits, exclusions, tierConstraints, mask, pi));
-                        }
-                        else
-                        {
-                            schedule.Add((label, mergedLiterals, fullPreLits, exclusions, new List<string>(), mask, pi));
                         }
                     }
                 }
@@ -922,6 +923,8 @@ class Program
         // Includes UNSAT superset pruning and syntactic contradiction detection.
         // knownUnsatLiteralMasks: per (preIdx), masks whose merged literals alone are contradictory.
         //   Any superset mask is also guaranteed UNSAT → skip without calling Z3.
+        // knownUnsatBaseMasks: per (preIdx), masks whose base entry (no boundary) was Z3 UNSAT.
+        //   All boundary-tier entries for the same (mask, preIdx) are also guaranteed UNSAT.
         async Task<int> SolveRange(
             List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule,
             int from, int to, int displayTotal,
@@ -933,12 +936,25 @@ class Program
             int satCount = 0;
             int prunedCount = 0;
             int contradictionCount = 0;
+            // Track base (no boundary) UNSAT results per (preIdx, mask) to skip their boundary tiers
+            var baseUnsatMasks = new HashSet<(int preIdx, int mask)>();
             for (int i = from; i < to; i++)
             {
                 if (TimedOut()) { Console.WriteLine("  Timeout reached, stopping."); break; }
                 if (maxTests > 0 && results.Count >= maxTests) { Console.WriteLine($"  Max tests ({maxTests}) reached, stopping."); break; }
 
                 var (label, literals, preLits, exclusions, extraConstraints, postMask, preIdx) = schedule[i];
+                bool isBoundaryTier = extraConstraints.Count > 0;
+
+                // --- Optimization 0: Base UNSAT → skip boundary tiers ---
+                // If the base entry (no boundary constraints) for this mask was UNSAT,
+                // all boundary tiers for the same mask are also UNSAT (boundary only adds constraints).
+                if (isBoundaryTier && baseUnsatMasks.Contains((preIdx, postMask)))
+                {
+                    Console.WriteLine($"  Combination {label}: UNSAT (base was UNSAT)");
+                    prunedCount++;
+                    continue;
+                }
 
                 // --- Optimization 1: UNSAT Superset Pruning ---
                 // If any previously-seen mask (whose literals alone were contradictory)
@@ -997,6 +1013,11 @@ class Program
                     if (earlyStopCount > 0 && results.Count >= earlyStopCount)
                         break;
                 }
+                else if (!isBoundaryTier)
+                {
+                    // Base entry was UNSAT (or timeout) → record so boundary tiers can be skipped.
+                    baseUnsatMasks.Add((preIdx, postMask));
+                }
             }
             if (prunedCount > 0 || contradictionCount > 0)
                 Console.WriteLine($"  Pruning stats: {contradictionCount} syntactic contradiction(s), {prunedCount} superset-pruned");
@@ -1013,6 +1034,7 @@ class Program
         {
             // --- Phase 1: all-combinations, no boundary ---
             BuildScheduleEntries(testSchedule, useAllComb: true, useBoundary: false);
+            SortScheduleByPopcount(testSchedule, 0, testSchedule.Count);
             int n = dnfExprs.Count;
             int totalCombinations = (1 << n) - 1;
             Console.WriteLine($"  Phase 1: all-combinations ({n} clauses -> {totalCombinations} combinations)");
@@ -1026,6 +1048,7 @@ class Program
                 // --- Phase 2: add boundary tiers ---
                 int phase2Start = testSchedule.Count;
                 BuildScheduleEntries(testSchedule, useAllComb: true, useBoundary: true);
+                SortScheduleByPopcount(testSchedule, phase2Start, testSchedule.Count);
                 int newEntries = testSchedule.Count - phase2Start;
                 Console.WriteLine($"  Phase 2: adding boundary analysis ({newEntries} new entries)");
 
@@ -1083,6 +1106,7 @@ class Program
         {
             // Non-progressive: build schedule with the given flags and solve all at once
             BuildScheduleEntries(testSchedule, allCombinations, boundary);
+            SortScheduleByPopcount(testSchedule, 0, testSchedule.Count);
             if (allCombinations)
             {
                 int n = dnfExprs.Count;
@@ -1240,6 +1264,43 @@ class Program
         if (inlined == original)
             return expr;
         return new LeafExpression(inlined);
+    }
+
+    /// <summary>
+    /// Count the number of set bits in an integer (popcount).
+    /// Used for ordering combinations: singletons first, then pairs, etc.
+    /// </summary>
+    static int BitCount(int n)
+    {
+        int count = 0;
+        while (n != 0) { count += n & 1; n >>= 1; }
+        return count;
+    }
+
+    /// <summary>
+    /// Sort a schedule by popcount of postMask (singletons first, then pairs, etc.),
+    /// with base entries (no boundary) before boundary tiers within each popcount group.
+    /// </summary>
+    static void SortScheduleByPopcount(
+        List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule,
+        int from, int to)
+    {
+        if (to - from <= 1) return;
+        var segment = schedule.GetRange(from, to - from);
+        segment.Sort((a, b) =>
+        {
+            int pcA = BitCount(a.postMask), pcB = BitCount(b.postMask);
+            if (pcA != pcB) return pcA.CompareTo(pcB);
+            // Within same popcount: base entries (no extra constraints) before boundary tiers
+            bool bndA = a.extraConstraints.Count > 0, bndB = b.extraConstraints.Count > 0;
+            if (bndA != bndB) return bndA ? 1 : -1;
+            // Then by mask value
+            if (a.postMask != b.postMask) return a.postMask.CompareTo(b.postMask);
+            // Then by preIdx
+            return a.preIdx.CompareTo(b.preIdx);
+        });
+        for (int i = 0; i < segment.Count; i++)
+            schedule[from + i] = segment[i];
     }
 
     /// <summary>
