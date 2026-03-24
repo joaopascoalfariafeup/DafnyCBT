@@ -40,13 +40,13 @@ static class SmtTranslator
         List<(string Name, string Type)> inputs,
         List<(string Name, string Type)> outputs,
         List<Expression> preClauses,
-        List<string> postLiterals,
+        List<Expression> postLiterals,
         Method method,
         bool verbose,
-        List<string>? exclusions = null,
+        List<Expression>? exclusions = null,
         List<string>? extraConstraints = null,
-        List<string>? preLiterals = null,
-        List<string>? backgroundPostconditions = null,
+        List<Expression>? preLiterals = null,
+        List<Expression>? backgroundPostconditions = null,
         HashSet<string>? mutableNames = null)
     {
         mutableNames ??= new HashSet<string>();
@@ -142,14 +142,6 @@ static class SmtTranslator
 
         sb.AppendLine();
 
-        // Build renamed input lists for DafnyExprToSmt context.
-        // Mutable param "a" becomes "a_pre" in preconditions, "a_post" in postconditions.
-        // DafnyExprToSmt then naturally produces a_pre_seq, a_pre_len, a_post_seq, etc.
-        var preInputs = inputs.Select(v =>
-            mutableNames.Contains(v.Name) ? ($"{v.Name}_pre", v.Type) : v).ToList();
-        var postInputs = inputs.Select(v =>
-            mutableNames.Contains(v.Name) ? ($"{v.Name}_post", v.Type) : v).ToList();
-
         // Reset well-formedness guards, uninterpreted functions, and translation status
         _wfGuards.Clear();
         _uninterpFuncs.Clear();
@@ -159,21 +151,21 @@ static class SmtTranslator
         var assertions = new System.Text.StringBuilder();
 
         // Encode postcondition literals (skip fresh() which is specification-only).
-        // For mutable params, rewrite: old(a[..]) -> a_pre[..], bare a[..] -> a_post[..]
+        // ExprToSmt handles old()/mutable renaming at AST level.
         foreach (var literal in postLiterals)
         {
-            if (TypeUtils.IsSpecOnlyLiteral(literal))
+            var litStr = DnfEngine.ExprToString(literal);
+            if (TypeUtils.IsSpecOnlyLiteral(litStr))
             {
-                assertions.AppendLine($"; Skipped specification-only literal: {literal}");
+                assertions.AppendLine($"; Skipped specification-only literal: {litStr}");
                 continue;
             }
-            var rewritten = RewriteForPostState(literal, mutableNames);
-            var smtExpr = DafnyExprToSmt(rewritten, postInputs);
+            var smtExpr = ExprToSmt(literal, inputs, mutableNames, isPostContext: true);
             if (smtExpr != null)
                 assertions.AppendLine($"(assert {smtExpr})");
             else
             {
-                assertions.AppendLine($"; Could not translate: {literal}");
+                assertions.AppendLine($"; Could not translate: {litStr}");
                 _hasUntranslatedPost = true;
             }
         }
@@ -187,8 +179,7 @@ static class SmtTranslator
             var wfCountBefore = _wfGuards.Count;
             foreach (var bgPost in backgroundPostconditions)
             {
-                var rewritten = RewriteForPostState(bgPost, mutableNames);
-                var smtExpr = DafnyExprToSmt(rewritten, postInputs);
+                var smtExpr = ExprToSmt(bgPost, inputs, mutableNames, isPostContext: true);
                 if (smtExpr != null)
                     assertions.AppendLine($"(assert {smtExpr})");
             }
@@ -204,25 +195,28 @@ static class SmtTranslator
         {
             foreach (var preLit in preLiterals)
             {
-                var rewritten = RewriteForPreState(preLit, mutableNames);
-                var smtExpr = DafnyExprToSmt(rewritten, preInputs);
+                var smtExpr = ExprToSmt(preLit, inputs, mutableNames, isPostContext: false);
                 if (smtExpr != null)
                     assertions.AppendLine($"(assert {smtExpr})");
                 else
-                    assertions.AppendLine($"; Could not translate precondition: {preLit}");
+                {
+                    var litStr = DnfEngine.ExprToString(preLit);
+                    assertions.AppendLine($"; Could not translate precondition: {litStr}");
+                }
             }
         }
         else
         {
             foreach (var pre in preClauses)
             {
-                var preStr = DnfEngine.ExprToString(pre);
-                var rewritten = RewriteForPreState(preStr, mutableNames);
-                var smtExpr = DafnyExprToSmt(rewritten, preInputs);
+                var smtExpr = ExprToSmt(pre, inputs, mutableNames, isPostContext: false);
                 if (smtExpr != null)
                     assertions.AppendLine($"(assert {smtExpr})");
                 else
+                {
+                    var preStr = DnfEngine.ExprToString(pre);
                     assertions.AppendLine($"; Could not translate precondition: {preStr}");
+                }
             }
         }
 
@@ -283,9 +277,8 @@ static class SmtTranslator
             foreach (var excl in exclusions)
             {
                 var wfBefore = _wfGuards.Count;
-                // Exclusions are postcondition literals — rewrite for post-state
-                var rewrittenExcl = RewriteForPostState(excl, mutableNames);
-                var smtExpr = DafnyExprToSmt(rewrittenExcl, postInputs);
+                // Exclusions are postcondition literals — translate for post-state
+                var smtExpr = ExprToSmt(excl, inputs, mutableNames, isPostContext: true);
                 if (smtExpr != null)
                 {
                     // Collect WF guards generated specifically by this exclusion
@@ -353,6 +346,385 @@ static class SmtTranslator
         }
 
         return sb.ToString();
+    }
+
+    // ───────────────── AST-based Expression → SMT translator ─────────────────
+
+    /// <summary>
+    /// Translates a Dafny AST Expression to an SMT2 expression string.
+    /// Handles mutable variable renaming (pre/post state) at the AST level:
+    /// - In post context: bare mutable refs → _post, inside old() → _pre
+    /// - In pre context: mutable refs → _pre
+    /// Falls back to string-based DafnyExprToSmt for LeafExpression nodes
+    /// (produced by predicate inlining) and unrecognized AST patterns.
+    /// </summary>
+    internal static string? ExprToSmt(Expression expr,
+        List<(string Name, string Type)> inputs,
+        HashSet<string> mutableNames,
+        bool isPostContext,
+        bool insideOld = false)
+    {
+        // Unwrap syntax wrappers
+        expr = UnwrapExpr(expr);
+
+        // LeafExpression (from predicate inlining) — use string-based fallback
+        if (expr is LeafExpression leaf)
+        {
+            var renamedInputs = BuildRenamedInputs(inputs, mutableNames, isPostContext && !insideOld);
+            string rewritten;
+            if (isPostContext && !insideOld)
+                rewritten = RewriteForPostState(leaf.DafnyText, mutableNames);
+            else
+                rewritten = RewriteForPreState(leaf.DafnyText, mutableNames);
+            return DafnyExprToSmt(rewritten, renamedInputs);
+        }
+
+        // Negated LeafExpression: !(<inlined predicate text>)
+        if (expr is UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not } negLeaf && UnwrapExpr(negLeaf.E) is LeafExpression nLeaf)
+        {
+            var inner = ExprToSmt(negLeaf.E, inputs, mutableNames, isPostContext, insideOld);
+            return inner != null ? $"(not {inner})" : null;
+        }
+
+        // OldExpr — switch to pre-state renaming
+        if (expr is OldExpr oldExpr)
+            return ExprToSmt(oldExpr.Expr, inputs, mutableNames, isPostContext, insideOld: true);
+
+        // UnaryOpExpr(Not)
+        if (expr is UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not } notExpr)
+        {
+            var inner = ExprToSmt(notExpr.E, inputs, mutableNames, isPostContext, insideOld);
+            return inner != null ? $"(not {inner})" : null;
+        }
+
+        // BinaryExpr
+        if (expr is BinaryExpr bin)
+        {
+            // Handle 'in' and 'not in' specially (need seq expansion)
+            if (bin.Op == BinaryExpr.Opcode.In || bin.Op == BinaryExpr.Opcode.NotIn)
+            {
+                var valSmt = ExprToSmt(bin.E0, inputs, mutableNames, isPostContext, insideOld);
+                if (valSmt == null) goto fallback;
+                var seqInfo = ResolveSeqForContains(bin.E1, inputs, mutableNames, isPostContext, insideOld);
+                if (seqInfo == null) goto fallback;
+                var (smtSeq, boundSmt) = seqInfo.Value;
+                var containsExpr = boundSmt != null
+                    ? ExpandSeqContainsBounded(smtSeq, valSmt, boundSmt)
+                    : ExpandSeqContains(smtSeq, valSmt);
+                return bin.Op == BinaryExpr.Opcode.NotIn ? $"(not {containsExpr})" : containsExpr;
+            }
+
+            var left = ExprToSmt(bin.E0, inputs, mutableNames, isPostContext, insideOld);
+            var right = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
+            if (left == null || right == null) goto fallback;
+
+            var result = bin.Op switch
+            {
+                BinaryExpr.Opcode.And => $"(and {left} {right})",
+                BinaryExpr.Opcode.Or => $"(or {left} {right})",
+                BinaryExpr.Opcode.Imp => $"(=> {left} {right})",
+                BinaryExpr.Opcode.Iff => $"(= {left} {right})",
+                BinaryExpr.Opcode.Eq => $"(= {left} {right})",
+                BinaryExpr.Opcode.Neq => $"(not (= {left} {right}))",
+                BinaryExpr.Opcode.Lt => $"(< {left} {right})",
+                BinaryExpr.Opcode.Le => $"(<= {left} {right})",
+                BinaryExpr.Opcode.Gt => $"(> {left} {right})",
+                BinaryExpr.Opcode.Ge => $"(>= {left} {right})",
+                BinaryExpr.Opcode.Add => IsSeqExprAst(bin.E0, inputs)
+                    ? $"(seq.++ {left} {right})" : $"(+ {left} {right})",
+                BinaryExpr.Opcode.Sub => $"(- {left} {right})",
+                BinaryExpr.Opcode.Mul => $"(* {left} {right})",
+                BinaryExpr.Opcode.Div => $"(div {left} {right})",
+                BinaryExpr.Opcode.Mod => $"(mod {left} {right})",
+                _ => (string?)null
+            };
+            if (result != null) return result;
+            goto fallback;
+        }
+
+        // IdentifierExpr / NameSegment — variable with mutable renaming
+        if (expr is IdentifierExpr idExpr)
+            return RenameMutable(idExpr.Name, mutableNames, isPostContext, insideOld);
+        if (expr is NameSegment nameExpr)
+            return RenameMutable(nameExpr.Name, mutableNames, isPostContext, insideOld);
+
+        // LiteralExpr (int, bool, char)
+        if (expr is CharLiteralExpr charLit)
+        {
+            var ch = charLit.Value?.ToString();
+            return ch != null && ch.Length > 0 ? ((int)ch[0]).ToString() : "0";
+        }
+        if (expr is LiteralExpr litExpr && litExpr is not LeafExpression)
+        {
+            if (litExpr.Value is bool b) return b ? "true" : "false";
+            if (litExpr.Value is System.Numerics.BigInteger bigInt)
+                return bigInt < 0 ? $"(- {-bigInt})" : bigInt.ToString();
+            if (litExpr.Value is int n) return n < 0 ? $"(- {-n})" : n.ToString();
+            return litExpr.Value?.ToString() ?? "0";
+        }
+
+        // ITEExpr: if-then-else
+        if (expr is ITEExpr ite)
+        {
+            var cond = ExprToSmt(ite.Test, inputs, mutableNames, isPostContext, insideOld);
+            var thn = ExprToSmt(ite.Thn, inputs, mutableNames, isPostContext, insideOld);
+            var els = ExprToSmt(ite.Els, inputs, mutableNames, isPostContext, insideOld);
+            if (cond != null && thn != null && els != null)
+                return $"(ite {cond} {thn} {els})";
+            goto fallback;
+        }
+
+        // ForallExpr / ExistsExpr
+        if (expr is ForallExpr or ExistsExpr)
+        {
+            var quantExpr = (QuantifierExpr)expr;
+            var quantifier = expr is ForallExpr ? "forall" : "exists";
+            var boundVars = quantExpr.BoundVars;
+            var bindings = string.Join(" ", boundVars.Select(bv =>
+                $"({bv.Name} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
+
+            foreach (var bv in boundVars) _boundVars.Add(bv.Name);
+            var bodySmt = ExprToSmt(quantExpr.Term, inputs, mutableNames, isPostContext, insideOld);
+            foreach (var bv in boundVars) _boundVars.Remove(bv.Name);
+
+            if (bodySmt == null) goto fallback;
+
+            // For single-variable quantifiers with seq.nth, expand finitely
+            if (boundVars.Count == 1 && bodySmt.Contains("seq.nth"))
+            {
+                var varName = boundVars[0].Name;
+                var instances = new List<string>();
+                for (int idx = 0; idx < MAX_SEQ_LEN; idx++)
+                {
+                    var instance = Regex.Replace(bodySmt,
+                        @"(?<![a-zA-Z_])" + Regex.Escape(varName) + @"(?![a-zA-Z_0-9])",
+                        idx.ToString());
+                    instances.Add(instance);
+                }
+                return quantifier == "forall"
+                    ? $"(and {string.Join(" ", instances)})"
+                    : $"(or {string.Join(" ", instances)})";
+            }
+
+            return $"({quantifier} ({bindings}) {bodySmt})";
+        }
+
+        // SeqSelectExpr: a[i], a[lo..hi], a[..]
+        if (expr is SeqSelectExpr seqSel)
+        {
+            var origName = GetOriginalName(seqSel.Seq);
+            var isArray = origName != null && inputs.Any(v => v.Name == origName && TypeUtils.IsArrayType(v.Type));
+            var seqBaseSmt = ExprToSmt(seqSel.Seq, inputs, mutableNames, isPostContext, insideOld);
+            if (seqBaseSmt == null) goto fallback;
+
+            if (seqSel.SelectOne)
+            {
+                // a[i] → seq.nth
+                if (seqSel.E0 == null) goto fallback;
+                var idxSmt = ExprToSmt(seqSel.E0, inputs, mutableNames, isPostContext, insideOld);
+                if (idxSmt == null) goto fallback;
+                var smtSeq = isArray ? $"{seqBaseSmt}_seq" : seqBaseSmt;
+                var idxName = GetOriginalName(seqSel.E0);
+                if (idxName == null || !_boundVars.Contains(idxName))
+                    _wfGuards.Add($"(and (<= 0 {idxSmt}) (< {idxSmt} (seq.len {smtSeq})))");
+                var ret = $"(seq.nth {smtSeq} {idxSmt})";
+                if (smtSeq.Contains("_pre") || smtSeq.Contains("_post"))
+
+                return ret;
+            }
+            else
+            {
+                // a[..], a[lo..hi], a[..hi]
+                var smtSeq = isArray ? $"{seqBaseSmt}_seq" : seqBaseSmt;
+                if (seqSel.E0 == null && seqSel.E1 == null)
+                    return smtSeq; // a[..] → full sequence
+                var fromSmt = seqSel.E0 != null
+                    ? ExprToSmt(seqSel.E0, inputs, mutableNames, isPostContext, insideOld) : "0";
+                var toSmt = seqSel.E1 != null
+                    ? ExprToSmt(seqSel.E1, inputs, mutableNames, isPostContext, insideOld) : $"(seq.len {smtSeq})";
+                if (fromSmt == null || toSmt == null) goto fallback;
+                return $"(seq.extract {smtSeq} {fromSmt} (- {toSmt} {fromSmt}))";
+            }
+        }
+
+        // MemberSelectExpr: a.Length → a_len
+        if (expr is MemberSelectExpr memSel && memSel.MemberName == "Length")
+        {
+            var objSmt = ExprToSmt(memSel.Obj, inputs, mutableNames, isPostContext, insideOld);
+            if (objSmt != null) return $"{objSmt}_len";
+            goto fallback;
+        }
+
+        // ExprDotName: pre-resolution form of MemberSelectExpr (e.g., a.Length)
+        // SuffixExpr.Lhs gives the left-hand side, SuffixName gives the member name
+        if (expr is ExprDotName dotName)
+        {
+            if (dotName.SuffixName == "Length")
+            {
+                var objSmt = ExprToSmt(dotName.Lhs, inputs, mutableNames, isPostContext, insideOld);
+                if (objSmt != null) return $"{objSmt}_len";
+            }
+            goto fallback;
+        }
+
+        // ChainingExpression: chain comparisons like 0 <= i < a.Length
+        // Has Operands and Operators lists; fall back to string-based for now
+        // (the string fallback correctly handles chain comparisons via SplitChainComparison)
+
+        // FunctionCallExpr
+        if (expr is FunctionCallExpr funcCall)
+        {
+            // IsSorted: built-in SMT encoding
+            if (funcCall.Name == "IsSorted" && funcCall.Args.Count == 1)
+            {
+                var argSmt = ExprToSmt(funcCall.Args[0], inputs, mutableNames, isPostContext, insideOld);
+                if (argSmt != null)
+                    return $"(forall ((i Int) (j Int)) (=> (and (<= 0 i) (< i j) (< j (seq.len {argSmt}))) (<= (seq.nth {argSmt} i) (seq.nth {argSmt} j))))";
+            }
+            // Generic: uninterpreted function
+            var smtArgs = funcCall.Args.Select(a => ExprToSmt(a, inputs, mutableNames, isPostContext, insideOld)).ToList();
+            if (smtArgs.All(a => a != null))
+            {
+                _uninterpFuncs[funcCall.Name] = smtArgs.Count;
+                return $"({funcCall.Name} {string.Join(" ", smtArgs)})";
+            }
+            goto fallback;
+        }
+
+        // UnaryExpr for |expr| (sequence length) — may be UnaryOpExpr with Cardinality
+        // Handled in fallback for now.
+
+    fallback:
+        // Fallback: convert to string and use the string-based translator
+
+        var exprStr = DnfEngine.ExprToString(expr);
+        var renamedInputsFb = BuildRenamedInputs(inputs, mutableNames, isPostContext && !insideOld);
+        string rewrittenFb;
+        if (isPostContext && !insideOld)
+            rewrittenFb = RewriteForPostState(exprStr, mutableNames);
+        else
+            rewrittenFb = RewriteForPreState(exprStr, mutableNames);
+        return DafnyExprToSmt(rewrittenFb, renamedInputsFb);
+    }
+
+    /// <summary>
+    /// Builds renamed inputs for the string-based fallback in ExprToSmt.
+    /// For post context, includes both _pre and _post variants so that old()
+    /// references (rewritten to _pre) can be found as array types.
+    /// </summary>
+    static List<(string Name, string Type)> BuildRenamedInputs(
+        List<(string Name, string Type)> inputs, HashSet<string> mutableNames, bool usePost)
+    {
+        if (mutableNames.Count == 0) return inputs;
+        var result = new List<(string Name, string Type)>();
+        foreach (var v in inputs)
+        {
+            if (mutableNames.Contains(v.Name))
+            {
+                result.Add(($"{v.Name}_pre", v.Type));
+                if (usePost)
+                    result.Add(($"{v.Name}_post", v.Type));
+            }
+            else
+                result.Add(v);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Renames a variable for mutable pre/post state.
+    /// </summary>
+    static string RenameMutable(string name, HashSet<string> mutableNames, bool isPostContext, bool insideOld)
+    {
+        if (mutableNames.Contains(name))
+            return (isPostContext && !insideOld) ? $"{name}_post" : $"{name}_pre";
+        return name;
+    }
+
+    /// <summary>
+    /// Extracts the original (unrenamed) identifier name from an expression.
+    /// Looks through OldExpr wrappers (e.g., old(a)[i] → "a").
+    /// </summary>
+    static string? GetOriginalName(Expression expr)
+    {
+        expr = UnwrapExpr(expr);
+        if (expr is OldExpr oldE) return GetOriginalName(oldE.Expr);
+        if (expr is IdentifierExpr id) return id.Name;
+        if (expr is NameSegment ns) return ns.Name;
+        return null;
+    }
+
+    /// <summary>
+    /// Checks if an AST expression is a sequence type (for + → seq.++ disambiguation).
+    /// </summary>
+    static bool IsSeqExprAst(Expression expr, List<(string Name, string Type)> inputs)
+    {
+        expr = UnwrapExpr(expr);
+        var name = GetOriginalName(expr);
+        if (name != null)
+        {
+            var match = inputs.FirstOrDefault(v => v.Name == name);
+            if (match != default && (TypeUtils.IsSeqType(match.Type) || TypeUtils.IsArrayType(match.Type)))
+                return true;
+        }
+        if (expr is SeqSelectExpr) return true;
+        if (expr is OldExpr oldE) return IsSeqExprAst(oldE.Expr, inputs);
+        return false;
+    }
+
+    /// <summary>
+    /// Resolves the sequence expression for 'in' / 'not in' operators.
+    /// Returns (smtSeqName, optionalBound) or null if unresolvable.
+    /// </summary>
+    static (string smtSeq, string? bound)? ResolveSeqForContains(Expression expr,
+        List<(string Name, string Type)> inputs, HashSet<string> mutableNames,
+        bool isPostContext, bool insideOld)
+    {
+        expr = UnwrapExpr(expr);
+
+        // a[..] or a[..len]
+        if (expr is SeqSelectExpr sel && !sel.SelectOne)
+        {
+            var origName = GetOriginalName(sel.Seq);
+            var isArray = origName != null && inputs.Any(v => v.Name == origName && TypeUtils.IsArrayType(v.Type));
+            var baseSmt = ExprToSmt(sel.Seq, inputs, mutableNames, isPostContext, insideOld);
+            if (baseSmt == null) return null;
+            var smtSeq = isArray ? $"{baseSmt}_seq" : baseSmt;
+
+            if (sel.E1 != null)
+            {
+                var boundSmt = ExprToSmt(sel.E1, inputs, mutableNames, isPostContext, insideOld);
+                return (smtSeq, boundSmt);
+            }
+            return (smtSeq, null);
+        }
+
+        // Bare variable: s or a
+        if (expr is IdentifierExpr idExpr || expr is NameSegment)
+        {
+            var name = GetOriginalName(expr)!;
+            var isArray = inputs.Any(v => v.Name == name && TypeUtils.IsArrayType(v.Type));
+            var renamed = RenameMutable(name, mutableNames, isPostContext, insideOld);
+            var smtSeq = isArray ? $"{renamed}_seq" : renamed;
+            return (smtSeq, null);
+        }
+
+        // Fallback: try full translation
+        var smt = ExprToSmt(expr, inputs, mutableNames, isPostContext, insideOld);
+        return smt != null ? (smt, (string?)null) : null;
+    }
+
+    /// <summary>
+    /// Unwrap parentheses and ConcreteSyntaxExpression wrappers.
+    /// </summary>
+    static Expression UnwrapExpr(Expression expr)
+    {
+        while (true)
+        {
+            if (expr is ParensExpression p) { expr = p.E; continue; }
+            if (expr is ConcreteSyntaxExpression c && c.ResolvedExpression != null) { expr = c.ResolvedExpression; continue; }
+            return expr;
+        }
     }
 
     /// <summary>

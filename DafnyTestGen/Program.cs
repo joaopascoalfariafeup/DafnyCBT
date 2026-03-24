@@ -476,16 +476,17 @@ class Program
     {
         z3Path ??= Z3Runner.FindZ3Path();
 
-        // Get DNF clauses
+        // Get DNF clauses (as AST Expressions, then convert to strings for downstream pipeline)
         var ensuresClauses = method.Ens.Select(e => e.E).ToList();
-        var dnfClauses = DnfEngine.ExprToDnf(ensuresClauses[0]);
+        var dnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
         for (int i = 1; i < ensuresClauses.Count; i++)
-            dnfClauses = DnfEngine.CrossProduct(dnfClauses, DnfEngine.ExprToDnf(ensuresClauses[i]));
+            dnfExprs = DnfEngine.CrossProduct(dnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
+        var dnfClauses = DnfEngine.ToStringDnf(dnfExprs);
 
-        // Build background postconditions: full (un-decomposed) ensures expressions as strings.
+        // Build background postconditions: full (un-decomposed) ensures expressions.
         // These are asserted as background constraints to catch cases where DNF decomposition
         // loses quantifier range guards (e.g., forall vacuously true at boundary values).
-        var backgroundPostconditions = ensuresClauses.Select(e => DnfEngine.ExprToString(e)).ToList();
+        var backgroundPostconditions = new List<Expression>(ensuresClauses);
         if (inlinablePredicates != null && inlinablePredicates.Count > 0)
         {
             var smtBuiltins = new HashSet<string> { "IsSorted" };
@@ -494,7 +495,11 @@ class Program
                 .ToList();
             if (bgPredsToInline.Count > 0)
                 backgroundPostconditions = backgroundPostconditions
-                    .Select(p => DafnyParser.InlinePredicates(p, bgPredsToInline)).ToList();
+                    .Select(e => {
+                        var str = DnfEngine.ExprToString(e);
+                        var inlined = DafnyParser.InlinePredicates(str, bgPredsToInline);
+                        return inlined != str ? (Expression)new LeafExpression(inlined) : e;
+                    }).ToList();
         }
 
         // Keep original DNF clauses for expect emission, create inlined versions for SMT translation.
@@ -517,13 +522,14 @@ class Program
 
         var preClauses = method.Req.Select(r => r.E).ToList();
 
-        // Decompose preconditions into DNF (for disjunctive precondition handling)
-        var preDnfClauses = new List<List<string>> { new List<string>() }; // trivial "true"
+        // Decompose preconditions into DNF (as AST, then convert to strings)
+        var preDnfExprs = new List<List<Expression>> { new List<Expression>() }; // trivial "true"
         foreach (var pre in preClauses)
         {
             var preDnf = DnfEngine.ExprToDnf(pre);
-            preDnfClauses = DnfEngine.CrossProduct(preDnfClauses, preDnf);
+            preDnfExprs = DnfEngine.CrossProduct(preDnfExprs, preDnf);
         }
+        var preDnfClauses = DnfEngine.ToStringDnf(preDnfExprs);
         // Remove the empty "true" elements from single-clause results
         preDnfClauses = preDnfClauses.Select(c => c.Where(s => s.Length > 0).ToList()).ToList();
         // Inline predicates in precondition literals too, but skip predicates with
@@ -552,7 +558,7 @@ class Program
         // causing every query to timeout.
         var allInlinedLiterals = dnfClauses.SelectMany(c => c)
             .Concat(preDnfClauses.SelectMany(c => c))
-            .Concat(backgroundPostconditions);
+            .Concat(backgroundPostconditions.Select(e => DnfEngine.ExprToString(e)));
         // Pattern: variable-indexed slice inside multiset(), e.g., multiset(b[..][..i0 + j0])
         // or multiset(b[..expr]) where expr is not empty (contains identifiers)
         var varSliceMultiset = new Regex(@"multiset\([^)]*\[\.\.(?!\])[^)]*\)");
@@ -765,12 +771,16 @@ class Program
             }
         }
 
+        // Helper: wrap string literals as Expression (LeafExpression) for BuildSmt2Query
+        static List<Expression> ToExprs(List<string> strs) =>
+            strs.Select(s => (Expression)new LeafExpression(s)).ToList();
+
         // Helper: solve one SMT query and return parsed values (or null)
         async Task<Dictionary<string, string>?> SolveOne(string solveLabel, int schedIdx, int schedTotal,
             List<string> lits, List<string> preLits, List<string> excl, List<string> extra)
         {
             Console.WriteLine($"  Solving combination {solveLabel} ({schedIdx}/{schedTotal})...");
-            var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
+            var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, ToExprs(lits), method, verbose, ToExprs(excl), extra, ToExprs(preLits), backgroundPostconditions, mutableNames);
             if (verbose)
             {
                 Console.WriteLine($"  [DEBUG] SMT2 query for {solveLabel}:");
@@ -804,7 +814,7 @@ class Program
                 {
                     var simplifiedLits = lits.Where(l => !l.Contains("exists ")).ToList();
                     Console.WriteLine($"  Combination {solveLabel}: unknown, retrying without {existsLits.Count} exists-quantified postcondition(s)...");
-                    var smt2 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, simplifiedLits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
+                    var smt2 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, ToExprs(simplifiedLits), method, verbose, ToExprs(excl), extra, ToExprs(preLits), backgroundPostconditions, mutableNames);
                     if (verbose)
                     {
                         Console.WriteLine($"  [DEBUG] Retry SMT2 query for {solveLabel}:");
@@ -827,9 +837,8 @@ class Program
                 }
                 // Final fallback: try input-only query (no postconditions)
                 {
-                    var emptyLits = new List<string>();
                     Console.WriteLine($"  Combination {solveLabel}: retrying with input-only constraints...");
-                    var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, emptyLits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
+                    var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, new List<Expression>(), method, verbose, ToExprs(excl), extra, ToExprs(preLits), backgroundPostconditions, mutableNames);
                     if (verbose)
                     {
                         Console.WriteLine($"  [DEBUG] Input-only SMT2 query for {solveLabel}:");
