@@ -1,24 +1,51 @@
 using System.Diagnostics;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace DafnyTestGen;
 
 static class TestValidator
 {
+    /// <summary>Timeout for the single `dafny build` compilation step.</summary>
+    const int BuildTimeoutMs = 60_000;
+
     /// <summary>
-    /// Validates all test cases in a single Dafny run, then produces
-    /// a split output with Passing() and Failing() methods.
-    /// Instead of running Dafny once per test (expensive due to compilation overhead),
-    /// we emit a single file where each expect is wrapped in a try/catch-like print
-    /// so all tests run and we collect pass/fail results in one invocation.
+    /// Timeout for running all tests in batch (first pass).
+    /// If a crash/timeout kills the process, completed results are kept.
     /// </summary>
-    internal static async Task<string> CheckAndSplitTests(string generatedCode, string originalSource, string outputPath)
+    const int BatchRunTimeoutMs = 15_000;
+
+    /// <summary>
+    /// Per-test run timeout when re-checking incomplete tests individually.
+    /// Only execution time — the binary is already compiled.
+    /// </summary>
+    const int SingleRunTimeoutMs = 10_000;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Public entry point
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Validates all test cases and returns a split output with
+    /// Passing() and Failing() methods.
+    ///
+    /// Strategy:
+    ///   1. Generate a single .dfy file with CheckExpect helper, TestCase_0..N methods,
+    ///      and a Main that accepts an optional arg to run a specific test.
+    ///   2. `dafny build` once → compiled .dll
+    ///   3. Run the exe (no args) → all tests. Parse DONE:N / FAIL:N markers.
+    ///   4. For tests that didn't complete (crash/timeout), re-run the same exe
+    ///      with the test index as argument — no recompilation needed.
+    /// </summary>
+    internal static async Task<string> CheckAndSplitTests(
+        string generatedCode, string originalSource, string outputPath)
     {
         var dafnyPath = Z3Runner.FindDafnyPath();
         Console.WriteLine($"[DafnyTestGen] Checking tests with: {dafnyPath}");
 
-        // Extract the source header (everything before "method GeneratedTests_")
-        var genMethodMatch = Regex.Match(generatedCode, @"^method GeneratedTests_\w+\(\)\s*$", RegexOptions.Multiline);
+        // ── Extract source header (everything before "method GeneratedTests_") ──
+        var genMethodMatch = Regex.Match(
+            generatedCode, @"^method GeneratedTests_\w+\(\)\s*$", RegexOptions.Multiline);
         if (!genMethodMatch.Success)
         {
             Console.Error.WriteLine("[DafnyTestGen] Could not find GeneratedTests method in output");
@@ -26,19 +53,17 @@ static class TestValidator
         }
         var sourceHeader = generatedCode.Substring(0, genMethodMatch.Index);
 
-        // If the source header contains a Main() method, rename it to avoid conflicts
+        // Rename any Main() in the source to avoid conflicts with our generated Main
         sourceHeader = Regex.Replace(sourceHeader, @"\bmethod\s+Main\s*\(\s*\)", "method OriginalMain()");
         sourceHeader = Regex.Replace(sourceHeader, @"\bMain\s*\(\s*\)\s*;", "OriginalMain();");
 
-        // Extract individual test case blocks
+        // ── Extract individual test-case blocks ─────────────────────────────────
         var testBlocks = new List<(string comment, string body)>();
         var blockPattern = new Regex(
             @"(  // Test case[^\r\n]*\r?\n(?:  //[^\r\n]*\r?\n)*)  \{\r?\n(.*?)  \}",
             RegexOptions.Singleline);
         foreach (Match m in blockPattern.Matches(generatedCode))
-        {
             testBlocks.Add((m.Groups[1].Value.TrimEnd(), m.Groups[2].Value));
-        }
 
         if (testBlocks.Count == 0)
         {
@@ -48,67 +73,129 @@ static class TestValidator
 
         Console.WriteLine($"[DafnyTestGen] Checking {testBlocks.Count} test case(s)...");
 
-        // Run all tests in a single Dafny invocation
-        var (failedIds, incompleteIds) = await RunAllTestsAtOnce(dafnyPath, sourceHeader, testBlocks, outputPath);
+        // ── Generate single check file and build ─────────────────────────────────
+        var tempDir = Path.Combine(Path.GetTempPath(),
+            "DafnyTestGen_" + Path.GetRandomFileName().Replace(".", ""));
+        Directory.CreateDirectory(tempDir);
 
-        // Tests that didn't complete (e.g., crash/abort in a prior test killed the process)
-        // need to be re-checked individually — they may actually pass.
-        var determined = testBlocks.Count - incompleteIds.Count;
-        if (incompleteIds.Count > 0)
+        try
         {
-            Console.WriteLine($"  Batch: {determined}/{testBlocks.Count} determined, {incompleteIds.Count} incomplete (crash or timeout) — re-checking individually...");
-            int recheck = 0;
-            foreach (var idx in incompleteIds)
+            var testFile = Path.Combine(tempDir, "check_all.dfy");
+            var runnerBase = Path.Combine(tempDir, "runner");
+
+            WriteCheckFile(testFile, sourceHeader, testBlocks);
+
+            // ── Phase 1: compile once ────────────────────────────────────────────
+            var (buildExited, buildCode, _, buildErr) = await RunProcess(
+                dafnyPath,
+                $"build --allow-warnings --no-verify \"{testFile}\" -o \"{runnerBase}\"",
+                BuildTimeoutMs);
+
+            if (!buildExited || buildCode != 0)
             {
-                recheck++;
-                Console.Write($"  Re-checking test {idx + 1} ({recheck}/{incompleteIds.Count})...");
-                bool passed = await RunSingleTest(dafnyPath, sourceHeader, testBlocks[idx].body, idx, outputPath);
-                Console.WriteLine(passed ? " PASS" : " FAIL (timeout or error)");
-                if (!passed)
-                    failedIds.Add(idx);
+                Console.Error.WriteLine($"[DafnyTestGen] Build failed (exit={buildCode})");
+                if (!string.IsNullOrWhiteSpace(buildErr))
+                    Console.Error.WriteLine(buildErr);
+                return generatedCode;
             }
+
+            // ── Phase 2: run all tests at once ──────────────────────────────────
+            var (runExe, runArgs) = FindRunCommand(runnerBase);
+            if (runExe == null)
+            {
+                Console.Error.WriteLine("[DafnyTestGen] Cannot find compiled output");
+                return generatedCode;
+            }
+
+            var (batchExited, _, batchOut, _) = await RunProcess(
+                runExe, runArgs, BatchRunTimeoutMs);
+
+            var failedIds = new HashSet<int>();
+            ParseFailMarkers(batchOut, failedIds);
+            var completedIds = ParseDoneMarkers(batchOut);
+
+            // ── Phase 3: re-check incomplete tests individually ─────────────────
+            var incompleteIds = new HashSet<int>();
+            for (int i = 0; i < testBlocks.Count; i++)
+            {
+                if (!completedIds.Contains(i) && !failedIds.Contains(i))
+                    incompleteIds.Add(i);
+            }
+
+            if (incompleteIds.Count > 0)
+            {
+                var reason = batchExited ? "crash" : "timeout";
+                Console.WriteLine(
+                    $"  Batch: {completedIds.Count}/{testBlocks.Count} completed, " +
+                    $"{incompleteIds.Count} incomplete ({reason}) — re-checking individually...");
+
+                foreach (var idx in incompleteIds.OrderBy(x => x))
+                {
+                    var (reExited, reCode, reOut, _) = await RunProcess(
+                        runExe, $"{runArgs} {idx}".Trim(), SingleRunTimeoutMs);
+
+                    if (!reExited)
+                    {
+                        failedIds.Add(idx);  // timeout → fail
+                    }
+                    else
+                    {
+                        // Check for FAIL marker or non-zero exit
+                        var reFailed = new HashSet<int>();
+                        ParseFailMarkers(reOut, reFailed);
+                        if (reFailed.Count > 0 || reCode != 0)
+                            failedIds.Add(idx);
+                    }
+                }
+            }
+
+            // ── Report and split ────────────────────────────────────────────────
+            var passingBlocks = new List<(string comment, string body)>();
+            var failingBlocks = new List<(string comment, string body)>();
+
+            for (int i = 0; i < testBlocks.Count; i++)
+            {
+                if (failedIds.Contains(i))
+                {
+                    failingBlocks.Add(testBlocks[i]);
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: FAIL");
+                }
+                else
+                {
+                    passingBlocks.Add(testBlocks[i]);
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS");
+                }
+            }
+
+            Console.WriteLine(
+                $"[DafnyTestGen] Results: {passingBlocks.Count} passing, {failingBlocks.Count} failing");
+
+            return EmitSplitTests(sourceHeader, passingBlocks, failingBlocks);
         }
-
-        var passingBlocks = new List<(string comment, string body)>();
-        var failingBlocks = new List<(string comment, string body)>();
-
-        for (int i = 0; i < testBlocks.Count; i++)
+        finally
         {
-            if (failedIds.Contains(i))
-            {
-                failingBlocks.Add(testBlocks[i]);
-                Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: FAIL");
-            }
-            else
-            {
-                passingBlocks.Add(testBlocks[i]);
-                Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS");
-            }
+            CleanupTempDir(tempDir);
         }
-
-        Console.WriteLine($"[DafnyTestGen] Results: {passingBlocks.Count} passing, {failingBlocks.Count} failing");
-
-        return EmitSplitTests(sourceHeader, passingBlocks, failingBlocks);
     }
 
-    /// <summary>
-    /// Runs all test cases in a single Dafny invocation.
-    /// Each test's expect statements are replaced with a custom CheckExpect method
-    /// that prints "FAIL:N" on failure instead of aborting, so all tests run to completion.
-    /// Returns the set of test indices that failed.
-    /// </summary>
-    static async Task<(HashSet<int> failedIds, HashSet<int> incompleteIds)> RunAllTestsAtOnce(
-        string dafnyPath, string sourceHeader,
-        List<(string comment, string body)> testBlocks, string outputPath)
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), "DafnyTestGen_" + Path.GetRandomFileName().Replace(".", ""));
-        Directory.CreateDirectory(tempDir);
-        var tempFile = Path.Combine(tempDir, "check_all.dfy");
+    // ─────────────────────────────────────────────────────────────────────────
+    // Check file generation
+    // ─────────────────────────────────────────────────────────────────────────
 
-        var sb = new System.Text.StringBuilder();
+    /// <summary>
+    /// Writes a single Dafny file with:
+    ///   - The source header (program under test)
+    ///   - CheckExpect helper (prints FAIL:N instead of aborting)
+    ///   - TestCase_0() .. TestCase_N() methods (with DONE:N markers)
+    ///   - Main(args) that runs all tests, or a specific test by index arg
+    /// </summary>
+    static void WriteCheckFile(string path, string sourceHeader,
+        List<(string comment, string body)> testBlocks)
+    {
+        var sb = new StringBuilder();
         sb.Append(sourceHeader);
 
-        // Emit the CheckExpect helper method
+        // CheckExpect helper
         sb.AppendLine("method CheckExpect(condition: bool, testId: int)");
         sb.AppendLine("{");
         sb.AppendLine("  if !condition {");
@@ -117,225 +204,149 @@ static class TestValidator
         sb.AppendLine("}");
         sb.AppendLine();
 
-        // Emit each test case as a separate method.
-        // Each test prints "DONE:N" at the end so we can detect incomplete tests (abort/crash).
+        // Individual test methods
         for (int i = 0; i < testBlocks.Count; i++)
         {
-            var body = testBlocks[i].body;
-            // Replace "expect <expr>;" with "CheckExpect(<expr>, i);"
-            body = ReplaceExpectsWithChecks(body, i);
-
+            var body = ReplaceExpectsWithChecks(testBlocks[i].body, i);
             sb.AppendLine($"method TestCase_{i}()");
             sb.AppendLine("{");
             sb.Append(body);
-            sb.AppendLine($"    print \"DONE:{i}\\n\";");
+            sb.AppendLine($"  print \"DONE:{i}\\n\";");
             sb.AppendLine("}");
             sb.AppendLine();
         }
 
-        // Emit Main that calls all test cases
-        sb.AppendLine("method Main()");
+        // Main: no args → run all; with arg → run specific test by index
+        sb.AppendLine("method Main(args: seq<string>)");
         sb.AppendLine("{");
+        sb.AppendLine("  if |args| > 1 {");
+        // Simple string matching for test index (Dafny has no built-in parseInt)
         for (int i = 0; i < testBlocks.Count; i++)
-            sb.AppendLine($"  TestCase_{i}();");
+        {
+            var prefix = i == 0 ? "    if" : "    else if";
+            sb.AppendLine($"{prefix} args[1] == \"{i}\" {{ TestCase_{i}(); }}");
+        }
+        sb.AppendLine("  } else {");
+        for (int i = 0; i < testBlocks.Count; i++)
+            sb.AppendLine($"    TestCase_{i}();");
+        sb.AppendLine("  }");
         sb.AppendLine("}");
 
-        File.WriteAllText(tempFile, sb.ToString());
-
-        var failedIds = new HashSet<int>();
-        try
-        {
-            var psi = new ProcessStartInfo
-            {
-                FileName = dafnyPath,
-                Arguments = $"run --allow-warnings --no-verify \"{tempFile}\"",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            using var process = Process.Start(psi)!;
-
-            // Capture output incrementally so we don't lose it on timeout/kill
-            var outputLines = new List<string>();
-            process.OutputDataReceived += (_, e) =>
-            {
-                if (e.Data != null)
-                    lock (outputLines) outputLines.Add(e.Data);
-            };
-            process.BeginOutputReadLine();
-
-            // Drain stderr incrementally to prevent pipe buffer deadlock
-            var stderrLines = new List<string>();
-            process.ErrorDataReceived += (_, e) =>
-            {
-                if (e.Data != null)
-                    lock (stderrLines) stderrLines.Add(e.Data);
-            };
-            process.BeginErrorReadLine();
-
-            int timeoutMs = 15000;
-            var tcs = new TaskCompletionSource<bool>();
-            process.EnableRaisingEvents = true;
-            process.Exited += (_, _) => tcs.TrySetResult(true);
-            if (process.HasExited) tcs.TrySetResult(true);
-
-            bool timedOut = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs)) != tcs.Task;
-            if (timedOut)
-            {
-                // Kill entire process tree (dafny + compiled child process)
-                try { process.Kill(entireProcessTree: true); } catch { }
-                Console.Error.WriteLine("[DafnyTestGen] Batch check timed out (possible infinite loop)");
-            }
-
-            if (!process.HasExited)
-                process.WaitForExit(5000);
-
-            string output;
-            lock (outputLines) { output = string.Join("\n", outputLines); }
-
-            // Parse FAIL and DONE markers from captured output
-            ParseFailMarkers(output, failedIds);
-            var completedIds = ParseDoneMarkers(output);
-
-            // Tests that didn't complete (no DONE marker) go to incompleteIds
-            // for individual re-checking (they may pass when run alone)
-            var incompleteIds = new HashSet<int>();
-            for (int i = 0; i < testBlocks.Count; i++)
-            {
-                if (!completedIds.Contains(i) && !failedIds.Contains(i))
-                    incompleteIds.Add(i);
-            }
-
-            return (failedIds, incompleteIds);
-        }
-        finally
-        {
-            CleanupTempDir(tempDir);
-        }
+        File.WriteAllText(path, sb.ToString());
     }
 
     /// <summary>
-    /// Runs a single test case in its own Dafny process.
-    /// Used as a fallback for tests that didn't complete in the batch run
-    /// (e.g., because a prior test crashed and killed the process).
-    /// Returns true if the test passes.
-    /// </summary>
-    static async Task<bool> RunSingleTest(
-        string dafnyPath, string sourceHeader,
-        string testBody, int index, string outputPath)
-    {
-        var tempDir = Path.Combine(Path.GetTempPath(), "DafnyTestGen_" + Path.GetRandomFileName().Replace(".", ""));
-        Directory.CreateDirectory(tempDir);
-        var tempFile = Path.Combine(tempDir, $"check_{index}.dfy");
-
-        var sb = new System.Text.StringBuilder();
-        sb.Append(sourceHeader);
-
-        sb.AppendLine("method Main()");
-        sb.AppendLine("{");
-        sb.Append(testBody);
-        sb.AppendLine("}");
-
-        File.WriteAllText(tempFile, sb.ToString());
-
-        try
-        {
-            var psi = new ProcessStartInfo
-            {
-                FileName = dafnyPath,
-                Arguments = $"run --allow-warnings --no-verify \"{tempFile}\"",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            using var process = Process.Start(psi)!;
-
-            // Use incremental capture for both stdout and stderr
-            // to avoid hanging on ReadToEndAsync when grandchild keeps pipes open
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-
-            int timeoutMs = 15000;
-            var tcs = new TaskCompletionSource<bool>();
-            process.EnableRaisingEvents = true;
-            process.Exited += (_, _) => tcs.TrySetResult(true);
-            if (process.HasExited) tcs.TrySetResult(true);
-
-            bool timedOut = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs)) != tcs.Task;
-            if (timedOut)
-            {
-                // Kill entire process tree (dafny + compiled child process)
-                try { process.Kill(entireProcessTree: true); } catch { }
-                return false;
-            }
-
-            if (!process.HasExited)
-                process.WaitForExit(5000);
-
-            return process.ExitCode == 0;
-        }
-        finally
-        {
-            CleanupTempDir(tempDir);
-        }
-    }
-
-    /// <summary>
-    /// Replace "expect expr;" with "CheckExpect(expr, testId);" in a test body.
-    /// Handles multi-line expects and complex expressions.
+    /// Replaces `expect expr;` with `CheckExpect(expr, testId);` in a test body.
     /// </summary>
     static string ReplaceExpectsWithChecks(string body, int testId)
     {
-        // Match "expect <expr>;" where expr may span concepts but ends at ";"
-        return Regex.Replace(body, @"(\s*)expect\s+(.*?);", m =>
-        {
-            var indent = m.Groups[1].Value;
-            var expr = m.Groups[2].Value.Trim();
-            // Handle "expect x == y;" style (most common)
-            return $"{indent}CheckExpect({expr}, {testId});";
-        });
+        return Regex.Replace(body,
+            @"^(\s*)expect (.+);",
+            $"$1CheckExpect($2, {testId});",
+            RegexOptions.Multiline);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Marker parsing
+    // ─────────────────────────────────────────────────────────────────────────
 
     static void ParseFailMarkers(string output, HashSet<int> failedIds)
     {
         foreach (Match m in Regex.Matches(output, @"FAIL:(\d+)"))
-        {
             if (int.TryParse(m.Groups[1].Value, out var id))
                 failedIds.Add(id);
-        }
     }
 
     static HashSet<int> ParseDoneMarkers(string output)
     {
-        var done = new HashSet<int>();
+        var ids = new HashSet<int>();
         foreach (Match m in Regex.Matches(output, @"DONE:(\d+)"))
-        {
             if (int.TryParse(m.Groups[1].Value, out var id))
-                done.Add(id);
+                ids.Add(id);
+        return ids;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Process helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    static (string? exe, string args) FindRunCommand(string runnerBase)
+    {
+        var dll = runnerBase + ".dll";
+        if (File.Exists(dll)) return ("dotnet", $"\"{dll}\"");
+
+        var winExe = runnerBase + ".exe";
+        if (File.Exists(winExe)) return (winExe, "");
+
+        if (File.Exists(runnerBase)) return (runnerBase, "");
+
+        // Fallback: any .dll in the temp dir
+        var dir = Path.GetDirectoryName(runnerBase)!;
+        if (Directory.Exists(dir))
+        {
+            var anyDll = Directory.GetFiles(dir, "*.dll")
+                .FirstOrDefault(f => !f.Contains("runtimeconfig"));
+            if (anyDll != null) return ("dotnet", $"\"{anyDll}\"");
         }
-        return done;
+
+        return (null, "");
+    }
+
+    static async Task<(bool exited, int exitCode, string stdout, string stderr)>
+        RunProcess(string fileName, string arguments, int timeoutMs)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName               = fileName,
+            Arguments              = arguments,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            UseShellExecute        = false,
+            CreateNoWindow         = true
+        };
+
+        using var proc = Process.Start(psi)!;
+
+        var outLines = new List<string>();
+        var errLines = new List<string>();
+        proc.OutputDataReceived += (_, e) => { if (e.Data != null) lock (outLines) outLines.Add(e.Data); };
+        proc.ErrorDataReceived  += (_, e) => { if (e.Data != null) lock (errLines) errLines.Add(e.Data); };
+        proc.BeginOutputReadLine();
+        proc.BeginErrorReadLine();
+
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        proc.EnableRaisingEvents = true;
+        proc.Exited += (_, _) => tcs.TrySetResult(true);
+        if (proc.HasExited) tcs.TrySetResult(true);
+
+        bool completed = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs)) == tcs.Task;
+        if (!completed)
+            try { proc.Kill(entireProcessTree: true); } catch { }
+        if (!proc.HasExited) proc.WaitForExit(3000);
+
+        string stdout, stderr;
+        lock (outLines) stdout = string.Join("\n", outLines);
+        lock (errLines) stderr = string.Join("\n", errLines);
+
+        return (completed, completed ? proc.ExitCode : -1, stdout, stderr);
     }
 
     static void CleanupTempDir(string tempDir)
     {
-        try
-        {
-            if (Directory.Exists(tempDir))
-                Directory.Delete(tempDir, true);
-        }
+        try { if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true); }
         catch { }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Output emitter
+    // ─────────────────────────────────────────────────────────────────────────
 
     static string EmitSplitTests(
         string sourceHeader,
         List<(string comment, string body)> passingBlocks,
         List<(string comment, string body)> failingBlocks)
     {
-        var sb = new System.Text.StringBuilder();
+        var sb = new StringBuilder();
         sb.Append(sourceHeader);
 
         sb.AppendLine("method Passing()");
