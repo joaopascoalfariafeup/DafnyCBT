@@ -33,7 +33,7 @@ class Program
         var z3PathOpt = new Option<string?>("--z3-path", "Path to Z3 executable (default: auto-discover from VS Code extension, Z3_PATH env var, or PATH)");
         var maxTestsOpt = new Option<int>("--max-tests", () => 0, "Maximum number of generated tests per method (0 = unlimited)");
         maxTestsOpt.AddAlias("-x");
-        var timeoutOpt = new Option<int>("--timeout", () => 0, "Timeout in seconds for test generation per method (0 = unlimited)");
+        var timeoutOpt = new Option<int>("--timeout", () => 60, "Timeout in seconds for test generation per method (0 = unlimited, default: 60)");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
