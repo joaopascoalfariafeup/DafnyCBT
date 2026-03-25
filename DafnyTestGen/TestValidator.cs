@@ -356,15 +356,29 @@ static class TestValidator
                 var rhs = m.Groups[4].Value;
                 var semi = m.Groups[5].Value;
 
-                // Only replace if RHS has a function call and we captured the value
+                // Only replace if RHS has a function call, we captured the value,
+                // and the value is a valid Dafny literal (number, bool, char)
                 if (vars.TryGetValue(varName, out var value) &&
-                    Regex.IsMatch(rhs, @"[A-Z]\w*\s*\("))
+                    Regex.IsMatch(rhs, @"[A-Z]\w*\s*\(") &&
+                    IsValidDafnyLiteral(value))
                 {
                     return $"{indent}{varName}{eq}{value}{semi} // == {rhs}";
                 }
                 return m.Value;
             },
             RegexOptions.Multiline);
+    }
+
+    /// <summary>
+    /// Checks if a captured value is a valid Dafny literal that can be injected.
+    /// Accepts: integers (-?digits), reals (-?digits.digits), booleans, char literals.
+    /// Rejects: strings, sequences, objects, or any other printed representation.
+    /// </summary>
+    static bool IsValidDafnyLiteral(string value)
+    {
+        return Regex.IsMatch(value, @"^-?\d+(\.\d+)?$")  // int or real
+            || value == "true" || value == "false"         // bool
+            || Regex.IsMatch(value, @"^'.'$");             // char
     }
 
     // ─────────────────────────────────────────────────────────────────────────
