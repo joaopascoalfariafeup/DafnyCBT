@@ -813,7 +813,10 @@ class Program
         async Task<(Dictionary<string, string>? values, bool isDefinitiveUnsat)> SolveOne(string solveLabel, int schedIdx, int schedTotal,
             List<Expression> lits, List<Expression> preLits, List<Expression> excl, List<string> extra)
         {
-            if (verbose) Console.WriteLine($"  Solving combination {solveLabel} ({schedIdx}/{schedTotal})...");
+            if (verbose)
+                Console.WriteLine($"  Solving combination {solveLabel} ({schedIdx}/{schedTotal})...");
+            else
+                Console.Write($"\r  Solving {schedIdx}/{schedTotal}...   ");
             var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
             if (verbose)
             {
@@ -1059,6 +1062,7 @@ class Program
             Console.WriteLine($"  Phase 1: all-combinations ({n} clauses -> {totalCombinations} combinations)");
 
             await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count, testCases, baseConditionExclusions, knownUnsatLiteralMasks);
+            if (!verbose) Console.Write("\r                          \r"); // clear progress line
             Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
 
             if (testCases.Count < minTests && boundaryTiersPerPre.Count > 0
@@ -1073,6 +1077,7 @@ class Program
 
                 await SolveRange(testSchedule, phase2Start, testSchedule.Count, testSchedule.Count,
                     testCases, baseConditionExclusions, knownUnsatLiteralMasks, minTests);
+                if (!verbose) Console.Write("\r                          \r");
                 Console.WriteLine($"  Phase 2 complete: {testCases.Count} test(s)");
             }
 
@@ -1118,6 +1123,7 @@ class Program
                         else break;
                     }
                 }
+                if (!verbose) Console.Write("\r                          \r");
                 Console.WriteLine($"  Phase 3 complete: {testCases.Count} test(s)");
             }
         }
