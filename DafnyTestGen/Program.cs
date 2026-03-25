@@ -849,11 +849,11 @@ class Program
             {
                 if (verbose) Console.WriteLine($"  Combination {solveLabel}: TIMEOUT (skipping)");
             }
-            else
+            else if (!TimedOut())
             {
                 // When Z3 returns unknown, retry without postconditions containing 'exists'
                 var existsLits = lits.Where(l => EKey(l).Contains("exists ")).ToList();
-                if (existsLits.Count > 0 && existsLits.Count < lits.Count)
+                if (existsLits.Count > 0 && existsLits.Count < lits.Count && !TimedOut())
                 {
                     var simplifiedLits = lits.Where(l => !EKey(l).Contains("exists ")).ToList();
                     if (verbose) Console.WriteLine($"  Combination {solveLabel}: unknown, retrying without {existsLits.Count} exists-quantified postcondition(s)...");
@@ -880,6 +880,7 @@ class Program
                     if (verbose) Console.WriteLine($"  Combination {solveLabel}: still unknown after exists-retry");
                 }
                 // Final fallback: try input-only query (no postconditions)
+                if (!TimedOut())
                 {
                     if (verbose) Console.WriteLine($"  Combination {solveLabel}: retrying with input-only constraints...");
                     var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, new List<Expression>(), method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);

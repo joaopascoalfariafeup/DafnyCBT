@@ -44,10 +44,10 @@ static class Z3Runner
         var errTask = process.StandardError.ReadToEndAsync();
         var allDone = Task.WhenAll(outputTask, errTask);
 
-        if (await Task.WhenAny(allDone, Task.Delay(Z3_TIMEOUT_MS + 5000)) != allDone)
+        if (await Task.WhenAny(allDone, Task.Delay(Z3_TIMEOUT_MS + 2000)) != allDone)
         {
-            // Timeout: kill the process to unblock the read tasks
-            try { process.Kill(); } catch { }
+            // Timeout: kill the process tree to unblock the read tasks
+            try { process.Kill(entireProcessTree: true); } catch { }
             return "timeout";
         }
 
