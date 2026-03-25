@@ -113,6 +113,7 @@ static class TestValidator
             var failedIds = new HashSet<int>();
             ParseFailMarkers(batchOut, failedIds);
             var completedIds = ParseDoneMarkers(batchOut);
+            var capturedVals = ParseValMarkers(batchOut);
 
             // ── Phase 3: re-check incomplete tests individually ─────────────────
             var incompleteIds = new HashSet<int>();
@@ -145,6 +146,16 @@ static class TestValidator
                         ParseFailMarkers(reOut, reFailed);
                         if (reFailed.Count > 0 || reCode != 0)
                             failedIds.Add(idx);
+
+                        // Merge captured values from individual run
+                        var reVals = ParseValMarkers(reOut);
+                        foreach (var (id, vars) in reVals)
+                        {
+                            if (!capturedVals.ContainsKey(id))
+                                capturedVals[id] = new Dictionary<string, string>();
+                            foreach (var (k, v) in vars)
+                                capturedVals[id][k] = v;
+                        }
                     }
                 }
             }
@@ -162,7 +173,8 @@ static class TestValidator
                 }
                 else
                 {
-                    passingBlocks.Add(testBlocks[i]);
+                    passingBlocks.Add((testBlocks[i].comment,
+                        InjectCapturedValues(testBlocks[i].body, i, capturedVals)));
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS");
                 }
             }
@@ -237,13 +249,48 @@ static class TestValidator
 
     /// <summary>
     /// Replaces `expect expr;` with `CheckExpect(expr, testId);` in a test body.
+    /// For expects of the form `expect var == FuncCall(...);`, also adds a
+    /// print statement to capture the actual value: `print "VAL:testId:var=", var, "\n";`
     /// </summary>
     static string ReplaceExpectsWithChecks(string body, int testId)
     {
         return Regex.Replace(body,
             @"^(\s*)expect (.+);",
-            $"$1CheckExpect($2, {testId});",
+            m =>
+            {
+                var indent = m.Groups[1].Value;
+                var expr = m.Groups[2].Value;
+                var checkLine = $"{indent}CheckExpect({expr}, {testId});";
+
+                // Detect `var == ExprWithFuncCall` and emit VAL print for the variable
+                var valPrint = TryMakeValPrint(expr, testId, indent);
+                if (valPrint != null)
+                    return valPrint + "\n" + checkLine;
+                return checkLine;
+            },
             RegexOptions.Multiline);
+    }
+
+    /// <summary>
+    /// If the expect expression is `var == ExprContainingFunctionCall(...)`,
+    /// returns a print statement like: print "VAL:testId:var=", var, "\n";
+    /// Returns null if the expect doesn't match this pattern.
+    /// </summary>
+    static string? TryMakeValPrint(string expr, int testId, string indent)
+    {
+        // Match: varName == <expr containing a function call>
+        // e.g., "f == Fact(n)" or "res == Power(x, n) % m"
+        var m = Regex.Match(expr, @"^(\w+)\s*==\s*(.+)$");
+        if (!m.Success) return null;
+
+        var varName = m.Groups[1].Value;
+        var rhs = m.Groups[2].Value;
+
+        // Only emit VAL print if the RHS contains a function call (identifier followed by '(')
+        if (!Regex.IsMatch(rhs, @"[A-Z]\w*\s*\("))
+            return null;
+
+        return $"{indent}print \"VAL:{testId}:{varName}=\", {varName}, \"\\n\";";
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -264,6 +311,60 @@ static class TestValidator
             if (int.TryParse(m.Groups[1].Value, out var id))
                 ids.Add(id);
         return ids;
+    }
+
+    /// <summary>
+    /// Parses VAL:testId:varName=value markers from output.
+    /// Returns a dict: testId → { varName → value }
+    /// </summary>
+    static Dictionary<int, Dictionary<string, string>> ParseValMarkers(string output)
+    {
+        var result = new Dictionary<int, Dictionary<string, string>>();
+        foreach (Match m in Regex.Matches(output, @"VAL:(\d+):(\w+)=(.+)"))
+        {
+            if (!int.TryParse(m.Groups[1].Value, out var id)) continue;
+            var varName = m.Groups[2].Value;
+            var value = m.Groups[3].Value.Trim();
+            if (!result.ContainsKey(id))
+                result[id] = new Dictionary<string, string>();
+            result[id][varName] = value;
+        }
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Value injection
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// For passing tests with captured output values, replaces
+    /// `expect var == FuncCall(...);` with `expect var == concreteValue; // == FuncCall(...)`
+    /// </summary>
+    static string InjectCapturedValues(string body, int testId,
+        Dictionary<int, Dictionary<string, string>> capturedVals)
+    {
+        if (!capturedVals.TryGetValue(testId, out var vars) || vars.Count == 0)
+            return body;
+
+        return Regex.Replace(body,
+            @"^(\s*expect\s+)(\w+)(\s*==\s*)(.+)(;)",
+            m =>
+            {
+                var indent = m.Groups[1].Value;
+                var varName = m.Groups[2].Value;
+                var eq = m.Groups[3].Value;
+                var rhs = m.Groups[4].Value;
+                var semi = m.Groups[5].Value;
+
+                // Only replace if RHS has a function call and we captured the value
+                if (vars.TryGetValue(varName, out var value) &&
+                    Regex.IsMatch(rhs, @"[A-Z]\w*\s*\("))
+                {
+                    return $"{indent}{varName}{eq}{value}{semi} // == {rhs}";
+                }
+                return m.Value;
+            },
+            RegexOptions.Multiline);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
