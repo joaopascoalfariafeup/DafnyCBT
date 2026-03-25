@@ -69,7 +69,16 @@ static class DafnyParser
                         && !m.Name.Contains("test", StringComparison.OrdinalIgnoreCase)
                         && !m.Name.Contains("Test", StringComparison.OrdinalIgnoreCase)
                         && m.Name != "Main")
+                    {
+                        // Skip methods inside classes (not supported — requires object
+                        // construction, field state setup, modifies this, etc.)
+                        if (cls is ClassDecl && cls is not DefaultClassDecl)
+                        {
+                            Console.WriteLine($"  Skipping '{m.Name}' (class method in '{cls.Name}' — not supported)");
+                            continue;
+                        }
                         result.Add(m);
+                    }
                 }
             }
         }
