@@ -165,6 +165,17 @@ static class TestEmitter
                 if (elemType == "bool")
                     elems = elems.Select(e => e == "true" ? "true" : "false").ToArray();
 
+                // Ensure char elements are char literals (not integers)
+                if (elemType == "char")
+                    elems = elems.Select(e =>
+                    {
+                        if (int.TryParse(e, out var code) && code >= 32 && code < 127 && code != '\'' && code != '\\')
+                            return $"'{(char)code}'";
+                        if (int.TryParse(e, out var c))
+                            return $"'\\U{{{c:X4}}}'";
+                        return e; // already a char literal
+                    }).ToArray();
+
                 if (len == 0)
                     return $"    var {name} := new {elemType}[0] [];";
                 else

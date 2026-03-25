@@ -86,14 +86,16 @@ static class TestValidator
             WriteCheckFile(testFile, sourceHeader, testBlocks);
 
             // ── Phase 1: compile once ────────────────────────────────────────────
-            var (buildExited, buildCode, _, buildErr) = await RunProcess(
+            var (buildExited, buildCode, buildOut, buildErr) = await RunProcess(
                 dafnyPath,
                 $"build --allow-warnings --no-verify \"{testFile}\" -o \"{runnerBase}\"",
                 BuildTimeoutMs);
 
             if (!buildExited || buildCode != 0)
             {
-                Console.Error.WriteLine($"[DafnyTestGen] Build failed (exit={buildCode})");
+                Console.Error.WriteLine($"[DafnyTestGen] Build failed (exit={buildCode}), check file: {testFile}");
+                if (!string.IsNullOrWhiteSpace(buildOut))
+                    Console.Error.WriteLine(buildOut);
                 if (!string.IsNullOrWhiteSpace(buildErr))
                     Console.Error.WriteLine(buildErr);
                 return generatedCode;

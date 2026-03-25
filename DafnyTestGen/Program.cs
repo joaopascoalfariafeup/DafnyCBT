@@ -254,6 +254,13 @@ class Program
                 Console.WriteLine();
                 continue;
             }
+            var multiDimParam = allParams.FirstOrDefault(f => System.Text.RegularExpressions.Regex.IsMatch(f.Type.ToString(), @"array\d"));
+            if (multiDimParam != null)
+            {
+                Console.WriteLine($"  Skipping: multi-dimensional array type '{multiDimParam.Type}' for parameter '{multiDimParam.Name}' is not supported");
+                Console.WriteLine();
+                continue;
+            }
 
             // Check for non-inlinable function calls in postconditions (e.g., recursive/ghost functions)
             // These become uninterpreted in SMT and produce incorrect test values.
