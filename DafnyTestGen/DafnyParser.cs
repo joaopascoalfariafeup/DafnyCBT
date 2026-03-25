@@ -111,6 +111,18 @@ static class DafnyParser
                 }
             }
         }
+        // Remove predicates whose body calls another inlinable predicate.
+        // Transitive inlining of nested predicates with quantifiers causes
+        // exponential SMT expansion (e.g., 8^3 = 512 instances for 3 levels).
+        var names = new HashSet<string>(result.Select(r => r.name));
+        result = result.Where(r =>
+        {
+            var callsOther = names.Any(n => n != r.name && r.body.Contains(n + "("));
+            if (callsOther)
+                Console.WriteLine($"  Note: predicate '{r.name}' calls other predicates — not inlining (would cause SMT explosion)");
+            return !callsOther;
+        }).ToList();
+
         return result;
     }
 
@@ -124,6 +136,7 @@ static class DafnyParser
         List<(string name, List<string> paramNames, string body)> predicates)
     {
         var result = literal;
+        const int maxInlinedLength = 50_000; // safety limit to prevent exponential growth
         for (int pass = 0; pass < 3; pass++) // max 3 inlining passes for nested calls
         {
             var changed = false;
@@ -131,7 +144,7 @@ static class DafnyParser
             {
                 // Find occurrences of name(args...)
                 var pattern = @"\b" + Regex.Escape(name) + @"\s*\(";
-                while (Regex.IsMatch(result, pattern))
+                while (result.Length < maxInlinedLength && Regex.IsMatch(result, pattern))
                 {
                     var match = Regex.Match(result, pattern);
                     int argsStart = match.Index + match.Length;

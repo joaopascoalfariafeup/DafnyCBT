@@ -817,16 +817,22 @@ class Program
                 Console.WriteLine($"  Solving combination {solveLabel} ({schedIdx}/{schedTotal})...");
             else
                 Console.Write($"\r  Solving {schedIdx}/{schedTotal}...   ");
+            if (verbose) { Console.WriteLine($"  [DEBUG] Building SMT query..."); Console.Out.Flush(); }
             var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
             if (verbose)
             {
-                Console.WriteLine($"  [DEBUG] SMT2 query for {solveLabel}:");
+                Console.WriteLine($"  [DEBUG] SMT2 query for {solveLabel} ({smt.Length} chars):");
                 Console.WriteLine(smt);
                 Console.WriteLine();
+                Console.WriteLine($"  [DEBUG] Calling Z3...");
+                Console.Out.Flush();
             }
             var result = await Z3Runner.RunZ3(z3Path, smt);
             if (verbose)
-                Console.WriteLine($"  [DEBUG] Z3 output: {result.Substring(0, Math.Min(result.Length, 500))}");
+            {
+                Console.WriteLine($"  [DEBUG] Z3 returned ({result.Length} chars): {result.Substring(0, Math.Min(result.Length, 500))}");
+                Console.Out.Flush();
+            }
             var resultLines = result.Split('\n').Select(l => l.Trim()).ToList();
             if (resultLines.Any(l => l == "sat"))
             {
