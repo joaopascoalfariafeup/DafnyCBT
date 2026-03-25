@@ -247,6 +247,13 @@ class Program
                 Console.WriteLine();
                 continue;
             }
+            var arrowParam = allParams.FirstOrDefault(f => f.Type.ToString().Contains("->") || f.Type.ToString().Contains("~>"));
+            if (arrowParam != null)
+            {
+                Console.WriteLine($"  Skipping: function type '{arrowParam.Type}' for parameter '{arrowParam.Name}' is not supported");
+                Console.WriteLine();
+                continue;
+            }
 
             // Check for non-inlinable function calls in postconditions (e.g., recursive/ghost functions)
             // These become uninterpreted in SMT and produce incorrect test values.
@@ -806,7 +813,7 @@ class Program
         async Task<(Dictionary<string, string>? values, bool isDefinitiveUnsat)> SolveOne(string solveLabel, int schedIdx, int schedTotal,
             List<Expression> lits, List<Expression> preLits, List<Expression> excl, List<string> extra)
         {
-            Console.WriteLine($"  Solving combination {solveLabel} ({schedIdx}/{schedTotal})...");
+            if (verbose) Console.WriteLine($"  Solving combination {solveLabel} ({schedIdx}/{schedTotal})...");
             var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
             if (verbose)
             {
@@ -823,19 +830,22 @@ class Program
                 var values = TypeUtils.ParseZ3Model(result, allVars);
                 if (values.Count > 0)
                 {
-                    Console.WriteLine($"  Combination {solveLabel}: SAT - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                    if (verbose)
+                        Console.WriteLine($"  Combination {solveLabel}: SAT - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
                     return (values, false);
                 }
-                Console.WriteLine($"  Combination {solveLabel}: SAT but could not parse model");
+                if (verbose) Console.WriteLine($"  Combination {solveLabel}: SAT but could not parse model");
                 return (null, false);
             }
             if (resultLines.Any(l => l == "unsat"))
             {
-                Console.WriteLine($"  Combination {solveLabel}: UNSAT (skipping)");
+                if (verbose) Console.WriteLine($"  Combination {solveLabel}: UNSAT (skipping)");
                 return (null, true); // definitive UNSAT
             }
             if (result.Trim() == "timeout" || resultLines.Any(l => l == "timeout"))
-                Console.WriteLine($"  Combination {solveLabel}: TIMEOUT (skipping)");
+            {
+                if (verbose) Console.WriteLine($"  Combination {solveLabel}: TIMEOUT (skipping)");
+            }
             else
             {
                 // When Z3 returns unknown, retry without postconditions containing 'exists'
@@ -843,7 +853,7 @@ class Program
                 if (existsLits.Count > 0 && existsLits.Count < lits.Count)
                 {
                     var simplifiedLits = lits.Where(l => !EKey(l).Contains("exists ")).ToList();
-                    Console.WriteLine($"  Combination {solveLabel}: unknown, retrying without {existsLits.Count} exists-quantified postcondition(s)...");
+                    if (verbose) Console.WriteLine($"  Combination {solveLabel}: unknown, retrying without {existsLits.Count} exists-quantified postcondition(s)...");
                     var smt2 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, simplifiedLits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
                     if (verbose)
                     {
@@ -859,15 +869,16 @@ class Program
                         var values = TypeUtils.ParseZ3Model(result2, allVars);
                         if (values.Count > 0)
                         {
-                            Console.WriteLine($"  Combination {solveLabel}: SAT (retry) - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                            if (verbose)
+                                Console.WriteLine($"  Combination {solveLabel}: SAT (retry) - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
                             return (values, false);
                         }
                     }
-                    Console.WriteLine($"  Combination {solveLabel}: still unknown after exists-retry");
+                    if (verbose) Console.WriteLine($"  Combination {solveLabel}: still unknown after exists-retry");
                 }
                 // Final fallback: try input-only query (no postconditions)
                 {
-                    Console.WriteLine($"  Combination {solveLabel}: retrying with input-only constraints...");
+                    if (verbose) Console.WriteLine($"  Combination {solveLabel}: retrying with input-only constraints...");
                     var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, new List<Expression>(), method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
                     if (verbose)
                     {
@@ -883,11 +894,12 @@ class Program
                         var values = TypeUtils.ParseZ3Model(result3, allVars);
                         if (values.Count > 0)
                         {
-                            Console.WriteLine($"  Combination {solveLabel}: SAT (input-only) - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                            if (verbose)
+                                Console.WriteLine($"  Combination {solveLabel}: SAT (input-only) - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
                             return (values, false);
                         }
                     }
-                    Console.WriteLine($"  Combination {solveLabel}: UNSAT even with input-only (skipping)");
+                    if (verbose) Console.WriteLine($"  Combination {solveLabel}: UNSAT even with input-only (skipping)");
                 }
                 if (verbose) Console.WriteLine($"  Z3 output: {result}");
             }
@@ -956,7 +968,7 @@ class Program
                 // all boundary tiers for the same mask are also UNSAT (boundary only adds constraints).
                 if (isBoundaryTier && baseUnsatMasks.Contains((preIdx, postMask)))
                 {
-                    Console.WriteLine($"  Combination {label}: UNSAT (base was UNSAT)");
+                    if (verbose) Console.WriteLine($"  Combination {label}: UNSAT (base was UNSAT)");
                     prunedCount++;
                     continue;
                 }
@@ -972,7 +984,7 @@ class Program
                     {
                         if ((postMask & unsatMask) == unsatMask)
                         {
-                            Console.WriteLine($"  Combination {label}: UNSAT (pruned: superset of known-UNSAT mask 0x{unsatMask:X})");
+                            if (verbose) Console.WriteLine($"  Combination {label}: UNSAT (pruned: superset of known-UNSAT mask 0x{unsatMask:X})");
                             pruned = true;
                             prunedCount++;
                             break;
@@ -989,7 +1001,7 @@ class Program
                 var contradictionReason = DnfEngine.FindContradiction(allLiterals);
                 if (contradictionReason != null)
                 {
-                    Console.WriteLine($"  Combination {label}: UNSAT (syntactic {contradictionReason})");
+                    if (verbose) Console.WriteLine($"  Combination {label}: UNSAT (syntactic {contradictionReason})");
                     contradictionCount++;
                     // Record this mask for superset pruning (contradiction is in literals only,
                     // not in exclusions, so any superset mask will have the same literals + more).
@@ -1026,7 +1038,7 @@ class Program
                     baseUnsatMasks.Add((preIdx, postMask));
                 }
             }
-            if (prunedCount > 0 || contradictionCount > 0)
+            if (verbose && (prunedCount > 0 || contradictionCount > 0))
                 Console.WriteLine($"  Pruning stats: {contradictionCount} syntactic contradiction(s), {prunedCount} superset-pruned");
             return satCount;
         }
