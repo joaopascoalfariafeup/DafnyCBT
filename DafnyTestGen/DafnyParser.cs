@@ -70,11 +70,12 @@ static class DafnyParser
                         && !m.Name.Contains("Test", StringComparison.OrdinalIgnoreCase)
                         && m.Name != "Main")
                     {
-                        // Skip methods inside classes (not supported — requires object
+                        // Skip methods inside classes/traits (not supported — requires object
                         // construction, field state setup, modifies this, etc.)
-                        if (cls is ClassDecl && cls is not DefaultClassDecl)
+                        if ((cls is ClassDecl && cls is not DefaultClassDecl) || cls is TraitDecl)
                         {
-                            Console.WriteLine($"  Skipping '{m.Name}' (class method in '{cls.Name}' — not supported)");
+                            var kind = cls is TraitDecl ? "trait" : "class";
+                            Console.WriteLine($"  Skipping '{m.Name}' ({kind} method in '{cls.Name}' — not supported)");
                             continue;
                         }
                         result.Add(m);
