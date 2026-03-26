@@ -218,6 +218,30 @@ class Program
         if (inlinablePredicates.Count > 0 && verbose)
             Console.WriteLine($"[DafnyTestGen] Found {inlinablePredicates.Count} inlinable predicate(s): {string.Join(", ", inlinablePredicates.Select(p => p.name))}");
 
+        // Collect bodyless functions/predicates (no body = abstract/opaque) for skip detection
+        var bodylessFunctions = DafnyParser.AllTopLevelDecls(program)
+            .OfType<TopLevelDeclWithMembers>()
+            .SelectMany(cls => cls.Members)
+            .OfType<Function>()
+            .Where(f => f.Body == null)
+            .Select(f => f.Name)
+            .ToHashSet();
+
+        // Collect twostate function/predicate names for skip detection
+        var twostateFunctions = DafnyParser.AllTopLevelDecls(program)
+            .OfType<TopLevelDeclWithMembers>()
+            .SelectMany(cls => cls.Members)
+            .OfType<Function>()
+            .Where(f => f is TwoStateFunction)
+            .Select(f => f.Name)
+            .ToHashSet();
+
+        // Collect user-defined datatype names for skip detection
+        var datatypeNames = DafnyParser.AllTopLevelDecls(program)
+            .OfType<DatatypeDecl>()
+            .Select(d => d.Name)
+            .ToHashSet();
+
         Console.WriteLine($"[DafnyTestGen] Input:  {file.FullName}");
         Console.WriteLine($"[DafnyTestGen] Output: {outputPath}");
         Console.WriteLine();
@@ -250,14 +274,84 @@ class Program
             var arrowParam = allParams.FirstOrDefault(f => f.Type.ToString().Contains("->") || f.Type.ToString().Contains("~>"));
             if (arrowParam != null)
             {
-                Console.WriteLine($"  Skipping: function type '{arrowParam.Type}' for parameter '{arrowParam.Name}' is not supported");
+                Console.WriteLine($"  Skipping: function type '{arrowParam.Type}' for parameter '{arrowParam.Name}' is not yet supported");
                 Console.WriteLine();
                 continue;
             }
             var multiDimParam = allParams.FirstOrDefault(f => System.Text.RegularExpressions.Regex.IsMatch(f.Type.ToString(), @"array\d"));
             if (multiDimParam != null)
             {
-                Console.WriteLine($"  Skipping: multi-dimensional array type '{multiDimParam.Type}' for parameter '{multiDimParam.Name}' is not supported");
+                Console.WriteLine($"  Skipping: multi-dimensional array type '{multiDimParam.Type}' for parameter '{multiDimParam.Name}' is not yet supported");
+                Console.WriteLine();
+                continue;
+            }
+
+            // Skip bodyless methods (abstract/declared without a body — nothing to test)
+            if (method.Body == null)
+            {
+                Console.WriteLine($"  Skipping '{method.Name}': bodyless method (no implementation to test)");
+                Console.WriteLine();
+                continue;
+            }
+
+            // Skip methods whose requires/ensures reference a bodyless function or predicate.
+            // Such functions have no known semantics for SMT and cannot be meaningfully tested.
+            var reqEnsExprs = method.Req.Select(r => r.E).Concat(method.Ens.Select(e => e.E));
+            var calledFunctions = reqEnsExprs
+                .SelectMany(expr => FindFunctionCalls(expr))
+                .Distinct()
+                .ToList();
+            var bodylessCalled = calledFunctions.Where(name => bodylessFunctions.Contains(name)).ToList();
+            if (bodylessCalled.Count > 0)
+            {
+                Console.WriteLine($"  Skipping '{method.Name}': requires/ensures references bodyless function(s) {string.Join(", ", bodylessCalled.Select(f => $"'{f}'"))}");
+                Console.WriteLine();
+                continue;
+            }
+
+            // Skip methods whose requires/ensures reference twostate predicates/functions.
+            // Twostate predicates reference two heap states (old and new) and cannot be
+            // translated to SMT or used as expect assertions in generated tests.
+            var twostateCalled = calledFunctions.Where(name => twostateFunctions.Contains(name)).ToList();
+            if (twostateCalled.Count > 0)
+            {
+                Console.WriteLine($"  Skipping '{method.Name}': requires/ensures references twostate predicate(s) {string.Join(", ", twostateCalled.Select(f => $"'{f}'"))} (not yet supported)");
+                Console.WriteLine();
+                continue;
+            }
+
+            // Skip methods with user-defined datatype parameters (not supported in SMT translation).
+            // Check all identifier tokens in the type string so that datatypes nested inside
+            // generic types (e.g., array<Color>, seq<Tree>) are also detected.
+            var datatypeParam = allParams.FirstOrDefault(f =>
+            {
+                var typeStr = f.Type.ToString();
+                var identifiers = Regex.Matches(typeStr, @"\b([A-Za-z_]\w*)\b");
+                return identifiers.Cast<Match>().Any(m => datatypeNames.Contains(m.Groups[1].Value));
+            });
+            if (datatypeParam != null)
+            {
+                var typeStr = datatypeParam.Type.ToString();
+                var matchedDt = Regex.Matches(typeStr, @"\b([A-Za-z_]\w*)\b")
+                    .Cast<Match>().First(m => datatypeNames.Contains(m.Groups[1].Value)).Groups[1].Value;
+                Console.WriteLine($"  Skipping '{method.Name}': parameter '{datatypeParam.Name}' uses datatype '{matchedDt}' (type '{datatypeParam.Type}' — not yet supported)");
+                Console.WriteLine();
+                continue;
+            }
+
+            // Skip methods with map, imap, or multiset parameters (not supported in SMT translation)
+            var mapParam = allParams.FirstOrDefault(f =>
+            {
+                var typeStr = f.Type.ToString();
+                return typeStr.StartsWith("map<") || typeStr.StartsWith("imap<")
+                    || typeStr.StartsWith("multiset<")
+                    || typeStr == "map" || typeStr == "imap" || typeStr == "multiset";
+            });
+            if (mapParam != null)
+            {
+                var typeStr = mapParam.Type.ToString();
+                var kind = typeStr.StartsWith("multiset") ? "multiset" : "map";
+                Console.WriteLine($"  Skipping '{method.Name}': parameter '{mapParam.Name}' has {kind} type '{mapParam.Type}' (not yet supported)");
                 Console.WriteLine();
                 continue;
             }
