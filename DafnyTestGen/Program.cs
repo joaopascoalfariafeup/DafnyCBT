@@ -242,6 +242,23 @@ class Program
             .Select(d => d.Name)
             .ToHashSet();
 
+        // File-level check: skip entire program if it contains any bodyless method.
+        // Such programs cannot be compiled (dafny build fails), so generated tests
+        // that include the source would produce build errors.
+        var allProgramMethods = DafnyParser.AllTopLevelDecls(program)
+            .OfType<TopLevelDeclWithMembers>()
+            .SelectMany(cls => cls.Members)
+            .OfType<Method>()
+            .ToList();
+        var bodylessMethods = allProgramMethods.Where(m => m.Body == null && !m.IsGhost).ToList();
+        if (bodylessMethods.Count > 0)
+        {
+            var names = string.Join(", ", bodylessMethods.Select(m => $"'{m.Name}'"));
+            Console.WriteLine($"[DafnyTestGen] Skipping {file.Name}: program contains bodyless method(s) {names} (cannot be compiled)");
+            Console.WriteLine();
+            return;
+        }
+
         Console.WriteLine($"[DafnyTestGen] Input:  {file.FullName}");
         Console.WriteLine($"[DafnyTestGen] Output: {outputPath}");
         Console.WriteLine();
