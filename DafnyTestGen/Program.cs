@@ -371,18 +371,21 @@ class Program
                 continue;
             }
 
-            // Skip methods with map, imap, or multiset parameters (not supported in SMT translation)
+            // Skip methods with set, map, imap, or multiset parameters (not supported in SMT translation)
             var mapParam = allParams.FirstOrDefault(f =>
             {
                 var typeStr = f.Type.ToString();
-                return typeStr.StartsWith("map<") || typeStr.StartsWith("imap<")
+                return typeStr.StartsWith("set<") || typeStr.StartsWith("iset<")
+                    || typeStr.StartsWith("map<") || typeStr.StartsWith("imap<")
                     || typeStr.StartsWith("multiset<")
+                    || typeStr == "set" || typeStr == "iset"
                     || typeStr == "map" || typeStr == "imap" || typeStr == "multiset";
             });
             if (mapParam != null)
             {
                 var typeStr = mapParam.Type.ToString();
-                var kind = typeStr.StartsWith("multiset") ? "multiset" : "map";
+                var kind = typeStr.StartsWith("set") || typeStr.StartsWith("iset") ? "set"
+                    : typeStr.StartsWith("multiset") ? "multiset" : "map";
                 Console.WriteLine($"  Skipping '{method.Name}': parameter '{mapParam.Name}' has {kind} type '{mapParam.Type}' (not yet supported)");
                 Console.WriteLine();
                 continue;
