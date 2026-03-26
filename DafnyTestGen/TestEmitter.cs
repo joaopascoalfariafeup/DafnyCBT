@@ -139,7 +139,8 @@ static class TestEmitter
         return typeStr;
     }
 
-    internal static string EmitVarDecl(string name, string typeStr, Dictionary<string, string> values)
+    internal static string EmitVarDecl(string name, string typeStr, Dictionary<string, string> values,
+        Dictionary<string, List<string>>? enumDatatypes = null)
     {
         if (TypeUtils.IsArrayType(typeStr))
         {
@@ -147,7 +148,8 @@ static class TestEmitter
                 ? typeStr.Substring(6, typeStr.Length - 7)
                 : "int";
 
-            var defaultElem = elemType == "bool" ? "false" : elemType == "real" ? "0.0" : "0";
+            var defaultElem = elemType == "bool" ? "false" : elemType == "real" ? "0.0" :
+                (enumDatatypes != null && enumDatatypes.TryGetValue(elemType, out var defCtors) ? defCtors[0] : "0");
 
             if (values.TryGetValue(name + "_len", out var lenStr) && int.TryParse(lenStr, out var len) && len >= 0)
             {
@@ -174,6 +176,15 @@ static class TestEmitter
                         if (int.TryParse(e, out var c))
                             return $"'\\U{{{c:X4}}}'";
                         return e; // already a char literal
+                    }).ToArray();
+
+                // Map enum ordinals back to constructor names
+                if (enumDatatypes != null && enumDatatypes.TryGetValue(elemType, out var enumCtors))
+                    elems = elems.Select(e =>
+                    {
+                        if (int.TryParse(e, out var ord) && ord >= 0 && ord < enumCtors.Count)
+                            return enumCtors[ord];
+                        return enumCtors[0];
                     }).ToArray();
 
                 if (len == 0)
@@ -213,15 +224,37 @@ static class TestEmitter
                     });
                     return $"    var {name}: seq<char> := [{string.Join(", ", charElems)}];";
                 }
-                else
+
+                // Map enum ordinals back to constructor names for seq<EnumType>
+                var seqElemType = TypeUtils.GetSeqElementType(typeStr);
+                if (enumDatatypes != null && enumDatatypes.TryGetValue(seqElemType, out var seqEnumCtors))
                 {
-                    // Generic seq<T>
+                    elems = elems.Select(e =>
+                    {
+                        if (int.TryParse(e, out var ord) && ord >= 0 && ord < seqEnumCtors.Count)
+                            return seqEnumCtors[ord];
+                        return seqEnumCtors[0];
+                    }).ToArray();
                     if (len == 0)
                         return $"    var {name}: {typeStr} := [];";
                     return $"    var {name}: {typeStr} := [{string.Join(", ", elems)}];";
                 }
+
+                // Generic seq<T>
+                if (len == 0)
+                    return $"    var {name}: {typeStr} := [];";
+                return $"    var {name}: {typeStr} := [{string.Join(", ", elems)}];";
             }
             return $"    var {name}: {typeStr} := [];";
+        }
+
+        // Enum datatype: map integer ordinal back to constructor name
+        if (enumDatatypes != null && enumDatatypes.TryGetValue(typeStr, out var scalarEnumCtors))
+        {
+            if (values.TryGetValue(name, out var enumVal) && int.TryParse(enumVal, out var ord)
+                && ord >= 0 && ord < scalarEnumCtors.Count)
+                return $"    var {name} := {scalarEnumCtors[ord]};";
+            return $"    var {name} := {scalarEnumCtors[0]};";
         }
 
         if (values.TryGetValue(name, out var val))
@@ -254,7 +287,8 @@ static class TestEmitter
         List<Expression> preClauses,
         bool hasArrayParam,
         bool hasUninterpFuncs = false,
-        HashSet<string>? mutableNames = null)
+        HashSet<string>? mutableNames = null,
+        Dictionary<string, List<string>>? enumDatatypes = null)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("// Auto-generated test cases by DafnyTestGen");
@@ -316,7 +350,7 @@ static class TestEmitter
                     if (values.TryGetValue($"{inp.Name}_pre_elems", out var preElems))
                         emitValues[inp.Name + "_elems"] = preElems;
                 }
-                sb.AppendLine(EmitVarDecl(inp.Name, typeStr, emitValues));
+                sb.AppendLine(EmitVarDecl(inp.Name, typeStr, emitValues, enumDatatypes));
             }
 
             // Capture old() expressions before the method call.

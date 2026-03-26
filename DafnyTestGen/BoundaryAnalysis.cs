@@ -18,7 +18,8 @@ static class BoundaryAnalysis
         bool verbose,
         int tierCount = 4,
         List<string>? preLiterals = null,
-        HashSet<string>? mutableNames = null)
+        HashSet<string>? mutableNames = null,
+        Dictionary<string, List<string>>? enumDatatypes = null)
     {
         mutableNames ??= new HashSet<string>();
 
@@ -112,6 +113,12 @@ static class BoundaryAnalysis
                 {
                     tiers.Add((lbl, $"(= {name} {smtVal})"));
                 }
+            }
+            else if (enumDatatypes != null && enumDatatypes.TryGetValue(type, out var enumCtors))
+            {
+                // One tier per constructor — exhaustive coverage
+                for (int i = 0; i < enumCtors.Count; i++)
+                    tiers.Add((enumCtors[i], $"(= {name} {i})"));
             }
 
             if (tiers.Count > 0)

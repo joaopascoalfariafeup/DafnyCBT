@@ -35,6 +35,9 @@ static class SmtTranslator
     internal static Dictionary<string, int> _uninterpFuncs = new();
     // True if any postcondition literal could not be translated to SMT
     internal static bool _hasUntranslatedPost = false;
+    // Enum datatype mappings (set by Program.cs before each method's SMT generation)
+    internal static Dictionary<string, List<string>> _enumDatatypes = new();
+    internal static Dictionary<string, (string dtName, int ordinal)> _enumConstructors = new();
 
     internal static string BuildSmt2Query(
         List<(string Name, string Type)> inputs,
@@ -84,6 +87,12 @@ static class SmtTranslator
                     sb.AppendLine($"(assert (>= {name} 32))");
                     sb.AppendLine($"(assert (<= {name} 126))");
                 }
+                // Enum datatype: constrain to valid ordinals
+                if (_enumDatatypes.TryGetValue(type, out var enumCtors))
+                {
+                    sb.AppendLine($"(assert (>= {name} 0))");
+                    sb.AppendLine($"(assert (<= {name} {enumCtors.Count - 1}))");
+                }
             }
         }
 
@@ -126,6 +135,8 @@ static class SmtTranslator
                         var elemTypeStr = TypeUtils.GetSeqElementType(type);
                         if (elemTypeStr == "char")
                             sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
+                        if (_enumDatatypes.TryGetValue(elemTypeStr, out var enumElemCtors))
+                            sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 0) (<= (seq.nth {smtName} i) {enumElemCtors.Count - 1})))))");
                     }
                 }
                 else
@@ -136,6 +147,8 @@ static class SmtTranslator
                     var elemType = TypeUtils.GetSeqElementType(type);
                     if (elemType == "char")
                         sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
+                    if (_enumDatatypes.TryGetValue(elemType, out var enumElemCtors2))
+                        sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 0) (<= (seq.nth {smtName} i) {enumElemCtors2.Count - 1})))))");
                 }
             }
         }
@@ -442,11 +455,26 @@ static class SmtTranslator
             goto fallback;
         }
 
-        // IdentifierExpr / NameSegment — variable with mutable renaming
+        // DatatypeValue — enum constructor reference (resolved AST, e.g. Red or Red())
+        if (expr is DatatypeValue dtVal && dtVal.Arguments.Count == 0)
+        {
+            if (_enumConstructors.TryGetValue(dtVal.MemberName, out var enumInfo))
+                return enumInfo.ordinal.ToString();
+        }
+
+        // IdentifierExpr / NameSegment — check enum constructor first, then variable
         if (expr is IdentifierExpr idExpr)
+        {
+            if (_enumConstructors.TryGetValue(idExpr.Name, out var enumInfo))
+                return enumInfo.ordinal.ToString();
             return RenameMutable(idExpr.Name, mutableNames, isPostContext, insideOld);
+        }
         if (expr is NameSegment nameExpr)
+        {
+            if (_enumConstructors.TryGetValue(nameExpr.Name, out var enumInfo))
+                return enumInfo.ordinal.ToString();
             return RenameMutable(nameExpr.Name, mutableNames, isPostContext, insideOld);
+        }
 
         // LiteralExpr (int, bool, char)
         if (expr is CharLiteralExpr charLit)
@@ -1240,9 +1268,13 @@ static class SmtTranslator
             return charCode.ToString();
         }
 
-        // Variable name (identifier)
+        // Variable name (identifier) or enum constructor
         if (Regex.IsMatch(expr, @"^\w+$"))
+        {
+            if (_enumConstructors.TryGetValue(expr, out var enumInfo))
+                return enumInfo.ordinal.ToString();
             return expr;
+        }
 
         // Negative literal: -1
         if (expr.StartsWith("-") && int.TryParse(expr.Substring(1), out var posNum))
@@ -1261,6 +1293,10 @@ static class SmtTranslator
         }
 
         // Handle function calls: FuncName(arg1, arg2, ...)
+        // First check for zero-arg enum constructor calls: Red(), White(), etc.
+        var zeroArgMatch = Regex.Match(expr, @"^(\w+)\(\)$");
+        if (zeroArgMatch.Success && _enumConstructors.TryGetValue(zeroArgMatch.Groups[1].Value, out var enumInfo2))
+            return enumInfo2.ordinal.ToString();
         // Declared as uninterpreted functions in SMT
         var funcMatch = Regex.Match(expr, @"^(\w+)\((.+)\)$");
         if (funcMatch.Success)

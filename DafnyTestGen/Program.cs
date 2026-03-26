@@ -236,11 +236,26 @@ class Program
             .Select(f => f.Name)
             .ToHashSet();
 
-        // Collect user-defined datatype names for skip detection
-        var datatypeNames = DafnyParser.AllTopLevelDecls(program)
+        // Classify user-defined datatypes: pure enums (all constructors parameterless) vs complex
+        var allDatatypes = DafnyParser.AllTopLevelDecls(program)
             .OfType<DatatypeDecl>()
-            .Select(d => d.Name)
-            .ToHashSet();
+            .ToList();
+        var enumDatatypes = new Dictionary<string, List<string>>();
+        var datatypeNames = new HashSet<string>(); // non-enum datatypes (still skipped)
+        foreach (var dt in allDatatypes)
+        {
+            if (dt.Ctors.All(ctor => ctor.Formals.Count == 0))
+                enumDatatypes[dt.Name] = dt.Ctors.Select(c => c.Name).ToList();
+            else
+                datatypeNames.Add(dt.Name);
+        }
+        var enumConstructors = new Dictionary<string, (string dtName, int ordinal)>();
+        foreach (var (dtName, ctors) in enumDatatypes)
+            for (int i = 0; i < ctors.Count; i++)
+                enumConstructors[ctors[i]] = (dtName, i);
+        if (enumDatatypes.Count > 0)
+            Console.WriteLine($"[DafnyTestGen] Enum datatypes: {string.Join(", ", enumDatatypes.Select(e => $"{e.Key}({string.Join("|", e.Value)})"))}");
+
 
         // File-level check: skip entire program if it contains any bodyless method.
         // Such programs cannot be compiled (dafny build fails), so generated tests
@@ -410,7 +425,7 @@ class Program
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
             Console.WriteLine();
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs);
+            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors);
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -624,9 +639,14 @@ class Program
     /// For each test condition (PRE && POST_clause), we ask Z3 to find satisfying values.
     /// </summary>
     static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
-        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool hasNonInlinableFuncs = false)
+        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool hasNonInlinableFuncs = false,
+        Dictionary<string, List<string>>? enumDatatypes = null, Dictionary<string, (string dtName, int ordinal)>? enumConstructors = null)
     {
         z3Path ??= Z3Runner.FindZ3Path();
+        enumDatatypes ??= new Dictionary<string, List<string>>();
+        enumConstructors ??= new Dictionary<string, (string dtName, int ordinal)>();
+        SmtTranslator._enumDatatypes = enumDatatypes;
+        SmtTranslator._enumConstructors = enumConstructors;
         var deadline = timeoutSecs > 0 ? DateTime.UtcNow.AddSeconds(timeoutSecs) : DateTime.MaxValue;
         bool TimedOut() => DateTime.UtcNow >= deadline;
 
@@ -820,7 +840,7 @@ class Program
             for (int pi = 0; pi < preCombinations.Count; pi++)
             {
                 var preLitStrings = preCombinations[pi].preLits.Select(EKey).ToList();
-                boundaryTiersPerPre[pi] = BoundaryAnalysis.BuildBoundaryTiers(inputs, preClauses, method, verbose, tierCount, preLitStrings, mutableNames);
+                boundaryTiersPerPre[pi] = BoundaryAnalysis.BuildBoundaryTiers(inputs, preClauses, method, verbose, tierCount, preLitStrings, mutableNames, enumDatatypes);
             }
             if (boundary)
                 Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
@@ -1379,7 +1399,7 @@ class Program
         bool hasUninterpFuncs = hasNonInlinableFuncs || SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
         // Emit Dafny test file
-        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames);
+        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes);
     }
 
     /// <summary>
