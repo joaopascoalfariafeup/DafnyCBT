@@ -59,6 +59,8 @@ static class BoundaryAnalysis
             }
             else if (type == "int" || type == "nat" || type == "T")
             {
+                // For mutable scalar fields, boundary tiers constrain the pre-state
+                var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
                 // Extract bounds from preconditions
                 var bounds = ExtractBounds(name, preStrings);
                 var boundaryValues = new HashSet<int>();
@@ -89,18 +91,18 @@ static class BoundaryAnalysis
 
                 foreach (var val in boundaryValues.OrderBy(v => v))
                 {
-                    tiers.Add(($"{val}", $"(= {name} {(val < 0 ? $"(- {-val})" : val.ToString())})"));
+                    tiers.Add(($"{val}", $"(= {smtName} {(val < 0 ? $"(- {-val})" : val.ToString())})"));
                 }
 
                 // Add relational boundary: param == otherParam
                 foreach (var rel in relBounds)
                 {
-                    tiers.Add(($"={rel}", $"(= {name} {rel})"));
+                    tiers.Add(($"={rel}", $"(= {smtName} {rel})"));
                 }
             }
             else if (type == "real")
             {
-                // For real parameters, use representative boundary values
+                var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
                 var realBoundaryValues = new List<(string label, string smtValue)>
                 {
                     ("0.0", "0.0"),
@@ -111,14 +113,14 @@ static class BoundaryAnalysis
 
                 foreach (var (lbl, smtVal) in realBoundaryValues)
                 {
-                    tiers.Add((lbl, $"(= {name} {smtVal})"));
+                    tiers.Add((lbl, $"(= {smtName} {smtVal})"));
                 }
             }
             else if (enumDatatypes != null && enumDatatypes.TryGetValue(type, out var enumCtors))
             {
-                // One tier per constructor — exhaustive coverage
+                var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
                 for (int i = 0; i < enumCtors.Count; i++)
-                    tiers.Add((enumCtors[i], $"(= {name} {i})"));
+                    tiers.Add((enumCtors[i], $"(= {smtName} {i})"));
             }
 
             if (tiers.Count > 0)

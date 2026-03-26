@@ -277,6 +277,30 @@ static class TestEmitter
         return $"    var {name} := {defaultVal}; // Z3 did not assign a value";
     }
 
+    /// <summary>
+    /// Formats a scalar Z3 value for Dafny emission (used for class field assignments).
+    /// </summary>
+    static string FormatScalarValue(string val, string typeStr, Dictionary<string, List<string>>? enumDatatypes)
+    {
+        if (enumDatatypes != null && enumDatatypes.TryGetValue(typeStr, out var ctors))
+        {
+            if (int.TryParse(val, out var ord) && ord >= 0 && ord < ctors.Count)
+                return ctors[ord];
+            return ctors[0];
+        }
+        if (typeStr == "real" && !val.Contains('.'))
+            return val + ".0";
+        if (typeStr == "char" && int.TryParse(val, out var charCode))
+        {
+            if (charCode >= 32 && charCode < 127 && charCode != '\'' && charCode != '\\')
+                return $"'{(char)charCode}'";
+            return $"'\\U{{{charCode:X4}}}'";
+        }
+        if (typeStr == "bool")
+            return val == "true" ? "true" : "false";
+        return val;
+    }
+
     internal static string EmitDafnyTests(
         string filePath,
         string methodName,
@@ -288,7 +312,8 @@ static class TestEmitter
         bool hasArrayParam,
         bool hasUninterpFuncs = false,
         HashSet<string>? mutableNames = null,
-        Dictionary<string, List<string>>? enumDatatypes = null)
+        Dictionary<string, List<string>>? enumDatatypes = null,
+        ClassInfo? classInfo = null)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("// Auto-generated test cases by DafnyTestGen");
@@ -335,10 +360,49 @@ static class TestEmitter
 
             sb.AppendLine("  {");
 
+            // For class methods: construct object and assign fields
+            var fieldNames = classInfo != null ? new HashSet<string>(classInfo.Fields.Select(f => f.Name)) : new HashSet<string>();
+            if (classInfo != null)
+            {
+                sb.AppendLine($"    var obj := new {classInfo.ClassName};");
+                foreach (var (fieldName, fieldType) in classInfo.Fields)
+                {
+                    var fType = SubstTypeParams(fieldType, typeParamMap);
+                    if (TypeUtils.IsArrayType(fType))
+                    {
+                        // Array field: emit temp var, then assign to obj.field
+                        var emitValues = new Dictionary<string, string>(values);
+                        if (values.TryGetValue($"{fieldName}_pre_len", out var preLen))
+                            emitValues[fieldName + "_len"] = preLen;
+                        if (values.TryGetValue($"{fieldName}_pre_elems", out var preElems))
+                            emitValues[fieldName + "_elems"] = preElems;
+                        sb.AppendLine(EmitVarDecl($"tmp_{fieldName}", fType, emitValues, enumDatatypes));
+                        sb.AppendLine($"    obj.{fieldName} := tmp_{fieldName};");
+                    }
+                    else
+                    {
+                        // Scalar field: obj.field := value;
+                        var valKey = mutableNames != null && mutableNames.Contains(fieldName) ? $"{fieldName}_pre" : fieldName;
+                        if (values.TryGetValue(valKey, out var val))
+                        {
+                            val = FormatScalarValue(val, fType, enumDatatypes);
+                            sb.AppendLine($"    obj.{fieldName} := {val};");
+                        }
+                        else
+                        {
+                            var defaultVal = fType switch { "real" => "0.0", "char" => "' '", "bool" => "false", _ => "0" };
+                            sb.AppendLine($"    obj.{fieldName} := {defaultVal};");
+                        }
+                    }
+                }
+            }
+
             // Emit variable declarations from Z3 model, substituting type parameters.
             // For mutable arrays, use _pre values (the input/pre-state).
+            // Skip synthetic field inputs (handled above for class methods).
             foreach (var inp in method.Ins)
             {
+                if (fieldNames.Contains(inp.Name)) continue; // already emitted as obj.field
                 var typeStr = SubstTypeParams(inp.Type.ToString(), typeParamMap);
                 var emitValues = values;
                 if (mutableNames != null && mutableNames.Contains(inp.Name) && TypeUtils.IsArrayType(typeStr))
@@ -359,18 +423,24 @@ static class TestEmitter
             var oldCaptures = ExtractOldCaptures(literals, arrayParamNames);
             foreach (var (oldExpr, varName, _) in oldCaptures)
             {
-                sb.AppendLine($"    var {varName} := {oldExpr};");
+                // For class methods, prefix field references with obj.
+                var captureExpr = oldExpr;
+                if (classInfo != null && fieldNames.Any(f => oldExpr == f || oldExpr.StartsWith(f + "[")))
+                    captureExpr = "obj." + oldExpr;
+                sb.AppendLine($"    var {varName} := {captureExpr};");
             }
 
             // Call the method
+            var callPrefix = classInfo != null ? "obj." : "";
+            var callArgs = string.Join(", ", method.Ins.Select(i => i.Name));
             if (method.Outs.Count > 0)
             {
                 var outNames = string.Join(", ", method.Outs.Select(o => o.Name));
-                sb.AppendLine($"    var {outNames} := {methodCallName}({string.Join(", ", method.Ins.Select(i => i.Name))});");
+                sb.AppendLine($"    var {outNames} := {callPrefix}{methodCallName}({callArgs});");
             }
             else
             {
-                sb.AppendLine($"    {methodCallName}({string.Join(", ", method.Ins.Select(i => i.Name))});");
+                sb.AppendLine($"    {callPrefix}{methodCallName}({callArgs});");
             }
 
             // Replace old() references in literals for expect statements
@@ -378,6 +448,23 @@ static class TestEmitter
                 .Where(lit => !TypeUtils.IsSpecOnlyLiteral(lit))
                 .Select(lit => ReplaceOldReferences(lit, oldCaptures, arrayParamNames))
                 .ToList();
+
+            // For class methods, replace bare field references with obj.field in expects
+            if (classInfo != null)
+            {
+                expectLiterals = expectLiterals.Select(lit =>
+                {
+                    var result = lit;
+                    foreach (var (fieldName, _) in classInfo.Fields)
+                    {
+                        // Replace bare field name with obj.field, but not inside old_field captures
+                        result = Regex.Replace(result,
+                            @"(?<![a-zA-Z_0-9\.])(?<!old_)" + Regex.Escape(fieldName) + @"(?![a-zA-Z_0-9])",
+                            $"obj.{fieldName}");
+                    }
+                    return result;
+                }).ToList();
+            }
 
             // Emit expect assertions.
             // Use postcondition literals when: uninterpreted functions, or method modifies

@@ -224,4 +224,16 @@ static class TypeUtils
         var trimmed = literal.Trim();
         return Regex.IsMatch(trimmed, @"\bfresh\s*\(");
     }
+
+    /// <summary>
+    /// Returns true if the type is supported as a class field for simple class testing.
+    /// </summary>
+    internal static bool IsSupportedFieldType(string type, Dictionary<string, List<string>>? enumDatatypes = null)
+    {
+        if (type is "int" or "nat" or "bool" or "real" or "char") return true;
+        if (IsArrayType(type) || IsSeqType(type))
+            return !IsNestedCollectionType(type);
+        if (enumDatatypes != null && enumDatatypes.ContainsKey(type)) return true;
+        return false;
+    }
 }

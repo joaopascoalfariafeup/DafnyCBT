@@ -183,6 +183,26 @@ class Program
         }
 
         // Step 2: Determine which methods to process
+        // Classify user-defined datatypes: pure enums (all constructors parameterless) vs complex
+        var allDatatypes = DafnyParser.AllTopLevelDecls(program)
+            .OfType<DatatypeDecl>()
+            .ToList();
+        var enumDatatypes = new Dictionary<string, List<string>>();
+        var datatypeNames = new HashSet<string>(); // non-enum datatypes (still skipped)
+        foreach (var dt in allDatatypes)
+        {
+            if (dt.Ctors.All(ctor => ctor.Formals.Count == 0))
+                enumDatatypes[dt.Name] = dt.Ctors.Select(c => c.Name).ToList();
+            else
+                datatypeNames.Add(dt.Name);
+        }
+        var enumConstructors = new Dictionary<string, (string dtName, int ordinal)>();
+        foreach (var (dtName, ctors) in enumDatatypes)
+            for (int i = 0; i < ctors.Count; i++)
+                enumConstructors[ctors[i]] = (dtName, i);
+        if (enumDatatypes.Count > 0)
+            Console.WriteLine($"[DafnyTestGen] Enum datatypes: {string.Join(", ", enumDatatypes.Select(e => $"{e.Key}({string.Join("|", e.Value)})"))}");
+
         List<Method> methods;
         if (methodName != null)
         {
@@ -204,13 +224,30 @@ class Program
         else
         {
             // Auto-discover: all non-ghost methods that don't have "test" in the name
-            methods = DafnyParser.FindTestableMethodsAuto(program);
+            methods = DafnyParser.FindTestableMethodsAuto(program, enumDatatypes);
             if (!methods.Any())
             {
                 Console.Error.WriteLine("No testable methods found (methods with ensures and without 'test' in name).");
                 return;
             }
             Console.WriteLine($"[DafnyTestGen] Auto-discovered {methods.Count} method(s): {string.Join(", ", methods.Select(m => m.Name))}");
+        }
+
+        // Build classInfo map for methods inside classes
+        var classInfoMap = new Dictionary<Method, ClassInfo>();
+        foreach (var topDecl in DafnyParser.AllTopLevelDecls(program))
+        {
+            if (topDecl is ClassDecl cd && topDecl is not DefaultClassDecl)
+            {
+                foreach (var member in cd.Members)
+                {
+                    if (member is Method m && methods.Contains(m))
+                    {
+                        var ci = DafnyParser.GetClassInfo(m, cd, enumDatatypes);
+                        if (ci != null) classInfoMap[m] = ci;
+                    }
+                }
+            }
         }
 
         // Find non-recursive predicates/functions for inlining into postconditions
@@ -235,27 +272,6 @@ class Program
             .Where(f => f is TwoStateFunction)
             .Select(f => f.Name)
             .ToHashSet();
-
-        // Classify user-defined datatypes: pure enums (all constructors parameterless) vs complex
-        var allDatatypes = DafnyParser.AllTopLevelDecls(program)
-            .OfType<DatatypeDecl>()
-            .ToList();
-        var enumDatatypes = new Dictionary<string, List<string>>();
-        var datatypeNames = new HashSet<string>(); // non-enum datatypes (still skipped)
-        foreach (var dt in allDatatypes)
-        {
-            if (dt.Ctors.All(ctor => ctor.Formals.Count == 0))
-                enumDatatypes[dt.Name] = dt.Ctors.Select(c => c.Name).ToList();
-            else
-                datatypeNames.Add(dt.Name);
-        }
-        var enumConstructors = new Dictionary<string, (string dtName, int ordinal)>();
-        foreach (var (dtName, ctors) in enumDatatypes)
-            for (int i = 0; i < ctors.Count; i++)
-                enumConstructors[ctors[i]] = (dtName, i);
-        if (enumDatatypes.Count > 0)
-            Console.WriteLine($"[DafnyTestGen] Enum datatypes: {string.Join(", ", enumDatatypes.Select(e => $"{e.Key}({string.Join("|", e.Value)})"))}");
-
 
         // File-level check: skip entire program if it contains any bodyless method.
         // Such programs cannot be compiled (dafny build fails), so generated tests
@@ -428,7 +444,7 @@ class Program
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
             Console.WriteLine();
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors);
+            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method));
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -643,7 +659,8 @@ class Program
     /// </summary>
     static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
         List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool hasNonInlinableFuncs = false,
-        Dictionary<string, List<string>>? enumDatatypes = null, Dictionary<string, (string dtName, int ordinal)>? enumConstructors = null)
+        Dictionary<string, List<string>>? enumDatatypes = null, Dictionary<string, (string dtName, int ordinal)>? enumConstructors = null,
+        ClassInfo? classInfo = null)
     {
         z3Path ??= Z3Runner.FindZ3Path();
         enumDatatypes ??= new Dictionary<string, List<string>>();
@@ -745,23 +762,53 @@ class Program
         var inputs = method.Ins.Select(f => (f.Name, Type: f.Type.ToString())).ToList();
         var outputs = method.Outs.Select(f => (f.Name, Type: f.Type.ToString())).ToList();
 
+        // Detect class context for simple class methods (passed from caller)
+        // classInfo is set when method is inside a simple class
+
         // Determine mutable parameters from method's modifies clause
         var mutableNames = new HashSet<string>();
         if (method.Mod?.Expressions != null)
             foreach (var fe in method.Mod.Expressions)
             {
                 var exprStr = DnfEngine.ExprToString(fe.E);
-                if (Regex.IsMatch(exprStr, @"^\w+$"))
+                if (exprStr == "this" && classInfo != null)
+                {
+                    // modifies this: all non-ghost fields are mutable
+                    foreach (var (fieldName, _) in classInfo.Fields)
+                        mutableNames.Add(fieldName);
+                }
+                else if (exprStr.StartsWith("`"))
+                {
+                    // backtick field reference: `fieldName
+                    mutableNames.Add(exprStr.Substring(1));
+                }
+                else if (Regex.IsMatch(exprStr, @"^\w+$"))
                     mutableNames.Add(exprStr);
             }
-        if (mutableNames.Count > 0 && verbose)
-            Console.WriteLine($"  Mutable parameters (pre/post split): {string.Join(", ", mutableNames)}");
 
-        // Build allVars for Z3 model parsing — split mutable arrays into _pre and _post
+        // For class methods, add fields as synthetic inputs
+        if (classInfo != null)
+        {
+            foreach (var (fieldName, fieldType) in classInfo.Fields)
+            {
+                // Skip fields that conflict with parameter names
+                if (inputs.Any(i => i.Name == fieldName) || outputs.Any(o => o.Name == fieldName))
+                    continue;
+                inputs.Add((fieldName, fieldType));
+                // Fields not in modifies clause are read-only (not split into pre/post)
+            }
+            if (verbose)
+                Console.WriteLine($"  Class '{classInfo.ClassName}' fields: {string.Join(", ", classInfo.Fields.Select(f => $"{f.Name}: {f.Type}"))}");
+        }
+
+        if (mutableNames.Count > 0 && verbose)
+            Console.WriteLine($"  Mutable (pre/post split): {string.Join(", ", mutableNames)}");
+
+        // Build allVars for Z3 model parsing — split mutable vars into _pre and _post
         var allVars = new List<(string Name, string Type)>();
         foreach (var v in inputs.Concat(outputs))
         {
-            if (mutableNames.Contains(v.Name) && TypeUtils.IsArrayType(v.Type))
+            if (mutableNames.Contains(v.Name))
             {
                 allVars.Add(($"{v.Name}_pre", v.Type));
                 allVars.Add(($"{v.Name}_post", v.Type));
@@ -1402,7 +1449,7 @@ class Program
         bool hasUninterpFuncs = hasNonInlinableFuncs || SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
         // Emit Dafny test file
-        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes);
+        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo);
     }
 
     /// <summary>

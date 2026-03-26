@@ -3,6 +3,8 @@ using Microsoft.Dafny;
 
 namespace DafnyTestGen;
 
+record ClassInfo(string ClassName, List<(string Name, string Type)> Fields);
+
 static class DafnyParser
 {
     internal static async Task<Microsoft.Dafny.Program?> ParseProgram(string source, Uri uri, DafnyOptions options, ErrorReporter reporter)
@@ -56,7 +58,8 @@ static class DafnyParser
         return result;
     }
 
-    internal static List<Method> FindTestableMethodsAuto(Microsoft.Dafny.Program program)
+    internal static List<Method> FindTestableMethodsAuto(Microsoft.Dafny.Program program,
+        Dictionary<string, List<string>>? enumDatatypes = null)
     {
         var result = new List<Method>();
         foreach (var topDecl in AllTopLevelDecls(program))
@@ -70,13 +73,21 @@ static class DafnyParser
                         && !m.Name.Contains("Test", StringComparison.OrdinalIgnoreCase)
                         && m.Name != "Main")
                     {
-                        // Skip methods inside classes/traits (not supported — requires object
-                        // construction, field state setup, modifies this, etc.)
-                        if ((cls is ClassDecl && cls is not DefaultClassDecl) || cls is TraitDecl)
+                        // Skip methods inside traits (not supported)
+                        if (cls is TraitDecl)
                         {
-                            var kind = cls is TraitDecl ? "trait" : "class";
-                            Console.WriteLine($"  Skipping '{m.Name}' ({kind} method in '{cls.Name}' — not supported)");
+                            Console.WriteLine($"  Skipping '{m.Name}' (trait method in '{cls.Name}' — not supported)");
                             continue;
+                        }
+                        // For methods inside classes, allow simple classes through
+                        if (cls is ClassDecl && cls is not DefaultClassDecl)
+                        {
+                            var ci = GetClassInfo(m, (ClassDecl)cls, enumDatatypes);
+                            if (ci == null)
+                            {
+                                Console.WriteLine($"  Skipping '{m.Name}' (class method in '{cls.Name}' — not simple enough)");
+                                continue;
+                            }
                         }
                         result.Add(m);
                     }
@@ -84,6 +95,58 @@ static class DafnyParser
             }
         }
         return result;
+    }
+
+    /// <summary>
+    /// Returns ClassInfo for a method inside a simple class, or null if the class is too complex.
+    /// A "simple class" has no {:autocontracts}, no trait parents, all non-ghost fields have
+    /// supported types, and the method doesn't require Valid()/RepInv().
+    /// </summary>
+    internal static ClassInfo? GetClassInfo(Method method,
+        Dictionary<string, List<string>>? enumDatatypes = null)
+    {
+        // Try to get the enclosing class from the method's AST
+        if (method.EnclosingClass is ClassDecl cls)
+            return GetClassInfo(method, cls, enumDatatypes);
+        return null;
+    }
+
+    internal static ClassInfo? GetClassInfo(Method method, ClassDecl cls,
+        Dictionary<string, List<string>>? enumDatatypes = null)
+    {
+
+        // Check for {:autocontracts}
+        if (cls.Attributes != null)
+        {
+            for (var attr = cls.Attributes; attr != null; attr = attr.Prev)
+                if (attr.Name == "autocontracts") return null;
+        }
+
+        // Check for trait parents
+        if (cls.ParentTraitHeads.Count > 0) return null;
+
+        // Collect non-ghost fields
+        var fields = new List<(string Name, string Type)>();
+        foreach (var member in cls.Members)
+        {
+            if (member is Field f && f is not ConstantField && !f.IsGhost && f.Name != "Repr")
+                fields.Add((f.Name, f.Type.ToString()));
+        }
+
+        // All fields must have supported types
+        foreach (var (_, type) in fields)
+            if (!TypeUtils.IsSupportedFieldType(type, enumDatatypes))
+                return null;
+
+        // Method must not require Valid() or RepInv()
+        foreach (var req in method.Req)
+        {
+            var reqStr = DnfEngine.ExprToString(req.E);
+            if (reqStr.Contains("Valid()") || reqStr.Contains("RepInv()"))
+                return null;
+        }
+
+        return new ClassInfo(cls.Name, fields);
     }
 
     /// <summary>

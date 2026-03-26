@@ -60,7 +60,7 @@ static class SmtTranslator
         sb.AppendLine();
 
         // Declare variables for inputs and outputs.
-        // For mutable array params (listed in method's modifies clause), declare separate
+        // For mutable params (listed in method's modifies clause), declare separate
         // _pre and _post variables so Z3 can independently assign pre-state (input) and
         // post-state (output) values. This prevents postconditions like IsSorted(a[..])
         // from constraining inputs.
@@ -75,6 +75,32 @@ static class SmtTranslator
                 sb.AppendLine($"(assert (= {name}_pre {name}_post))"); // length preserved
                 if (type == "nat")
                     sb.AppendLine($"(assert (>= {name}_pre 0))");
+            }
+            else if (mutableNames.Contains(name))
+            {
+                // Scalar mutable (e.g., class field): declare _pre and _post
+                var smtType = TypeUtils.DafnyTypeToSmt(type);
+                sb.AppendLine($"(declare-const {name}_pre {smtType})");
+                sb.AppendLine($"(declare-const {name}_post {smtType})");
+                if (type == "nat")
+                {
+                    sb.AppendLine($"(assert (>= {name}_pre 0))");
+                    sb.AppendLine($"(assert (>= {name}_post 0))");
+                }
+                if (type == "char")
+                {
+                    sb.AppendLine($"(assert (>= {name}_pre 32))");
+                    sb.AppendLine($"(assert (<= {name}_pre 126))");
+                    sb.AppendLine($"(assert (>= {name}_post 32))");
+                    sb.AppendLine($"(assert (<= {name}_post 126))");
+                }
+                if (_enumDatatypes.TryGetValue(type, out var enumCtorsMut))
+                {
+                    sb.AppendLine($"(assert (>= {name}_pre 0))");
+                    sb.AppendLine($"(assert (<= {name}_pre {enumCtorsMut.Count - 1}))");
+                    sb.AppendLine($"(assert (>= {name}_post 0))");
+                    sb.AppendLine($"(assert (<= {name}_post {enumCtorsMut.Count - 1}))");
+                }
             }
             else
             {
@@ -575,11 +601,25 @@ static class SmtTranslator
             }
         }
 
-        // MemberSelectExpr: a.Length → a_len
-        if (expr is MemberSelectExpr memSel && memSel.MemberName == "Length")
+        // MemberSelectExpr: a.Length → a_len, this.field → field (with renaming)
+        if (expr is MemberSelectExpr memSel)
         {
-            var objSmt = ExprToSmt(memSel.Obj, inputs, mutableNames, isPostContext, insideOld);
-            if (objSmt != null) return $"{objSmt}_len";
+            if (memSel.MemberName == "Length")
+            {
+                var objSmt = ExprToSmt(memSel.Obj, inputs, mutableNames, isPostContext, insideOld);
+                if (objSmt != null) return $"{objSmt}_len";
+                goto fallback;
+            }
+            // Field access via this.field or implicit this
+            if (memSel.Obj is ThisExpr or ImplicitThisExpr)
+            {
+                var fieldName = memSel.MemberName;
+                if (mutableNames.Contains(fieldName))
+                    return RenameMutable(fieldName, mutableNames, isPostContext, insideOld);
+                // Read-only field: just use the name
+                if (inputs.Any(v => v.Name == fieldName))
+                    return fieldName;
+            }
             goto fallback;
         }
 
