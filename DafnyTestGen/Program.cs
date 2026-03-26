@@ -1120,9 +1120,13 @@ class Program
                         eqParts.Add($"(= {smtLen} {lenVal})");
                     }
                 }
-                else if (values.TryGetValue(name, out var val))
+                else
                 {
-                    eqParts.Add($"(= {name} {val})");
+                    var lookupName = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                    if (values.TryGetValue(lookupName, out var val))
+                    {
+                        eqParts.Add($"(= {lookupName} {val})");
+                    }
                 }
             }
             if (eqParts.Count == 0) return null;
@@ -1417,10 +1421,10 @@ class Program
                 }).ToList();
             }
 
-            var key = string.Join("|", method.Ins.Select(inp =>
+            var key = string.Join("|", inputs.Select(inp =>
             {
                 var name = inp.Name;
-                var type = inp.Type.ToString();
+                var type = inp.Type;
                 var prefix = mutableNames.Contains(name) ? $"{name}_pre" : name;
                 if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
                 {
