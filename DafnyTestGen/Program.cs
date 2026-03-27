@@ -803,14 +803,20 @@ class Program
             }
         // For autocontracts: auto-injected "modifies this, Repr" not in parsed AST,
         // so treat all var fields and const array fields as mutable.
+        // Only do this if postconditions reference old() (indicating state modification).
         if (classInfo is { IsAutoContracts: true } && mutableNames.Count == 0)
         {
-            foreach (var (fieldName, _) in classInfo.Fields)
-                mutableNames.Add(fieldName);
-            if (classInfo.ConstFields != null)
-                foreach (var (cfName, cfType) in classInfo.ConstFields)
-                    if (TypeUtils.IsArrayType(cfType))
-                        mutableNames.Add(cfName);
+            bool postUsesOld = method.Ens.Any(e =>
+                Regex.IsMatch(DnfEngine.ExprToString(e.E), @"\bold\s*\("));
+            if (postUsesOld)
+            {
+                foreach (var (fieldName, _) in classInfo.Fields)
+                    mutableNames.Add(fieldName);
+                if (classInfo.ConstFields != null)
+                    foreach (var (cfName, cfType) in classInfo.ConstFields)
+                        if (TypeUtils.IsArrayType(cfType))
+                            mutableNames.Add(cfName);
+            }
         }
 
         // For class methods, add fields as synthetic inputs
