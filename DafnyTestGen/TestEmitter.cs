@@ -355,7 +355,8 @@ static class TestEmitter
         bool hasUninterpFuncs = false,
         HashSet<string>? mutableNames = null,
         Dictionary<string, List<string>>? enumDatatypes = null,
-        ClassInfo? classInfo = null)
+        ClassInfo? classInfo = null,
+        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("// Auto-generated test cases by DafnyTestGen");
@@ -364,10 +365,16 @@ static class TestEmitter
         sb.AppendLine($"// Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
         sb.AppendLine();
 
-        // Include original source, removing 'ghost' from functions/predicates
-        // so they can be used in 'expect' statements at runtime
+        // Include original source, removing 'ghost' from fields, constants, functions, and predicates
+        // so they can be assigned and used in 'expect' statements at runtime
         var testSource = Regex.Replace(originalSource, @"\bghost\s+function\b", "function");
         testSource = Regex.Replace(testSource, @"\bghost\s+predicate\b", "predicate");
+        testSource = Regex.Replace(testSource, @"\bghost\s+var\b", "var");
+        testSource = Regex.Replace(testSource, @"\bghost\s+const\b", "const");
+        // Strip old() wrappers in method bodies — when ghost vars become concrete,
+        // old() in non-spec code is invalid; the semantics are preserved since
+        // old(x) in an assignment refers to x's value before this method call.
+        testSource = Regex.Replace(testSource, @"\bold\(", "(");
         sb.AppendLine(testSource);
         sb.AppendLine();
 
@@ -376,10 +383,16 @@ static class TestEmitter
         if (method.TypeArgs != null)
             foreach (var tp in method.TypeArgs)
                 typeParamMap[tp.Name] = "int";
+        // Also include class-level type parameters
+        if (classInfo?.ClassTypeParams != null)
+            foreach (var tp in classInfo.ClassTypeParams)
+                if (!typeParamMap.ContainsKey(tp))
+                    typeParamMap[tp] = "int";
 
-        // Build the method call name with type instantiation if generic
-        var methodCallName = typeParamMap.Count > 0
-            ? $"{methodName}<{string.Join(", ", typeParamMap.Values)}>"
+        // Build the method call name with type instantiation if generic (method-level type args only)
+        var methodTypeArgs = method.TypeArgs?.Select(tp => tp.Name).ToList() ?? new List<string>();
+        var methodCallName = methodTypeArgs.Count > 0
+            ? $"{methodName}<{string.Join(", ", methodTypeArgs.Select(tp => typeParamMap.TryGetValue(tp, out var t) ? t : "int"))}>"
             : methodName;
 
         sb.AppendLine($"method GeneratedTests_{methodName}()");
@@ -414,11 +427,22 @@ static class TestEmitter
                 ? new HashSet<string>(classInfo.ConstFields.Select(f => f.Name)) : new HashSet<string>();
             var ctorParamNames = classInfo is { ConstructorParams: not null }
                 ? new HashSet<string>(classInfo.ConstructorParams.Select(p => p.Name)) : new HashSet<string>();
+            var ghostFieldNames = classInfo?.GhostFields != null
+                ? new HashSet<string>(classInfo.GhostFields.Select(f => f.Name)) : new HashSet<string>();
+            // Ghost fields are now concrete in the test copy, so include them in allClassFields
+            var ghostVarFields = classInfo?.GhostFields != null
+                ? classInfo.GhostFields.Where(f => f.Name != "Repr").ToList()
+                : new List<(string Name, string Type)>();
             if (classInfo != null)
             {
-                if (classInfo.IsAutoContracts && classInfo.ConstructorParams != null)
+                // Build class name with type instantiation for generic classes
+                var classNameWithTypes = classInfo.ClassName;
+                if (classInfo.ClassTypeParams != null && classInfo.ClassTypeParams.Count > 0)
+                    classNameWithTypes += $"<{string.Join(", ", classInfo.ClassTypeParams.Select(tp => typeParamMap.TryGetValue(tp, out var t) ? t : "int"))}>";
+
+                if (classInfo.ConstructorParams != null && classInfo.ConstructorParams.Count > 0)
                 {
-                    // Autocontracts: use constructor with Z3-chosen parameter values
+                    // Use constructor with Z3-chosen parameter values
                     var ctorArgs = classInfo.ConstructorParams.Select(p =>
                     {
                         if (values.TryGetValue(p.Name, out var val))
@@ -428,11 +452,11 @@ static class TestEmitter
                         }
                         return p.Type switch { "real" => "0.0", "char" => "' '", "bool" => "false", "nat" => "1", _ => "1" };
                     });
-                    sb.AppendLine($"    var obj := new {classInfo.ClassName}({string.Join(", ", ctorArgs)});");
+                    sb.AppendLine($"    var obj := new {classNameWithTypes}({string.Join(", ", ctorArgs)});");
                 }
                 else
                 {
-                    sb.AppendLine($"    var obj := new {classInfo.ClassName};");
+                    sb.AppendLine($"    var obj := new {classNameWithTypes};");
                 }
 
                 // Assign var fields
@@ -443,10 +467,19 @@ static class TestEmitter
                     {
                         // Array field: emit temp var, then assign to obj.field
                         var emitValues = new Dictionary<string, string>(values);
-                        if (values.TryGetValue($"{fieldName}_pre_len", out var preLen))
-                            emitValues[fieldName + "_len"] = preLen;
-                        if (values.TryGetValue($"{fieldName}_pre_elems", out var preElems))
-                            emitValues[fieldName + "_elems"] = preElems;
+                        var isMut = mutableNames != null && mutableNames.Contains(fieldName);
+                        var lenKey = isMut ? $"{fieldName}_pre_len" : $"{fieldName}_len";
+                        if (values.TryGetValue(lenKey, out var arrLen))
+                        {
+                            emitValues[fieldName + "_len"] = arrLen;
+                            emitValues[$"tmp_{fieldName}_len"] = arrLen;
+                        }
+                        var elemsKey = isMut ? $"{fieldName}_pre_elems" : $"{fieldName}_elems";
+                        if (values.TryGetValue(elemsKey, out var arrElems))
+                        {
+                            emitValues[fieldName + "_elems"] = arrElems;
+                            emitValues[$"tmp_{fieldName}_elems"] = arrElems;
+                        }
                         sb.AppendLine(EmitVarDecl($"tmp_{fieldName}", fType, emitValues, enumDatatypes));
                         sb.AppendLine($"    obj.{fieldName} := tmp_{fieldName};");
                     }
@@ -494,14 +527,69 @@ static class TestEmitter
                         }
                     }
                 }
-            }
 
-            // Emit variable declarations from Z3 model, substituting type parameters.
-            // For mutable arrays, use _pre values (the input/pre-state).
-            // Skip synthetic field inputs (handled above for class methods).
+                // Assign ghost var fields (now concrete in the test copy).
+                // Seq/scalar ghosts from Z3 values; Repr = {obj} + object-typed fields.
+                foreach (var (gfName, gfType) in ghostVarFields)
+                {
+                    // Skip ghost consts (set by constructor, can't reassign)
+                    if (ctorParamNames.Contains(gfName)) continue;
+                    var fType = SubstTypeParams(gfType, typeParamMap);
+                    if (TypeUtils.IsSeqType(fType))
+                    {
+                        var lenKey = $"{gfName}_len";
+                        if (values.TryGetValue(lenKey, out var lenStr) && int.TryParse(lenStr, out var len) && len >= 0)
+                        {
+                            var elemType = fType.StartsWith("seq<") ? fType.Substring(4, fType.Length - 5) : "int";
+                            string[] elems;
+                            if (values.TryGetValue($"{gfName}_elems", out var elemsStr))
+                                elems = elemsStr.Split(',');
+                            else
+                                elems = Enumerable.Range(0, len).Select(_ => "0").ToArray();
+                            if (len == 0)
+                                sb.AppendLine($"    obj.{gfName} := [];");
+                            else
+                            {
+                                var trimmed = elems.Take(len).Select(e => FormatScalarValue(e.Trim(), elemType, enumDatatypes));
+                                sb.AppendLine($"    obj.{gfName} := [{string.Join(", ", trimmed)}];");
+                            }
+                        }
+                        else
+                            sb.AppendLine($"    obj.{gfName} := [];");
+                    }
+                    else
+                    {
+                        var valKey = mutableNames != null && mutableNames.Contains(gfName) ? $"{gfName}_pre" : gfName;
+                        if (values.TryGetValue(valKey, out var val))
+                        {
+                            val = FormatScalarValue(val, fType, enumDatatypes);
+                            sb.AppendLine($"    obj.{gfName} := {val};");
+                        }
+                    }
+                }
+
+                // Assign Repr = {obj} + all object-typed fields (arrays)
+                // Repr is a ghost set<object> not in ghostFields (excluded in parser), detect from source
+                bool hasReprField = Regex.IsMatch(originalSource, @"\bghost\s+var\s+Repr\b");
+                if (hasReprField)
+                {
+                    var reprMembers = new List<string> { "obj" };
+                    foreach (var (fn, ft) in classInfo.Fields)
+                        if (TypeUtils.IsArrayType(SubstTypeParams(ft, typeParamMap)))
+                            reprMembers.Add($"obj.{fn}");
+                    if (classInfo.ConstFields != null)
+                        foreach (var (fn, ft) in classInfo.ConstFields)
+                            if (TypeUtils.IsArrayType(SubstTypeParams(ft, typeParamMap)))
+                                reprMembers.Add($"obj.{fn}");
+                    sb.AppendLine($"    obj.Repr := {{{string.Join(", ", reprMembers)}}};");
+                }
+            }
             foreach (var inp in method.Ins)
             {
                 if (fieldNames.Contains(inp.Name)) continue; // already emitted as obj.field
+                if (ghostFieldNames.Contains(inp.Name)) continue; // ghost fields not in test code
+                if (constFieldNames.Contains(inp.Name)) continue; // const fields set by constructor
+                if (ctorParamNames.Contains(inp.Name)) continue; // constructor params already used
                 var typeStr = SubstTypeParams(inp.Type.ToString(), typeParamMap);
                 var emitValues = values;
                 if (mutableNames != null && mutableNames.Contains(inp.Name) && TypeUtils.IsArrayType(typeStr))
@@ -522,6 +610,7 @@ static class TestEmitter
             knownIdentifiers.UnionWith(fieldNames);
             knownIdentifiers.UnionWith(constFieldNames);
             knownIdentifiers.UnionWith(ctorParamNames);
+            knownIdentifiers.UnionWith(ghostFieldNames);
             var oldCaptures = ExtractOldCaptures(literals, arrayParamNames, knownIdentifiers);
             foreach (var (oldExpr, varName, isArrayCapture) in oldCaptures)
             {
@@ -539,7 +628,8 @@ static class TestEmitter
                     {
                         // Whole-expression capture: replace all field references with obj.field
                         var allClassFields = classInfo.Fields
-                            .Concat(classInfo.ConstFields ?? new List<(string, string)>());
+                            .Concat(classInfo.ConstFields ?? new List<(string, string)>())
+                            .Concat(ghostVarFields);
                         foreach (var (fn, _) in allClassFields)
                             captureExpr = Regex.Replace(captureExpr,
                                 @"(?<![a-zA-Z_0-9])(?<!obj\.)" + Regex.Escape(fn) + @"(?![a-zA-Z_0-9])",
@@ -560,7 +650,8 @@ static class TestEmitter
             if (classInfo != null)
             {
                 var allClassFields = classInfo.Fields
-                    .Concat(classInfo.ConstFields ?? new List<(string, string)>());
+                    .Concat(classInfo.ConstFields ?? new List<(string, string)>())
+                    .Concat(ghostVarFields);
                 expectLiterals = expectLiterals.Select(lit =>
                 {
                     var result = lit;
@@ -571,6 +662,16 @@ static class TestEmitter
                         result = Regex.Replace(result,
                             @"(?<![a-zA-Z_0-9])(?<!old_)(?<!obj\.)" + Regex.Escape(fieldName) + @"(?![a-zA-Z_0-9])",
                             $"obj.{fieldName}");
+                    }
+                    // Replace bare member predicate/function calls with obj.pred()
+                    if (inlinablePredicates != null)
+                    {
+                        foreach (var (predName, _, _) in inlinablePredicates)
+                        {
+                            result = Regex.Replace(result,
+                                @"(?<![a-zA-Z_0-9.])(?<!obj\.)" + Regex.Escape(predName) + @"(?=\s*\()",
+                                $"obj.{predName}");
+                        }
                     }
                     return result;
                 }).ToList();

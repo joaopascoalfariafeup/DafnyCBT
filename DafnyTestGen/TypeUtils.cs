@@ -278,7 +278,24 @@ static class TypeUtils
     internal static bool IsSpecOnlyLiteral(string literal)
     {
         var trimmed = literal.Trim();
-        return Regex.IsMatch(trimmed, @"\bfresh\s*\(");
+        if (Regex.IsMatch(trimmed, @"\bfresh\s*\(")) return true;
+        // "this in Repr" standalone is spec-only (but don't match Repr inside larger expressions like Valid() body)
+        if (Regex.IsMatch(trimmed, @"^(this|data|\w+)\s+in\s+Repr$")) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Returns true if the postcondition literal references any ghost field name
+    /// (not runtime-checkable in test code).
+    /// </summary>
+    internal static bool ReferencesGhostField(string literal, HashSet<string> ghostFieldNames)
+    {
+        foreach (var gf in ghostFieldNames)
+        {
+            if (Regex.IsMatch(literal, @"(?<![a-zA-Z_0-9])" + Regex.Escape(gf) + @"(?![a-zA-Z_0-9])"))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>

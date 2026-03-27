@@ -794,6 +794,12 @@ class Program
                             if (TypeUtils.IsArrayType(cfType))
                                 mutableNames.Add(cfName);
                 }
+                else if (exprStr == "Repr" && classInfo != null && !classInfo.IsAutoContracts)
+                {
+                    // modifies Repr in non-autocontracts: all non-ghost var fields are mutable
+                    foreach (var (fieldName, _) in classInfo.Fields)
+                        mutableNames.Add(fieldName);
+                }
                 else if (exprStr.StartsWith("`"))
                 {
                     // backtick field reference: `fieldName
@@ -841,8 +847,8 @@ class Program
                     inputs.Add((cfName, cfType));
                 }
             }
-            // For autocontracts: add constructor parameters as inputs
-            if (classInfo.IsAutoContracts && classInfo.ConstructorParams != null)
+            // Add constructor parameters as inputs
+            if (classInfo.ConstructorParams != null)
             {
                 foreach (var (cpName, cpType) in classInfo.ConstructorParams)
                 {
@@ -851,13 +857,25 @@ class Program
                     inputs.Add((cpName, cpType));
                 }
             }
+            // For non-autocontracts: add ghost fields as SMT inputs (Z3 uses them, test code doesn't assign them)
+            if (!classInfo.IsAutoContracts && classInfo.GhostFields != null)
+            {
+                foreach (var (gfName, gfType) in classInfo.GhostFields)
+                {
+                    if (inputs.Any(i => i.Name == gfName) || outputs.Any(o => o.Name == gfName))
+                        continue;
+                    inputs.Add((gfName, gfType));
+                }
+            }
             if (verbose)
             {
                 Console.WriteLine($"  Class '{classInfo.ClassName}' fields: {string.Join(", ", classInfo.Fields.Select(f => $"{f.Name}: {f.Type}"))}");
-                if (classInfo.IsAutoContracts && classInfo.ConstFields != null && classInfo.ConstFields.Count > 0)
+                if (classInfo.ConstFields != null && classInfo.ConstFields.Count > 0)
                     Console.WriteLine($"  Const fields: {string.Join(", ", classInfo.ConstFields.Select(f => $"{f.Name}: {f.Type}"))}");
-                if (classInfo.IsAutoContracts && classInfo.ConstructorParams != null)
+                if (classInfo.ConstructorParams != null)
                     Console.WriteLine($"  Constructor params: {string.Join(", ", classInfo.ConstructorParams.Select(p => $"{p.Name}: {p.Type}"))}");
+                if (classInfo.GhostFields != null && classInfo.GhostFields.Count > 0)
+                    Console.WriteLine($"  Ghost fields: {string.Join(", ", classInfo.GhostFields.Select(f => $"{f.Name}: {f.Type}"))}");
             }
         }
 
@@ -1640,7 +1658,7 @@ class Program
         bool hasUninterpFuncs = hasNonInlinableFuncs || SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
         // Emit Dafny test file
-        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo);
+        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo, inlinablePredicates);
     }
 
     /// <summary>

@@ -275,6 +275,8 @@ static class SmtTranslator
             var wfCountBefore = _wfGuards.Count;
             foreach (var bgPost in backgroundPostconditions)
             {
+                var bgStr = DnfEngine.ExprToString(bgPost);
+                if (TypeUtils.IsSpecOnlyLiteral(bgStr)) continue;
                 var smtExpr = ExprToSmt(bgPost, inputs, mutableNames, isPostContext: true);
                 if (smtExpr != null)
                     assertions.AppendLine($"(assert {smtExpr})");
@@ -538,7 +540,19 @@ static class SmtTranslator
 
             var left = ExprToSmt(bin.E0, inputs, mutableNames, isPostContext, insideOld);
             var right = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
-            if (left == null || right == null) goto fallback;
+            // For && and ||: tolerate one side being untranslatable
+            if (left == null && right == null) goto fallback;
+            if (bin.Op == BinaryExpr.Opcode.And)
+            {
+                if (left == null) return right;
+                if (right == null) return left;
+            }
+            else if (bin.Op == BinaryExpr.Opcode.Or)
+            {
+                // For ||: if one side is untranslatable, the whole disjunction is uncertain
+                if (left == null || right == null) goto fallback;
+            }
+            else if (left == null || right == null) goto fallback;
 
             var result = bin.Op switch
             {
@@ -578,15 +592,21 @@ static class SmtTranslator
                 return enumInfo.ordinal.ToString();
         }
 
+        // ThisExpr: 'this' has no SMT representation (object reference)
+        if (expr is ThisExpr) return null;
+
         // IdentifierExpr / NameSegment — check enum constructor first, then variable
+        // Skip 'Repr' (ghost set<object>, not an SMT-representable variable)
         if (expr is IdentifierExpr idExpr)
         {
+            if (idExpr.Name == "Repr") return null;
             if (_enumConstructors.TryGetValue(idExpr.Name, out var enumInfo))
                 return enumInfo.ordinal.ToString();
             return RenameMutable(idExpr.Name, mutableNames, isPostContext, insideOld);
         }
         if (expr is NameSegment nameExpr)
         {
+            if (nameExpr.Name == "Repr") return null;
             if (_enumConstructors.TryGetValue(nameExpr.Name, out var enumInfo))
                 return enumInfo.ordinal.ToString();
             return RenameMutable(nameExpr.Name, mutableNames, isPostContext, insideOld);
@@ -772,6 +792,10 @@ static class SmtTranslator
         // Fallback: convert to string and use the string-based translator
 
         var exprStr = DnfEngine.ExprToString(expr);
+        // Skip expressions referencing Repr or bare 'this' — these are heap constraints
+        // that can't be represented in our SMT encoding
+        if (Regex.IsMatch(exprStr, @"\bRepr\b") || Regex.IsMatch(exprStr, @"\bthis\b"))
+            return null;
         var renamedInputsFb = BuildRenamedInputs(inputs, mutableNames, isPostContext && !insideOld);
         string rewrittenFb;
         if (isPostContext && !insideOld)
@@ -1155,6 +1179,9 @@ static class SmtTranslator
             var left = DafnyExprToSmt(andParts.Value.left, inputs);
             var right = DafnyExprToSmt(andParts.Value.right, inputs);
             if (left != null && right != null) return $"(and {left} {right})";
+            // Tolerance: drop untranslatable side (heap constraints like "this in Repr")
+            if (left != null) return left;
+            if (right != null) return right;
         }
         var orParts = SplitOnOperator(expr, "||");
         if (orParts != null)
@@ -1251,8 +1278,9 @@ static class SmtTranslator
         var notInMatch = Regex.Match(expr, @"^(.+?)\s+!in\s+(\w+)(\[\.\.(\w+)?\])?$");
         if (notInMatch.Success)
         {
-            var valExpr = DafnyExprToSmt(notInMatch.Groups[1].Value.Trim(), inputs);
             var seqName = notInMatch.Groups[2].Value;
+            if (seqName == "Repr") return null; // heap ownership constraint
+            var valExpr = DafnyExprToSmt(notInMatch.Groups[1].Value.Trim(), inputs);
             var hasSlice = notInMatch.Groups[3].Success;
             var sliceBound = notInMatch.Groups[4].Success ? notInMatch.Groups[4].Value : null;
             if (valExpr != null)
@@ -1279,8 +1307,9 @@ static class SmtTranslator
         var inMatch = Regex.Match(expr, @"^(.+?)\s+in\s+(\w+)(\[\.\.(\w+)?\])?$");
         if (inMatch.Success)
         {
-            var valExpr = DafnyExprToSmt(inMatch.Groups[1].Value.Trim(), inputs);
             var seqName = inMatch.Groups[2].Value;
+            if (seqName == "Repr") return null; // heap ownership constraint
+            var valExpr = DafnyExprToSmt(inMatch.Groups[1].Value.Trim(), inputs);
             var hasSlice = inMatch.Groups[3].Success;
             var sliceBound = inMatch.Groups[4].Success ? inMatch.Groups[4].Value : null;
             if (valExpr != null)
@@ -1454,6 +1483,8 @@ static class SmtTranslator
         // Variable name (identifier) or enum constructor
         if (Regex.IsMatch(expr, @"^\w+$"))
         {
+            // Skip heap-related identifiers that have no SMT representation
+            if (expr == "this" || expr == "Repr") return null;
             if (_enumConstructors.TryGetValue(expr, out var enumInfo))
                 return enumInfo.ordinal.ToString();
             return expr;

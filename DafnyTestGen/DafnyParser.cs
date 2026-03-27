@@ -9,7 +9,9 @@ record ClassInfo(
     bool IsAutoContracts = false,
     List<(string Name, string Type)>? ConstFields = null,
     List<(string Name, string Type)>? ConstructorParams = null,
-    List<Expression>? ConstructorRequires = null);
+    List<Expression>? ConstructorRequires = null,
+    List<(string Name, string Type)>? GhostFields = null,
+    List<string>? ClassTypeParams = null);
 
 static class DafnyParser
 {
@@ -140,14 +142,32 @@ static class DafnyParser
                 fields.Add((f.Name, f.Type.ToString()));
         }
 
-        // Collect const fields (for autocontracts: constructor initializes them)
+        // Collect const fields (constructor initializes them)
         var constFields = new List<(string Name, string Type)>();
-        if (isAutoContracts)
+        foreach (var member in cls.Members)
+        {
+            if (member is ConstantField cf && !cf.IsGhost && cf.Name != "Repr")
+                constFields.Add((cf.Name, cf.Type.ToString()));
+        }
+
+        // Collect ghost fields (for non-autocontracts: pass to Z3, skip in test code)
+        var ghostFields = new List<(string Name, string Type)>();
+        if (!isAutoContracts)
         {
             foreach (var member in cls.Members)
             {
-                if (member is ConstantField cf && !cf.IsGhost && cf.Name != "Repr")
-                    constFields.Add((cf.Name, cf.Type.ToString()));
+                if (member is Field f && f is not ConstantField && f.IsGhost && f.Name != "Repr")
+                {
+                    var ft = f.Type.ToString();
+                    if (TypeUtils.IsSupportedFieldType(ft, enumDatatypes))
+                        ghostFields.Add((f.Name, ft));
+                }
+                if (member is ConstantField cf && cf.IsGhost && cf.Name != "Repr")
+                {
+                    var ct = cf.Type.ToString();
+                    if (TypeUtils.IsSupportedFieldType(ct, enumDatatypes))
+                        ghostFields.Add((cf.Name, ct));
+                }
             }
         }
 
@@ -156,42 +176,31 @@ static class DafnyParser
             if (!TypeUtils.IsSupportedFieldType(type, enumDatatypes))
                 return null;
 
-        // For non-autocontracts: reject methods that require Valid()/RepInv()
-        if (!isAutoContracts)
-        {
-            foreach (var req in method.Req)
-            {
-                var reqStr = DnfEngine.ExprToString(req.E);
-                if (reqStr.Contains("Valid()") || reqStr.Contains("RepInv()"))
-                    return null;
-            }
-        }
-
-        // For autocontracts: find the constructor and its params/requires
+        // Find the constructor and its params/requires
         List<(string Name, string Type)>? ctorParams = null;
         List<Expression>? ctorRequires = null;
-        if (isAutoContracts)
+        foreach (var member in cls.Members)
         {
-            foreach (var member in cls.Members)
+            if (member.Name == "_ctor")
             {
-                if (member.Name == "_ctor")
+                // Constructor may not be a Method subtype in this Dafny version — use dynamic
+                try
                 {
-                    // Constructor may not be a Method subtype in this Dafny version — use dynamic
-                    try
-                    {
-                        dynamic ctor = member;
-                        var ins = (IEnumerable<Formal>)ctor.Ins;
-                        var reqs = (IEnumerable<AttributedExpression>)ctor.Req;
-                        ctorParams = ins.Select(p => (p.Name, Type: p.Type.ToString())).ToList();
-                        ctorRequires = reqs.Select(r => (Expression)r.E).ToList();
-                    }
-                    catch { /* ignore if properties don't exist */ }
-                    break; // use the first constructor
+                    dynamic ctor = member;
+                    var ins = (IEnumerable<Formal>)ctor.Ins;
+                    var reqs = (IEnumerable<AttributedExpression>)ctor.Req;
+                    ctorParams = ins.Select(p => (p.Name, Type: p.Type.ToString())).ToList();
+                    ctorRequires = reqs.Select(r => (Expression)r.E).ToList();
                 }
+                catch { /* ignore if properties don't exist */ }
+                break; // use the first constructor
             }
         }
 
-        return new ClassInfo(cls.Name, fields, isAutoContracts, constFields, ctorParams, ctorRequires);
+        // Capture class-level type parameters
+        var classTypeParams = cls.TypeArgs?.Select(tp => tp.Name).ToList();
+
+        return new ClassInfo(cls.Name, fields, isAutoContracts, constFields, ctorParams, ctorRequires, ghostFields, classTypeParams);
     }
 
     /// <summary>
