@@ -552,6 +552,10 @@ static class TestEmitter
                 sb.AppendLine($"    {callPrefix}{methodCallName}({callArgs});");
             }
 
+            // For autocontracts: verify Valid() holds after the call
+            if (classInfo is { IsAutoContracts: true })
+                sb.AppendLine("    expect obj.Valid();");
+
             // Replace old() references in literals for expect statements
             var expectLiterals = literals
                 .Where(lit => !TypeUtils.IsSpecOnlyLiteral(lit))
