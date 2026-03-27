@@ -82,6 +82,14 @@ static class TypeUtils
                 {
                     result[name] = NormalizeZ3Real(realMatch.Groups[1].Value);
                 }
+                else
+                {
+                    // Also try get-value response format: ((name value))
+                    var gvPattern = new Regex(@$"\(\({Regex.Escape(name)}\s+((?:\([^()]*(?:\([^()]*\)[^()]*)*\)|\d+\.\d+|\d+))\)\)");
+                    var gvMatch = gvPattern.Match(fullText);
+                    if (gvMatch.Success)
+                        result[name] = NormalizeZ3Real(gvMatch.Groups[1].Value);
+                }
             }
             else if (type == "bool")
             {
@@ -91,6 +99,14 @@ static class TypeUtils
                 {
                     result[name] = match.Groups[1].Value;
                 }
+                else
+                {
+                    // Also try get-value response format: ((name true/false))
+                    var gvPattern = new Regex(@$"\(\({Regex.Escape(name)}\s+(true|false)\)\)");
+                    var gvMatch = gvPattern.Match(fullText);
+                    if (gvMatch.Success)
+                        result[name] = gvMatch.Groups[1].Value;
+                }
             }
             else
             {
@@ -99,6 +115,14 @@ static class TypeUtils
                 if (match.Success)
                 {
                     result[name] = NormalizeZ3Int(match.Groups[1].Value);
+                }
+                else
+                {
+                    // Also try get-value response format: ((name value))
+                    var gvPattern = new Regex(@$"\(\({Regex.Escape(name)}\s+([-\d]+|\(- \d+\))\)\)");
+                    var gvMatch = gvPattern.Match(fullText);
+                    if (gvMatch.Success)
+                        result[name] = NormalizeZ3Int(gvMatch.Groups[1].Value);
                 }
             }
         }

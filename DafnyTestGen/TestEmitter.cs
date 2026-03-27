@@ -549,24 +549,8 @@ static class TestEmitter
                 sb.AppendLine($"    var {varName} := {captureExpr};");
             }
 
-            // Call the method
-            var callPrefix = classInfo != null ? "obj." : "";
-            var callArgs = string.Join(", ", method.Ins.Select(i => i.Name));
-            if (method.Outs.Count > 0)
-            {
-                var outNames = string.Join(", ", method.Outs.Select(o => o.Name));
-                sb.AppendLine($"    var {outNames} := {callPrefix}{methodCallName}({callArgs});");
-            }
-            else
-            {
-                sb.AppendLine($"    {callPrefix}{methodCallName}({callArgs});");
-            }
-
-            // For autocontracts methods that modify this: verify Valid() holds after the call
-            if (classInfo is { IsAutoContracts: true } && mutableNames != null && mutableNames.Count > 0)
-                sb.AppendLine("    expect obj.Valid();");
-
-            // Replace old() references in literals for expect statements
+            // Build expectLiterals early (before the call) so we can capture RHS expressions.
+            // Replace old() references and field prefixes.
             var expectLiterals = literals
                 .Where(lit => !TypeUtils.IsSpecOnlyLiteral(lit))
                 .Select(lit => ReplaceOldReferences(lit, oldCaptures, arrayParamNames))
@@ -592,26 +576,82 @@ static class TestEmitter
                 }).ToList();
             }
 
-            // Emit expect assertions.
-            // Use postcondition literals when: uninterpreted functions, or method modifies
-            // state (the interesting outputs are in the modified variables, not return values).
-            bool useLiteralExpects = hasUninterpFuncs || (mutableNames != null && mutableNames.Count > 0);
-            if (useLiteralExpects)
+            // Determine which outputs have concrete Z3 values (before emitting any code)
+            var coveredOutputs = new HashSet<string>();
+            foreach (var outp in method.Outs)
             {
-                foreach (var lit in expectLiterals)
-                    sb.AppendLine($"    expect {lit};");
+                var outPattern = @"\b" + Regex.Escape(outp.Name) + @"\b";
+                if (!literals.Any(lit => Regex.IsMatch(lit, outPattern)))
+                    continue;
+                var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
+                if (!hasUninterpFuncs && values.TryGetValue(outp.Name, out _) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr))
+                    coveredOutputs.Add(outp.Name);
+                else if (TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr2) && int.TryParse(lenStr2, out var seqLen2) && seqLen2 >= 0)
+                    coveredOutputs.Add(outp.Name);
+                else if (TypeUtils.IsSetType(typeStr) && (values.ContainsKey(outp.Name + "_members") || values.ContainsKey(outp.Name + "_card")))
+                    coveredOutputs.Add(outp.Name);
             }
-            else foreach (var outp in method.Outs)
+
+            // For postconditions of the form "outName == <expr>" where <expr> only references
+            // inputs (not outputs), capture the RHS before the call so we get a concrete value.
+            // Only capture for outputs NOT already covered by concrete Z3 values.
+            var outNames_set = new HashSet<string>(method.Outs.Select(o => o.Name));
+            var rhsCaptures = new Dictionary<string, string>(); // outName -> check_outName
+            foreach (var lit in expectLiterals)
             {
-                // If no active postcondition literal mentions this output variable,
-                // the postcondition doesn't constrain it — the Z3 value is arbitrary,
-                // so skip the concrete expect to avoid false negatives.
+                // Match "outName == <expr>" at the start of the literal
+                var m = Regex.Match(lit, @"^(\w+)\s*==\s*(.+)$", RegexOptions.Singleline);
+                if (!m.Success) continue;
+                var lhs = m.Groups[1].Value;
+                var rhs = m.Groups[2].Value.Trim();
+                if (!outNames_set.Contains(lhs)) continue;
+                if (coveredOutputs.Contains(lhs)) continue; // Z3 already gave a concrete value
+                if (rhsCaptures.ContainsKey(lhs)) continue; // already captured from first matching literal
+                // Check that the RHS doesn't reference any output variable
+                bool rhsRefsOutput = false;
+                foreach (var outp in method.Outs)
+                {
+                    if (Regex.IsMatch(rhs, @"\b" + Regex.Escape(outp.Name) + @"\b"))
+                    { rhsRefsOutput = true; break; }
+                }
+                if (rhsRefsOutput) continue;
+                rhsCaptures[lhs] = "check_" + lhs;
+                sb.AppendLine($"    var check_{lhs} := {rhs};");
+            }
+
+            // Call the method
+            var callPrefix = classInfo != null ? "obj." : "";
+            var callArgs = string.Join(", ", method.Ins.Select(i => i.Name));
+            if (method.Outs.Count > 0)
+            {
+                var outNames = string.Join(", ", method.Outs.Select(o => o.Name));
+                sb.AppendLine($"    var {outNames} := {callPrefix}{methodCallName}({callArgs});");
+            }
+            else
+            {
+                sb.AppendLine($"    {callPrefix}{methodCallName}({callArgs});");
+            }
+
+            // For autocontracts methods that modify this: verify Valid() holds after the call
+            if (classInfo is { IsAutoContracts: true } && mutableNames != null && mutableNames.Count > 0)
+                sb.AppendLine("    expect obj.Valid();");
+
+            // Emit expect assertions.
+            // For each output, prefer a concrete Z3 value when available (scalar, seq, set).
+            // If Z3 didn't provide a parseable value for an output, fall back to
+            // postcondition literals that mention it.
+            // Postcondition literals that mention NO output (e.g. "x in C") are always emitted.
+            foreach (var outp in method.Outs)
+            {
+                // Skip outputs not constrained by any postcondition
                 var outPattern = @"\b" + Regex.Escape(outp.Name) + @"\b";
                 if (!literals.Any(lit => Regex.IsMatch(lit, outPattern)))
                     continue;
 
                 var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
-                if (values.TryGetValue(outp.Name, out var val) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr))
+                // When postconditions use non-inlinable functions, Z3's scalar output
+                // values are unreliable (arbitrary satisfying assignments), so skip them.
+                if (!hasUninterpFuncs && values.TryGetValue(outp.Name, out var val) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr))
                 {
                     // Ensure real output values have a decimal point
                     if (typeStr == "real" && !val.Contains('.'))
@@ -625,6 +665,7 @@ static class TestEmitter
                             val = $"'\\U{{{charCode:X4}}}'";
                     }
                     sb.AppendLine($"    expect {outp.Name} == {val};");
+                    coveredOutputs.Add(outp.Name);
                 }
                 else if (TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr)
                          && int.TryParse(lenStr, out var seqLen) && seqLen >= 0)
@@ -651,15 +692,46 @@ static class TestEmitter
                     {
                         sb.AppendLine($"    expect {outp.Name} == [{string.Join(", ", elems.Take(seqLen))}];");
                     }
+                    coveredOutputs.Add(outp.Name);
                 }
                 else if (TypeUtils.IsSetType(typeStr) && values.TryGetValue(outp.Name + "_members", out var setMembers))
                 {
                     var members = setMembers.Split(',');
                     sb.AppendLine($"    expect {outp.Name} == {{{string.Join(", ", members)}}};");
+                    coveredOutputs.Add(outp.Name);
                 }
                 else if (TypeUtils.IsSetType(typeStr))
                 {
                     sb.AppendLine($"    expect {outp.Name} == {{}};");
+                    coveredOutputs.Add(outp.Name);
+                }
+            }
+            // Emit postcondition literals for outputs not covered by concrete values,
+            // plus any literals that don't reference output variables at all.
+            // For "outName == <expr>" literals with a pre-call RHS capture, use check_outName.
+            foreach (var lit in expectLiterals)
+            {
+                bool mentionsOnlyCoveredOutputs = true;
+                bool mentionsAnyOutput = false;
+                foreach (var outp in method.Outs)
+                {
+                    var outPattern = @"\b" + Regex.Escape(outp.Name) + @"\b";
+                    if (Regex.IsMatch(lit, outPattern))
+                    {
+                        mentionsAnyOutput = true;
+                        if (!coveredOutputs.Contains(outp.Name))
+                            mentionsOnlyCoveredOutputs = false;
+                    }
+                }
+                // Emit if: mentions no output (e.g. "x in C"), or mentions an uncovered output
+                if (!mentionsAnyOutput || !mentionsOnlyCoveredOutputs)
+                {
+                    // If this literal is "outName == <expr>" and we captured RHS, use check_outName
+                    var litMatch = Regex.Match(lit, @"^(\w+)\s*==\s*(.+)$", RegexOptions.Singleline);
+                    if (litMatch.Success && rhsCaptures.TryGetValue(litMatch.Groups[1].Value, out var checkVar))
+                        sb.AppendLine($"    expect {litMatch.Groups[1].Value} == {checkVar};");
+                    else
+                        sb.AppendLine($"    expect {lit};");
                 }
             }
 

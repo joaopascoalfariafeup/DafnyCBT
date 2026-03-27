@@ -274,22 +274,23 @@ static class TestValidator
     }
 
     /// <summary>
-    /// If the expect expression is `var == ExprContainingFunctionCall(...)`,
-    /// returns a print statement like: print "VAL:testId:var=", var, "\n";
-    /// Returns null if the expect doesn't match this pattern.
+    /// If the expect expression is `var == ExprContainingFunctionCall(...)` or
+    /// `var == check_var` (pre-call captured value), returns a print statement
+    /// like: print "VAL:testId:var=", var, "\n";
+    /// Returns null if the expect doesn't match these patterns.
     /// </summary>
     static string? TryMakeValPrint(string expr, int testId, string indent)
     {
-        // Match: varName == <expr containing a function call>
-        // e.g., "f == Fact(n)" or "res == Power(x, n) % m"
+        // Match: varName == <expr>
+        // e.g., "f == Fact(n)" or "r == check_r"
         var m = Regex.Match(expr, @"^(\w+)\s*==\s*(.+)$");
         if (!m.Success) return null;
 
         var varName = m.Groups[1].Value;
         var rhs = m.Groups[2].Value;
 
-        // Only emit VAL print if the RHS contains a function call (identifier followed by '(')
-        if (!Regex.IsMatch(rhs, @"[A-Z]\w*\s*\("))
+        // Emit VAL print if the RHS contains a function call OR is a check_ variable
+        if (!Regex.IsMatch(rhs, @"[A-Z]\w*\s*\(") && !Regex.IsMatch(rhs, @"^check_\w+$"))
             return null;
 
         return $"{indent}print \"VAL:{testId}:{varName}=\", {varName}, \"\\n\";";
@@ -340,7 +341,9 @@ static class TestValidator
 
     /// <summary>
     /// For passing tests with captured output values, replaces
-    /// `expect var == FuncCall(...);` with `expect var == concreteValue; // == FuncCall(...)`
+    /// `expect var == FuncCall(...);` or `expect var == check_var;` with
+    /// `expect var == concreteValue; // == original_rhs`
+    /// and removes the now-unused `var check_var := ...;` line.
     /// </summary>
     static string InjectCapturedValues(string body, int testId,
         Dictionary<int, Dictionary<string, string>> capturedVals)
@@ -348,7 +351,7 @@ static class TestValidator
         if (!capturedVals.TryGetValue(testId, out var vars) || vars.Count == 0)
             return body;
 
-        return Regex.Replace(body,
+        var result = Regex.Replace(body,
             @"^(\s*expect\s+)(\w+)(\s*==\s*)(.+)(;)",
             m =>
             {
@@ -358,17 +361,32 @@ static class TestValidator
                 var rhs = m.Groups[4].Value;
                 var semi = m.Groups[5].Value;
 
-                // Only replace if RHS has a function call, we captured the value,
-                // and the value is a valid Dafny literal (number, bool, char)
+                // Only replace if RHS has a function call or is check_var,
+                // we captured the value, and the value is a valid Dafny literal
                 if (vars.TryGetValue(varName, out var value) &&
-                    Regex.IsMatch(rhs, @"[A-Z]\w*\s*\(") &&
+                    (Regex.IsMatch(rhs, @"[A-Z]\w*\s*\(") || Regex.IsMatch(rhs, @"^check_\w+$")) &&
                     IsValidDafnyLiteral(value))
                 {
-                    return $"{indent}{varName}{eq}{value}{semi} // == {rhs}";
+                    return $"{indent}{varName}{eq}{value}{semi}";
                 }
                 return m.Value;
             },
             RegexOptions.Multiline);
+
+        // Remove unused check_ variable declarations when the value was injected
+        foreach (var varName in vars.Keys)
+        {
+            if (vars.TryGetValue(varName, out var value) && IsValidDafnyLiteral(value))
+            {
+                // Remove lines like: "    var check_varName := <expr>;"
+                result = Regex.Replace(result,
+                    @"^[ \t]*var check_" + Regex.Escape(varName) + @"\s*:=\s*[^;]+;\r?\n",
+                    "",
+                    RegexOptions.Multiline);
+            }
+        }
+
+        return result;
     }
 
     /// <summary>

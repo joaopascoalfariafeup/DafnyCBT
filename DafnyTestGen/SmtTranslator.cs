@@ -415,6 +415,13 @@ static class SmtTranslator
         sb.AppendLine("(check-sat)");
         sb.AppendLine("(get-model)");
 
+        // Explicitly request scalar output values (get-model may omit them)
+        foreach (var (name, type) in outputs)
+        {
+            if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type) && !TypeUtils.IsSetType(type))
+                sb.AppendLine($"(get-value ({name}))");
+        }
+
         // After get-model, also get individual sequence element values
         foreach (var (name, type) in inputs.Concat(outputs))
         {
