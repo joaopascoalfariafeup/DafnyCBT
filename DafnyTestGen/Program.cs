@@ -909,18 +909,26 @@ class Program
                     var leMatch = Regex.Match(simpleBody, @"^(\S+)\s*<=\s*(\S+)$");
                     if (leMatch.Success)
                     {
+                        // Pre-state Valid() constraint
                         var left = leMatch.Groups[1].Value;
                         var right = leMatch.Groups[2].Value;
-                        // Replace field references
                         if (mutableNames.Contains(left)) left = $"{left}_pre";
                         if (mutableNames.Contains(right)) right = $"{right}_pre";
-                        // Replace field.Length
                         left = Regex.Replace(left, @"(\w+)\.Length", m =>
                             mutableNames.Contains(m.Groups[1].Value) ? $"{m.Groups[1].Value}_pre_len" : $"{m.Groups[1].Value}_len");
                         right = Regex.Replace(right, @"(\w+)\.Length", m =>
                             mutableNames.Contains(m.Groups[1].Value) ? $"{m.Groups[1].Value}_pre_len" : $"{m.Groups[1].Value}_len");
                         globalExtraConstraints.Add($"(<= {left} {right})");
-                        if (verbose) Console.WriteLine($"  Valid() constraint: (<= {left} {right})");
+                        if (verbose) Console.WriteLine($"  Valid() pre-state constraint: (<= {left} {right})");
+
+                        // Post-state Valid() constraint (autocontracts ensures Valid())
+                        var leftPost = leMatch.Groups[1].Value;
+                        var rightPost = leMatch.Groups[2].Value;
+                        // Post-state: mutable fields use bare names, array lengths use _len
+                        leftPost = Regex.Replace(leftPost, @"(\w+)\.Length", "$1_len");
+                        rightPost = Regex.Replace(rightPost, @"(\w+)\.Length", "$1_len");
+                        globalExtraConstraints.Add($"(<= {leftPost} {rightPost})");
+                        if (verbose) Console.WriteLine($"  Valid() post-state constraint: (<= {leftPost} {rightPost})");
                     }
                     // TODO: handle more complex Valid() bodies
                 }
