@@ -10,6 +10,9 @@ static class TypeUtils
     internal static bool IsArrayType(string type) =>
         type.StartsWith("array<") || type == "array";
 
+    internal static bool IsSetType(string type) =>
+        type.StartsWith("set<") || type == "set" || type.StartsWith("iset<") || type == "iset";
+
     /// <summary>
     /// Returns true if the type is a nested collection (seq of seq, seq of array, array of seq, etc.)
     /// These are not yet supported for SMT element parsing and Dafny emission.
@@ -18,9 +21,9 @@ static class TypeUtils
 
     internal static bool IsNestedCollectionType(string type)
     {
-        if (!IsSeqType(type) && !IsArrayType(type)) return false;
-        var elemType = GetSeqElementType(type);
-        return IsSeqType(elemType) || IsArrayType(elemType);
+        if (!IsSeqType(type) && !IsArrayType(type) && !IsSetType(type)) return false;
+        var elemType = IsSetType(type) ? GetSetElementType(type) : GetSeqElementType(type);
+        return IsSeqType(elemType) || IsArrayType(elemType) || IsSetType(elemType);
     }
 
     internal static string GetSeqElementType(string type)
@@ -28,6 +31,13 @@ static class TypeUtils
         if (type.StartsWith("seq<")) return type.Substring(4, type.Length - 5);
         if (type.StartsWith("array<")) return type.Substring(6, type.Length - 7);
         if (type == "string") return "char";
+        return "int";
+    }
+
+    internal static string GetSetElementType(string type)
+    {
+        if (type.StartsWith("set<")) return type.Substring(4, type.Length - 5);
+        if (type.StartsWith("iset<")) return type.Substring(5, type.Length - 6);
         return "int";
     }
 
@@ -47,6 +57,8 @@ static class TypeUtils
         if (dafnyType == "string") return "(Seq Int)"; // model as Seq Int to avoid Unicode sort mismatch
         if (dafnyType.StartsWith("seq<")) return $"(Seq {DafnyTypeToSmt(dafnyType.Substring(4, dafnyType.Length - 5))})";
         if (dafnyType.StartsWith("array<")) return "Int"; // represent as length; actual array modeled separately
+        if (dafnyType.StartsWith("set<") || dafnyType.StartsWith("iset<"))
+            return $"(Array {DafnyTypeToSmt(GetSetElementType(dafnyType))} Bool)";
         return "Int"; // fallback
     }
 
@@ -94,8 +106,28 @@ static class TypeUtils
         // Extract sequence/array values from get-value responses
         foreach (var (name, type) in vars)
         {
-            if (!IsArrayType(type) && !IsSeqType(type))
+            if (!IsArrayType(type) && !IsSeqType(type) && !IsSetType(type))
                 continue;
+
+            if (IsSetType(type))
+            {
+                // Parse set membership from get-value responses: ((select setName i) true/false)
+                var members = new List<string>();
+                var setElemType = GetSetElementType(type);
+                for (int i = 0; i < SmtTranslator.MAX_SET_UNIVERSE; i++)
+                {
+                    var memberPattern = new Regex(@$"\(\(select\s+{Regex.Escape(name)}\s+{i}\)\s+(true|false)\)");
+                    var memberMatch = memberPattern.Match(fullText);
+                    if (memberMatch.Success && memberMatch.Groups[1].Value == "true")
+                    {
+                        members.Add(i.ToString());
+                    }
+                }
+                result[name + "_card"] = members.Count.ToString();
+                if (members.Count > 0)
+                    result[name + "_members"] = string.Join(",", members);
+                continue;
+            }
 
             var smtName = SeqSmtName(name, type);
 
@@ -231,7 +263,7 @@ static class TypeUtils
     internal static bool IsSupportedFieldType(string type, Dictionary<string, List<string>>? enumDatatypes = null)
     {
         if (type is "int" or "nat" or "bool" or "real" or "char") return true;
-        if (IsArrayType(type) || IsSeqType(type))
+        if (IsArrayType(type) || IsSeqType(type) || IsSetType(type))
             return !IsNestedCollectionType(type);
         if (enumDatatypes != null && enumDatatypes.ContainsKey(type)) return true;
         return false;

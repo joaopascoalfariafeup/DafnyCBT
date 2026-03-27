@@ -280,6 +280,16 @@ static class TestEmitter
             return $"    var {name}: {typeStr} := [];";
         }
 
+        if (TypeUtils.IsSetType(typeStr))
+        {
+            if (values.TryGetValue(name + "_members", out var membersStr))
+            {
+                var members = membersStr.Split(',');
+                return $"    var {name}: {typeStr} := {{{string.Join(", ", members)}}};";
+            }
+            return $"    var {name}: {typeStr} := {{}};";
+        }
+
         // Enum datatype: map integer ordinal back to constructor name
         if (enumDatatypes != null && enumDatatypes.TryGetValue(typeStr, out var scalarEnumCtors))
         {
@@ -641,6 +651,15 @@ static class TestEmitter
                     {
                         sb.AppendLine($"    expect {outp.Name} == [{string.Join(", ", elems.Take(seqLen))}];");
                     }
+                }
+                else if (TypeUtils.IsSetType(typeStr) && values.TryGetValue(outp.Name + "_members", out var setMembers))
+                {
+                    var members = setMembers.Split(',');
+                    sb.AppendLine($"    expect {outp.Name} == {{{string.Join(", ", members)}}};");
+                }
+                else if (TypeUtils.IsSetType(typeStr))
+                {
+                    sb.AppendLine($"    expect {outp.Name} == {{}};");
                 }
             }
 

@@ -23,8 +23,22 @@ static class SmtTranslator
         return false;
     }
 
+    static bool IsSetExpr(string dafnyExpr, List<(string Name, string Type)> inputs)
+    {
+        dafnyExpr = dafnyExpr.Trim();
+        var match = inputs.FirstOrDefault(v => v.Name == dafnyExpr);
+        if (match != default && TypeUtils.IsSetType(match.Type))
+            return true;
+        // Set literal {x, y} (but not empty {} which we handle separately)
+        if (dafnyExpr.StartsWith("{") && dafnyExpr.EndsWith("}")) return true;
+        return false;
+    }
+
     // Maximum bounded sequence length used in SMT queries
     internal const int MAX_SEQ_LEN = 8;
+
+    // Maximum bounded set universe size (elements range from 0..MAX_SET_UNIVERSE-1)
+    internal const int MAX_SET_UNIVERSE = 8;
 
     // Collects well-formedness guards (e.g., bounds checks for seq[i])
     // during expression translation. Caller should assert these too.
@@ -57,6 +71,24 @@ static class SmtTranslator
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("(set-option :produce-models true)");
         sb.AppendLine("(set-logic ALL)");
+
+        // Set operation macros (sets encoded as (Array Int Bool))
+        var hasSetParam = inputs.Concat(outputs).Any(v => TypeUtils.IsSetType(v.Type));
+        if (hasSetParam)
+        {
+            sb.AppendLine();
+            sb.AppendLine("; Set operations over (Array Int Bool) encoding");
+            sb.AppendLine("(define-fun SetMember ((x Int) (s (Array Int Bool))) Bool (select s x))");
+            sb.AppendLine("(define-fun EmptySet () (Array Int Bool) ((as const (Array Int Bool)) false))");
+            sb.AppendLine("(define-fun SubsetOf ((a (Array Int Bool)) (b (Array Int Bool))) Bool");
+            sb.AppendLine($"  (forall ((x Int)) (=> (select a x) (select b x))))");
+            sb.AppendLine("(define-fun SetUnion ((a (Array Int Bool)) (b (Array Int Bool))) (Array Int Bool)");
+            sb.AppendLine($"  ((_ map or) a b))");
+            sb.AppendLine("(define-fun SetIntersection ((a (Array Int Bool)) (b (Array Int Bool))) (Array Int Bool)");
+            sb.AppendLine($"  ((_ map and) a b))");
+            sb.AppendLine("(define-fun SetDifference ((a (Array Int Bool)) (b (Array Int Bool))) (Array Int Bool)");
+            sb.AppendLine($"  ((_ map and) a ((_ map not) b)))");
+        }
         sb.AppendLine();
 
         // Declare variables for inputs and outputs.
@@ -175,6 +207,31 @@ static class SmtTranslator
                         sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
                     if (_enumDatatypes.TryGetValue(elemType, out var enumElemCtors2))
                         sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 0) (<= (seq.nth {smtName} i) {enumElemCtors2.Count - 1})))))");
+                }
+            }
+        }
+
+        // Bound set types: closed-world assumption over universe {0..MAX_SET_UNIVERSE-1}
+        // and define a cardinality helper for each set variable
+        foreach (var (name, type) in inputs.Concat(outputs).ToList())
+        {
+            if (TypeUtils.IsSetType(type))
+            {
+                var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                // Closed-world: membership implies element in universe
+                var universeDisjuncts = string.Join(" ", Enumerable.Range(0, MAX_SET_UNIVERSE).Select(i => $"(= x {i})"));
+                sb.AppendLine($"(assert (forall ((x Int)) (=> (select {smtName} x) (or {universeDisjuncts}))))");
+                // Cardinality helper: sum of (ite (select S i) 1 0) for each universe element
+                var cardTerms = string.Join(" ", Enumerable.Range(0, MAX_SET_UNIVERSE).Select(i => $"(ite (select {smtName} {i}) 1 0)"));
+                sb.AppendLine($"(define-fun {smtName}_card () Int (+ {cardTerms}))");
+
+                // If mutable, also bound post-state set and define its cardinality
+                if (mutableNames.Contains(name))
+                {
+                    var postName = $"{name}_post";
+                    sb.AppendLine($"(assert (forall ((x Int)) (=> (select {postName} x) (or {universeDisjuncts}))))");
+                    var postCardTerms = string.Join(" ", Enumerable.Range(0, MAX_SET_UNIVERSE).Select(i => $"(ite (select {postName} {i}) 1 0)"));
+                    sb.AppendLine($"(define-fun {postName}_card () Int (+ {postCardTerms}))");
                 }
             }
         }
@@ -382,6 +439,12 @@ static class SmtTranslator
                         sb.AppendLine($"(get-value ((seq.nth {smtName} {i})))");
                 }
             }
+            else if (TypeUtils.IsSetType(type))
+            {
+                var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                for (int i = 0; i < MAX_SET_UNIVERSE; i++)
+                    sb.AppendLine($"(get-value ((select {smtName} {i})))");
+            }
         }
 
         return sb.ToString();
@@ -439,11 +502,24 @@ static class SmtTranslator
         // BinaryExpr
         if (expr is BinaryExpr bin)
         {
-            // Handle 'in' and 'not in' specially (need seq expansion)
+            // Handle 'in' and 'not in' specially
             if (bin.Op == BinaryExpr.Opcode.In || bin.Op == BinaryExpr.Opcode.NotIn)
             {
                 var valSmt = ExprToSmt(bin.E0, inputs, mutableNames, isPostContext, insideOld);
                 if (valSmt == null) goto fallback;
+
+                // Check if RHS is a set type
+                var rhsName = GetOriginalName(UnwrapExpr(bin.E1));
+                var rhsIsSet = rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsSetType(v.Type));
+                if (rhsIsSet)
+                {
+                    var setSmt = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
+                    if (setSmt == null) goto fallback;
+                    var memberExpr = $"(select {setSmt} {valSmt})";
+                    return bin.Op == BinaryExpr.Opcode.NotIn ? $"(not {memberExpr})" : memberExpr;
+                }
+
+                // Sequence/array in
                 var seqInfo = ResolveSeqForContains(bin.E1, inputs, mutableNames, isPostContext, insideOld);
                 if (seqInfo == null) goto fallback;
                 var (smtSeq, boundSmt) = seqInfo.Value;
@@ -465,14 +541,21 @@ static class SmtTranslator
                 BinaryExpr.Opcode.Iff => $"(= {left} {right})",
                 BinaryExpr.Opcode.Eq => $"(= {left} {right})",
                 BinaryExpr.Opcode.Neq => $"(not (= {left} {right}))",
-                BinaryExpr.Opcode.Lt => $"(< {left} {right})",
-                BinaryExpr.Opcode.Le => $"(<= {left} {right})",
-                BinaryExpr.Opcode.Gt => $"(> {left} {right})",
-                BinaryExpr.Opcode.Ge => $"(>= {left} {right})",
-                BinaryExpr.Opcode.Add => IsSeqExprAst(bin.E0, inputs)
+                BinaryExpr.Opcode.Lt => IsSetExprAst(bin.E0, inputs)
+                    ? $"(and (SubsetOf {left} {right}) (not (= {left} {right})))" : $"(< {left} {right})",
+                BinaryExpr.Opcode.Le => IsSetExprAst(bin.E0, inputs)
+                    ? $"(SubsetOf {left} {right})" : $"(<= {left} {right})",
+                BinaryExpr.Opcode.Gt => IsSetExprAst(bin.E0, inputs)
+                    ? $"(and (SubsetOf {right} {left}) (not (= {left} {right})))" : $"(> {left} {right})",
+                BinaryExpr.Opcode.Ge => IsSetExprAst(bin.E0, inputs)
+                    ? $"(SubsetOf {right} {left})" : $"(>= {left} {right})",
+                BinaryExpr.Opcode.Add => IsSetExprAst(bin.E0, inputs)
+                    ? $"(SetUnion {left} {right})" : IsSeqExprAst(bin.E0, inputs)
                     ? $"(seq.++ {left} {right})" : $"(+ {left} {right})",
-                BinaryExpr.Opcode.Sub => $"(- {left} {right})",
-                BinaryExpr.Opcode.Mul => $"(* {left} {right})",
+                BinaryExpr.Opcode.Sub => IsSetExprAst(bin.E0, inputs)
+                    ? $"(SetDifference {left} {right})" : $"(- {left} {right})",
+                BinaryExpr.Opcode.Mul => IsSetExprAst(bin.E0, inputs)
+                    ? $"(SetIntersection {left} {right})" : $"(* {left} {right})",
                 BinaryExpr.Opcode.Div => $"(div {left} {right})",
                 BinaryExpr.Opcode.Mod => $"(mod {left} {right})",
                 _ => (string?)null
@@ -659,8 +742,24 @@ static class SmtTranslator
             goto fallback;
         }
 
-        // UnaryExpr for |expr| (sequence length) — may be UnaryOpExpr with Cardinality
+        // UnaryExpr for |expr| (sequence length / set cardinality) — may be UnaryOpExpr with Cardinality
         // Handled in fallback for now.
+
+        // SetDisplayExpr: {e1, e2, ...} — set literal
+        if (expr is SetDisplayExpr setDisplay)
+        {
+            if (setDisplay.Elements.Count == 0)
+                return "EmptySet";
+            // Build a set from elements: (store (store EmptySet e1 true) e2 true) ...
+            var result = "EmptySet";
+            foreach (var elem in setDisplay.Elements)
+            {
+                var elemSmt = ExprToSmt(elem, inputs, mutableNames, isPostContext, insideOld);
+                if (elemSmt == null) goto fallback;
+                result = $"(store {result} {elemSmt} true)";
+            }
+            return result;
+        }
 
     fallback:
         // Fallback: convert to string and use the string-based translator
@@ -737,6 +836,20 @@ static class SmtTranslator
         }
         if (expr is SeqSelectExpr sel && !sel.SelectOne) return true;
         if (expr is OldExpr oldE) return IsSeqExprAst(oldE.Expr, inputs);
+        return false;
+    }
+
+    static bool IsSetExprAst(Expression expr, List<(string Name, string Type)> inputs)
+    {
+        expr = UnwrapExpr(expr);
+        var name = GetOriginalName(expr);
+        if (name != null)
+        {
+            var match = inputs.FirstOrDefault(v => v.Name == name);
+            if (match != default && TypeUtils.IsSetType(match.Type))
+                return true;
+        }
+        if (expr is OldExpr oldE) return IsSetExprAst(oldE.Expr, inputs);
         return false;
     }
 
@@ -884,6 +997,10 @@ static class SmtTranslator
             else
                 break;
         }
+
+        // Handle empty set literal: {}
+        if (expr == "{}")
+            return "EmptySet";
 
         // Handle negation
         if (expr.StartsWith("!(") && expr.EndsWith(")"))
@@ -1123,7 +1240,7 @@ static class SmtTranslator
             return $"(= (seq.nth {arrName}_seq {idxName}) {valName})";
         }
 
-        // Handle !in pattern: x !in a[..] or x !in a[..len] or x !in s
+        // Handle !in pattern: x !in S (set) or x !in a[..] or x !in a[..len] or x !in s
         var notInMatch = Regex.Match(expr, @"^(.+?)\s+!in\s+(\w+)(\[\.\.(\w+)?\])?$");
         if (notInMatch.Success)
         {
@@ -1133,6 +1250,11 @@ static class SmtTranslator
             var sliceBound = notInMatch.Groups[4].Success ? notInMatch.Groups[4].Value : null;
             if (valExpr != null)
             {
+                // Check if RHS is a set
+                var isSet = inputs.Any(v => v.Name == seqName && TypeUtils.IsSetType(v.Type));
+                if (isSet && !hasSlice)
+                    return $"(not (select {seqName} {valExpr}))";
+
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
                 if (sliceBound != null)
@@ -1146,6 +1268,7 @@ static class SmtTranslator
         }
 
         // Handle 'in' pattern: x in a[..] or x in a[..len] or x in s
+        // Handle 'in' pattern: x in S (set) or x in a[..] or x in a[..len] or x in s
         var inMatch = Regex.Match(expr, @"^(.+?)\s+in\s+(\w+)(\[\.\.(\w+)?\])?$");
         if (inMatch.Success)
         {
@@ -1155,6 +1278,11 @@ static class SmtTranslator
             var sliceBound = inMatch.Groups[4].Success ? inMatch.Groups[4].Value : null;
             if (valExpr != null)
             {
+                // Check if RHS is a set
+                var isSet = inputs.Any(v => v.Name == seqName && TypeUtils.IsSetType(v.Type));
+                if (isSet && !hasSlice)
+                    return $"(select {seqName} {valExpr})";
+
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
                 if (sliceBound != null)
@@ -1189,11 +1317,19 @@ static class SmtTranslator
             return $"(forall ((i Int) (j Int)) (=> (and (<= 0 i) (< i j) (< j (seq.len {seqName}))) (<= (seq.nth {seqName} i) (seq.nth {seqName} j))))";
         }
 
-        // Handle |expr| (sequence length)
+        // Handle |expr| (sequence length or set cardinality)
         var seqLenMatch = Regex.Match(expr, @"^\|(.+)\|$");
         if (seqLenMatch.Success)
         {
-            var inner = DafnyExprToSmt(seqLenMatch.Groups[1].Value, inputs);
+            var innerStr = seqLenMatch.Groups[1].Value.Trim();
+            // Check if inner expression is a set variable
+            var isSet = inputs.Any(v => v.Name == innerStr && TypeUtils.IsSetType(v.Type));
+            if (isSet)
+            {
+                var smtName = inputs.Any(v => v.Name == innerStr) ? innerStr : innerStr;
+                return $"{smtName}_card";
+            }
+            var inner = DafnyExprToSmt(innerStr, inputs);
             if (inner != null) return $"(seq.len {inner})";
         }
 
