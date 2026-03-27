@@ -3,7 +3,13 @@ using Microsoft.Dafny;
 
 namespace DafnyTestGen;
 
-record ClassInfo(string ClassName, List<(string Name, string Type)> Fields);
+record ClassInfo(
+    string ClassName,
+    List<(string Name, string Type)> Fields,
+    bool IsAutoContracts = false,
+    List<(string Name, string Type)>? ConstFields = null,
+    List<(string Name, string Type)>? ConstructorParams = null,
+    List<Expression>? ConstructorRequires = null);
 
 static class DafnyParser
 {
@@ -71,7 +77,8 @@ static class DafnyParser
                     if (member is Method m && !m.IsGhost && m.Ens.Count > 0
                         && !m.Name.Contains("test", StringComparison.OrdinalIgnoreCase)
                         && !m.Name.Contains("Test", StringComparison.OrdinalIgnoreCase)
-                        && m.Name != "Main")
+                        && m.Name != "Main"
+                        && m.Name != "_ctor")
                     {
                         // Skip methods inside traits (not supported)
                         if (cls is TraitDecl)
@@ -114,18 +121,18 @@ static class DafnyParser
     internal static ClassInfo? GetClassInfo(Method method, ClassDecl cls,
         Dictionary<string, List<string>>? enumDatatypes = null)
     {
-
-        // Check for {:autocontracts}
+        // Detect {:autocontracts}
+        bool isAutoContracts = false;
         if (cls.Attributes != null)
         {
             for (var attr = cls.Attributes; attr != null; attr = attr.Prev)
-                if (attr.Name == "autocontracts") return null;
+                if (attr.Name == "autocontracts") { isAutoContracts = true; break; }
         }
 
-        // Check for trait parents
-        if (cls.ParentTraitHeads.Count > 0) return null;
+        // Check for trait parents (skip autocontracts: Dafny may inject object trait)
+        if (!isAutoContracts && cls.ParentTraitHeads.Count > 0) return null;
 
-        // Collect non-ghost fields
+        // Collect non-ghost var fields
         var fields = new List<(string Name, string Type)>();
         foreach (var member in cls.Members)
         {
@@ -133,20 +140,58 @@ static class DafnyParser
                 fields.Add((f.Name, f.Type.ToString()));
         }
 
-        // All fields must have supported types
-        foreach (var (_, type) in fields)
+        // Collect const fields (for autocontracts: constructor initializes them)
+        var constFields = new List<(string Name, string Type)>();
+        if (isAutoContracts)
+        {
+            foreach (var member in cls.Members)
+            {
+                if (member is ConstantField cf && !cf.IsGhost && cf.Name != "Repr")
+                    constFields.Add((cf.Name, cf.Type.ToString()));
+            }
+        }
+
+        // All fields (var + const) must have supported types
+        foreach (var (_, type) in fields.Concat(constFields))
             if (!TypeUtils.IsSupportedFieldType(type, enumDatatypes))
                 return null;
 
-        // Method must not require Valid() or RepInv()
-        foreach (var req in method.Req)
+        // For non-autocontracts: reject methods that require Valid()/RepInv()
+        if (!isAutoContracts)
         {
-            var reqStr = DnfEngine.ExprToString(req.E);
-            if (reqStr.Contains("Valid()") || reqStr.Contains("RepInv()"))
-                return null;
+            foreach (var req in method.Req)
+            {
+                var reqStr = DnfEngine.ExprToString(req.E);
+                if (reqStr.Contains("Valid()") || reqStr.Contains("RepInv()"))
+                    return null;
+            }
         }
 
-        return new ClassInfo(cls.Name, fields);
+        // For autocontracts: find the constructor and its params/requires
+        List<(string Name, string Type)>? ctorParams = null;
+        List<Expression>? ctorRequires = null;
+        if (isAutoContracts)
+        {
+            foreach (var member in cls.Members)
+            {
+                if (member.Name == "_ctor")
+                {
+                    // Constructor may not be a Method subtype in this Dafny version — use dynamic
+                    try
+                    {
+                        dynamic ctor = member;
+                        var ins = (IEnumerable<Formal>)ctor.Ins;
+                        var reqs = (IEnumerable<AttributedExpression>)ctor.Req;
+                        ctorParams = ins.Select(p => (p.Name, Type: p.Type.ToString())).ToList();
+                        ctorRequires = reqs.Select(r => (Expression)r.E).ToList();
+                    }
+                    catch { /* ignore if properties don't exist */ }
+                    break; // use the first constructor
+                }
+            }
+        }
+
+        return new ClassInfo(cls.Name, fields, isAutoContracts, constFields, ctorParams, ctorRequires);
     }
 
     /// <summary>

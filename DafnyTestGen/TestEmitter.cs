@@ -6,16 +6,34 @@ namespace DafnyTestGen;
 static class TestEmitter
 {
     /// <summary>
+    /// Extracts "free variables" from an expression string — identifiers that are NOT
+    /// member accesses (not preceded by '.') and not Dafny keywords.
+    /// E.g., "elems[..size]" → {"elems", "size"}, "a.Length" → {"a"}, "a[k + 1]" → {"a", "k"}
+    /// </summary>
+    static HashSet<string> ExtractFreeVariables(string expr)
+    {
+        var keywords = new HashSet<string> { "forall", "exists", "old", "true", "false", "null", "this", "var", "in", "if", "then", "else", "match", "case" };
+        var result = new HashSet<string>();
+        foreach (Match m in Regex.Matches(expr, @"\b([a-zA-Z_]\w*)\b"))
+        {
+            if (m.Index > 0 && expr[m.Index - 1] == '.') continue; // member access
+            var id = m.Groups[1].Value;
+            if (!keywords.Contains(id))
+                result.Add(id);
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Extracts all old(expr) occurrences from postcondition literals and returns
     /// a list of (innerExpr, captureVarName, isArrayCapture) triples for pre-call capture.
-    /// When old(a[indexExpr]) references an array parameter, the entire array is captured
-    /// as a sequence (a[..]) so that quantifier-bound indices work correctly.
-    /// E.g., old(a[k + 1]) with array param 'a' -> ("a[..]", "old_a", true)
-    /// E.g., old(a[0]) with array param 'a' -> ("a[..]", "old_a", true)
-    /// E.g., old(x) -> ("x", "old_x", false)
+    /// When all free variables in the inner expression are known (method params, fields, etc.),
+    /// the entire expression is captured as a single variable (whole-expression capture).
+    /// When unknown variables are present (e.g., quantifier-bound), falls back to array
+    /// consolidation: capturing the entire array as a sequence so quantifier-bound indices work.
     /// </summary>
     internal static List<(string innerExpr, string varName, bool isArrayCapture)> ExtractOldCaptures(
-        List<string> literals, HashSet<string> arrayParamNames)
+        List<string> literals, HashSet<string> arrayParamNames, HashSet<string> knownIdentifiers)
     {
         var captures = new Dictionary<string, (string varName, bool isArray)>(); // captureExpr -> (varName, isArray)
         foreach (var lit in literals)
@@ -36,30 +54,40 @@ static class TestEmitter
                 {
                     var innerExpr = lit.Substring(start, pos - 1 - start).Trim();
 
-                    // Check if this is an array access: arrayName[indexExpr]
-                    var arrayAccessMatch = Regex.Match(innerExpr, @"^(\w+)\[");
-                    if (arrayAccessMatch.Success && arrayParamNames.Contains(arrayAccessMatch.Groups[1].Value))
+                    // Check if all free variables in the expression are known (capturable)
+                    var freeVars = ExtractFreeVariables(innerExpr);
+                    bool allKnown = freeVars.All(v => knownIdentifiers.Contains(v));
+
+                    if (allKnown)
                     {
-                        // Consolidate all old(a[...]) into a single capture of a[..]
-                        var arrayName = arrayAccessMatch.Groups[1].Value;
-                        var captureExpr = arrayName + "[..]";
-                        if (!captures.ContainsKey(captureExpr))
-                            captures[captureExpr] = ("old_" + arrayName, true);
-                    }
-                    else if (!captures.ContainsKey(innerExpr))
-                    {
-                        // Generate a clean variable name from the expression
-                        var varName = "old_" + Regex.Replace(innerExpr, @"[^a-zA-Z0-9_]", "_")
-                            .Trim('_');
-                        // Deduplicate variable names
-                        var baseName = varName;
-                        int suffix = 2;
-                        while (captures.Values.Any(v => v.varName == varName))
+                        // Whole-expression capture: capture the entire old(expr) as a variable
+                        if (!captures.ContainsKey(innerExpr))
                         {
-                            varName = baseName + suffix;
-                            suffix++;
+                            var varName = "old_" + Regex.Replace(innerExpr, @"[^a-zA-Z0-9_]+", "_")
+                                .Trim('_');
+                            var baseName = varName;
+                            int suffix = 2;
+                            while (captures.Values.Any(v => v.varName == varName))
+                            {
+                                varName = baseName + suffix;
+                                suffix++;
+                            }
+                            captures[innerExpr] = (varName, false);
                         }
-                        captures[innerExpr] = (varName, false);
+                    }
+                    else
+                    {
+                        // Some free vars are unknown (likely quantifier-bound).
+                        // Fall back to array consolidation if this is an array access.
+                        var arrayAccessMatch = Regex.Match(innerExpr, @"^(\w+)\[");
+                        if (arrayAccessMatch.Success && arrayParamNames.Contains(arrayAccessMatch.Groups[1].Value))
+                        {
+                            var arrayName = arrayAccessMatch.Groups[1].Value;
+                            var captureExpr = arrayName + "[..]";
+                            if (!captures.ContainsKey(captureExpr))
+                                captures[captureExpr] = ("old_" + arrayName, true);
+                        }
+                        // else: can't capture this old() expression — will remain untranslated
                     }
                 }
             }
@@ -78,7 +106,18 @@ static class TestEmitter
     {
         var result = literal;
 
-        // First handle array captures: old(arrayName[...]) -> old_arrayName[...]
+        // First handle non-array (whole-expression) captures: old(expr) -> varName
+        // These are more specific and must run before array consolidation, which uses
+        // a general pattern that could match the same old() expressions.
+        foreach (var (innerExpr, varName, isArrayCapture) in oldCaptures)
+        {
+            if (isArrayCapture) continue;
+            var pattern = @"\bold\s*\(" + Regex.Escape(innerExpr) + @"\)";
+            result = Regex.Replace(result, pattern, varName);
+        }
+
+        // Then handle array captures: old(arrayName[...]) -> old_arrayName[...]
+        // This is the fallback for quantifier-bound index expressions.
         foreach (var (_, varName, isArrayCapture) in oldCaptures)
         {
             if (!isArrayCapture) continue;
@@ -118,13 +157,6 @@ static class TestEmitter
             }
         }
 
-        // Then handle non-array captures: old(expr) -> varName
-        foreach (var (innerExpr, varName, isArrayCapture) in oldCaptures)
-        {
-            if (isArrayCapture) continue;
-            var pattern = @"\bold\s*\(" + Regex.Escape(innerExpr) + @"\)";
-            result = Regex.Replace(result, pattern, varName);
-        }
         return result;
     }
 
@@ -346,6 +378,12 @@ static class TestEmitter
         // Collect array parameter names for old() capture handling
         var arrayParamNames = new HashSet<string>(
             method.Ins.Where(inp => TypeUtils.IsArrayType(inp.Type.ToString())).Select(inp => inp.Name));
+        // Include class array fields (var and const) for old() capture
+        if (classInfo != null)
+        {
+            foreach (var (fn, ft) in classInfo.Fields.Concat(classInfo.ConstFields ?? new List<(string, string)>()))
+                if (TypeUtils.IsArrayType(ft)) arrayParamNames.Add(fn);
+        }
 
         foreach (var (label, values, literals) in testCases)
         {
@@ -362,9 +400,32 @@ static class TestEmitter
 
             // For class methods: construct object and assign fields
             var fieldNames = classInfo != null ? new HashSet<string>(classInfo.Fields.Select(f => f.Name)) : new HashSet<string>();
+            var constFieldNames = classInfo is { ConstFields: not null }
+                ? new HashSet<string>(classInfo.ConstFields.Select(f => f.Name)) : new HashSet<string>();
+            var ctorParamNames = classInfo is { ConstructorParams: not null }
+                ? new HashSet<string>(classInfo.ConstructorParams.Select(p => p.Name)) : new HashSet<string>();
             if (classInfo != null)
             {
-                sb.AppendLine($"    var obj := new {classInfo.ClassName};");
+                if (classInfo.IsAutoContracts && classInfo.ConstructorParams != null)
+                {
+                    // Autocontracts: use constructor with Z3-chosen parameter values
+                    var ctorArgs = classInfo.ConstructorParams.Select(p =>
+                    {
+                        if (values.TryGetValue(p.Name, out var val))
+                        {
+                            val = FormatScalarValue(val, p.Type, enumDatatypes);
+                            return val;
+                        }
+                        return p.Type switch { "real" => "0.0", "char" => "' '", "bool" => "false", "nat" => "1", _ => "1" };
+                    });
+                    sb.AppendLine($"    var obj := new {classInfo.ClassName}({string.Join(", ", ctorArgs)});");
+                }
+                else
+                {
+                    sb.AppendLine($"    var obj := new {classInfo.ClassName};");
+                }
+
+                // Assign var fields
                 foreach (var (fieldName, fieldType) in classInfo.Fields)
                 {
                     var fType = SubstTypeParams(fieldType, typeParamMap);
@@ -395,6 +456,34 @@ static class TestEmitter
                         }
                     }
                 }
+
+                // Assign const array field elements (pointer set by constructor)
+                if (classInfo.ConstFields != null)
+                {
+                    foreach (var (cfName, cfType) in classInfo.ConstFields)
+                    {
+                        var fType = SubstTypeParams(cfType, typeParamMap);
+                        if (TypeUtils.IsArrayType(fType))
+                        {
+                            var elemType = fType.StartsWith("array<") ? fType.Substring(6, fType.Length - 7) : "int";
+                            var lenKey = mutableNames != null && mutableNames.Contains(cfName) ? $"{cfName}_pre_len" : $"{cfName}_len";
+                            if (values.TryGetValue(lenKey, out var lenStr) && int.TryParse(lenStr, out var len))
+                            {
+                                var elemsKey = mutableNames != null && mutableNames.Contains(cfName) ? $"{cfName}_pre_elems" : $"{cfName}_elems";
+                                string[] elems;
+                                if (values.TryGetValue(elemsKey, out var elemsStr))
+                                    elems = elemsStr.Split(',');
+                                else
+                                    elems = Enumerable.Range(0, len).Select(_ => "0").ToArray();
+                                for (int idx = 0; idx < len && idx < elems.Length; idx++)
+                                {
+                                    var elemVal = FormatScalarValue(elems[idx].Trim(), elemType, enumDatatypes);
+                                    sb.AppendLine($"    obj.{cfName}[{idx}] := {elemVal};");
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Emit variable declarations from Z3 model, substituting type parameters.
@@ -418,15 +507,35 @@ static class TestEmitter
             }
 
             // Capture old() expressions before the method call.
-            // For array params, capture the whole array as a sequence (a[..])
-            // so quantifier-bound indices like old(a[k+1]) work correctly.
-            var oldCaptures = ExtractOldCaptures(literals, arrayParamNames);
-            foreach (var (oldExpr, varName, _) in oldCaptures)
+            // Build known identifiers: all names that are in scope before the call.
+            var knownIdentifiers = new HashSet<string>(method.Ins.Select(i => i.Name));
+            knownIdentifiers.UnionWith(fieldNames);
+            knownIdentifiers.UnionWith(constFieldNames);
+            knownIdentifiers.UnionWith(ctorParamNames);
+            var oldCaptures = ExtractOldCaptures(literals, arrayParamNames, knownIdentifiers);
+            foreach (var (oldExpr, varName, isArrayCapture) in oldCaptures)
             {
-                // For class methods, prefix field references with obj.
                 var captureExpr = oldExpr;
-                if (classInfo != null && fieldNames.Any(f => oldExpr == f || oldExpr.StartsWith(f + "[")))
-                    captureExpr = "obj." + oldExpr;
+                if (classInfo != null)
+                {
+                    if (isArrayCapture)
+                    {
+                        // Array consolidation: simple obj. prefix (expr is "arrayName[..]")
+                        if (fieldNames.Any(f => oldExpr == f || oldExpr.StartsWith(f + "["))
+                            || constFieldNames.Any(f => oldExpr == f || oldExpr.StartsWith(f + "[")))
+                            captureExpr = "obj." + oldExpr;
+                    }
+                    else
+                    {
+                        // Whole-expression capture: replace all field references with obj.field
+                        var allClassFields = classInfo.Fields
+                            .Concat(classInfo.ConstFields ?? new List<(string, string)>());
+                        foreach (var (fn, _) in allClassFields)
+                            captureExpr = Regex.Replace(captureExpr,
+                                @"(?<![a-zA-Z_0-9])(?<!obj\.)" + Regex.Escape(fn) + @"(?![a-zA-Z_0-9])",
+                                $"obj.{fn}");
+                    }
+                }
                 sb.AppendLine($"    var {varName} := {captureExpr};");
             }
 
@@ -452,14 +561,17 @@ static class TestEmitter
             // For class methods, replace bare field references with obj.field in expects
             if (classInfo != null)
             {
+                var allClassFields = classInfo.Fields
+                    .Concat(classInfo.ConstFields ?? new List<(string, string)>());
                 expectLiterals = expectLiterals.Select(lit =>
                 {
                     var result = lit;
-                    foreach (var (fieldName, _) in classInfo.Fields)
+                    foreach (var (fieldName, _) in allClassFields)
                     {
                         // Replace bare field name with obj.field, but not inside old_field captures
+                        // or when already prefixed with obj.
                         result = Regex.Replace(result,
-                            @"(?<![a-zA-Z_0-9\.])(?<!old_)" + Regex.Escape(fieldName) + @"(?![a-zA-Z_0-9])",
+                            @"(?<![a-zA-Z_0-9])(?<!old_)(?<!obj\.)" + Regex.Escape(fieldName) + @"(?![a-zA-Z_0-9])",
                             $"obj.{fieldName}");
                     }
                     return result;

@@ -244,7 +244,11 @@ class Program
                     if (member is Method m && methods.Contains(m))
                     {
                         var ci = DafnyParser.GetClassInfo(m, cd, enumDatatypes);
-                        if (ci != null) classInfoMap[m] = ci;
+                        if (ci != null)
+                        {
+                            classInfoMap[m] = ci;
+                            if (verbose) Console.WriteLine($"  [classInfoMap] {m.Name}: autoContracts={ci.IsAutoContracts}, ctorParams={ci.ConstructorParams?.Count}, constFields={ci.ConstFields?.Count}");
+                        }
                     }
                 }
             }
@@ -444,7 +448,7 @@ class Program
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
             Console.WriteLine();
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method));
+            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program);
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -660,7 +664,7 @@ class Program
     static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
         List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool hasNonInlinableFuncs = false,
         Dictionary<string, List<string>>? enumDatatypes = null, Dictionary<string, (string dtName, int ordinal)>? enumConstructors = null,
-        ClassInfo? classInfo = null)
+        ClassInfo? classInfo = null, Microsoft.Dafny.Program? program = null)
     {
         z3Path ??= Z3Runner.FindZ3Path();
         enumDatatypes ??= new Dictionary<string, List<string>>();
@@ -724,6 +728,13 @@ class Program
 
         var preClauses = method.Req.Select(r => r.E).ToList();
 
+        // For autocontracts: add constructor requires as preconditions
+        if (classInfo is { IsAutoContracts: true, ConstructorRequires: not null })
+        {
+            foreach (var ctorReq in classInfo.ConstructorRequires)
+                preClauses.Add(ctorReq);
+        }
+
         // Decompose preconditions into DNF as AST
         var preDnfExprs = new List<List<Expression>> { new List<Expression>() }; // trivial "true"
         foreach (var pre in preClauses)
@@ -773,9 +784,14 @@ class Program
                 var exprStr = DnfEngine.ExprToString(fe.E);
                 if (exprStr == "this" && classInfo != null)
                 {
-                    // modifies this: all non-ghost fields are mutable
+                    // modifies this: all non-ghost var fields are mutable
                     foreach (var (fieldName, _) in classInfo.Fields)
                         mutableNames.Add(fieldName);
+                    // For autocontracts: const array fields have mutable contents
+                    if (classInfo.IsAutoContracts && classInfo.ConstFields != null)
+                        foreach (var (cfName, cfType) in classInfo.ConstFields)
+                            if (TypeUtils.IsArrayType(cfType))
+                                mutableNames.Add(cfName);
                 }
                 else if (exprStr.StartsWith("`"))
                 {
@@ -785,6 +801,17 @@ class Program
                 else if (Regex.IsMatch(exprStr, @"^\w+$"))
                     mutableNames.Add(exprStr);
             }
+        // For autocontracts: auto-injected "modifies this, Repr" not in parsed AST,
+        // so treat all var fields and const array fields as mutable.
+        if (classInfo is { IsAutoContracts: true } && mutableNames.Count == 0)
+        {
+            foreach (var (fieldName, _) in classInfo.Fields)
+                mutableNames.Add(fieldName);
+            if (classInfo.ConstFields != null)
+                foreach (var (cfName, cfType) in classInfo.ConstFields)
+                    if (TypeUtils.IsArrayType(cfType))
+                        mutableNames.Add(cfName);
+        }
 
         // For class methods, add fields as synthetic inputs
         if (classInfo != null)
@@ -797,8 +824,34 @@ class Program
                 inputs.Add((fieldName, fieldType));
                 // Fields not in modifies clause are read-only (not split into pre/post)
             }
+            // For autocontracts: add const fields as synthetic inputs
+            if (classInfo.IsAutoContracts && classInfo.ConstFields != null)
+            {
+                foreach (var (cfName, cfType) in classInfo.ConstFields)
+                {
+                    if (inputs.Any(i => i.Name == cfName) || outputs.Any(o => o.Name == cfName))
+                        continue;
+                    inputs.Add((cfName, cfType));
+                }
+            }
+            // For autocontracts: add constructor parameters as inputs
+            if (classInfo.IsAutoContracts && classInfo.ConstructorParams != null)
+            {
+                foreach (var (cpName, cpType) in classInfo.ConstructorParams)
+                {
+                    if (inputs.Any(i => i.Name == cpName))
+                        continue;
+                    inputs.Add((cpName, cpType));
+                }
+            }
             if (verbose)
+            {
                 Console.WriteLine($"  Class '{classInfo.ClassName}' fields: {string.Join(", ", classInfo.Fields.Select(f => $"{f.Name}: {f.Type}"))}");
+                if (classInfo.IsAutoContracts && classInfo.ConstFields != null && classInfo.ConstFields.Count > 0)
+                    Console.WriteLine($"  Const fields: {string.Join(", ", classInfo.ConstFields.Select(f => $"{f.Name}: {f.Type}"))}");
+                if (classInfo.IsAutoContracts && classInfo.ConstructorParams != null)
+                    Console.WriteLine($"  Constructor params: {string.Join(", ", classInfo.ConstructorParams.Select(p => $"{p.Name}: {p.Type}"))}");
+            }
         }
 
         if (mutableNames.Count > 0 && verbose)
@@ -819,6 +872,105 @@ class Program
 
         // Determine if we need sequences (for array params)
         bool hasArrayParam = inputs.Any(v => v.Type.StartsWith("array<") || v.Type == "array");
+
+        // Global SMT constraints for autocontracts (apply to every query)
+        var globalExtraConstraints = new List<string>();
+        if (classInfo is { IsAutoContracts: true })
+        {
+            // Inject Valid() body as SMT constraint (pre-state)
+            if (inlinablePredicates != null)
+            {
+                var validPred = inlinablePredicates.FirstOrDefault(p => p.name == "Valid");
+                if (validPred.name != null && validPred.body != null)
+                {
+                    // Inline the Valid() body (e.g., "size <= elems.Length") and translate to SMT
+                    var validBody = validPred.body;
+                    // Replace field references with _pre suffix for mutable fields
+                    foreach (var mn in mutableNames)
+                    {
+                        if (TypeUtils.IsArrayType(inputs.FirstOrDefault(i => i.Name == mn).Type ?? ""))
+                            validBody = Regex.Replace(validBody, @"\b" + Regex.Escape(mn) + @"\.Length\b", $"{mn}_pre_len");
+                        else
+                            validBody = Regex.Replace(validBody, @"\b" + Regex.Escape(mn) + @"\b", $"{mn}_pre");
+                    }
+                    // Replace non-mutable field.Length with SMT name
+                    foreach (var (cfName, cfType) in classInfo.ConstFields ?? new List<(string, string)>())
+                    {
+                        if (TypeUtils.IsArrayType(cfType) && !mutableNames.Contains(cfName))
+                            validBody = Regex.Replace(validBody, @"\b" + Regex.Escape(cfName) + @"\.Length\b", $"{cfName}_len");
+                    }
+                    // Translate simple comparisons to SMT
+                    validBody = validBody.Replace("<=", "LEOP").Replace(">=", "GEOP")
+                        .Replace("<", "LTOP").Replace(">", "GTOP");
+                    validBody = validBody.Replace("LEOP", " ").Replace("GEOP", " ")
+                        .Replace("LTOP", " ").Replace("GTOP", " ");
+                    // Parse: try simple "a <= b" pattern
+                    var simpleBody = validPred.body.Trim();
+                    var leMatch = Regex.Match(simpleBody, @"^(\S+)\s*<=\s*(\S+)$");
+                    if (leMatch.Success)
+                    {
+                        var left = leMatch.Groups[1].Value;
+                        var right = leMatch.Groups[2].Value;
+                        // Replace field references
+                        if (mutableNames.Contains(left)) left = $"{left}_pre";
+                        if (mutableNames.Contains(right)) right = $"{right}_pre";
+                        // Replace field.Length
+                        left = Regex.Replace(left, @"(\w+)\.Length", m =>
+                            mutableNames.Contains(m.Groups[1].Value) ? $"{m.Groups[1].Value}_pre_len" : $"{m.Groups[1].Value}_len");
+                        right = Regex.Replace(right, @"(\w+)\.Length", m =>
+                            mutableNames.Contains(m.Groups[1].Value) ? $"{m.Groups[1].Value}_pre_len" : $"{m.Groups[1].Value}_len");
+                        globalExtraConstraints.Add($"(<= {left} {right})");
+                        if (verbose) Console.WriteLine($"  Valid() constraint: (<= {left} {right})");
+                    }
+                    // TODO: handle more complex Valid() bodies
+                }
+            }
+
+            // Link const array field lengths to constructor params
+            // Look for constructor ensures clauses like "elems.Length == capacity"
+            if (classInfo.ConstructorParams != null && program != null)
+            {
+                // Search for the constructor's ensures to find linking constraints
+                foreach (var topDecl in DafnyParser.AllTopLevelDecls(program))
+                {
+                    if (topDecl is ClassDecl cd && cd.Name == classInfo.ClassName)
+                    {
+                        foreach (var member in cd.Members)
+                        {
+                            if (member.Name == "_ctor")
+                            {
+                                // Use dynamic to access Ens — Constructor may not be a Method subtype
+                                try
+                                {
+                                    dynamic ctor = member;
+                                    foreach (var ens in ctor.Ens)
+                                    {
+                                        var ensStr = DnfEngine.ExprToString(ens.E);
+                                        // Match patterns like "elems.Length == capacity" or "capacity == elems.Length"
+                                        foreach (var (cpName, _) in classInfo.ConstructorParams)
+                                        {
+                                            foreach (var (cfName, cfType) in classInfo.ConstFields ?? new List<(string, string)>())
+                                            {
+                                                if (!TypeUtils.IsArrayType(cfType)) continue;
+                                                var lenName = mutableNames.Contains(cfName) ? $"{cfName}_pre_len" : $"{cfName}_len";
+                                                if (ensStr.Contains($"{cfName}.Length == {cpName}") || ensStr.Contains($"{cpName} == {cfName}.Length"))
+                                                {
+                                                    globalExtraConstraints.Add($"(= {lenName} {cpName})");
+                                                    if (verbose) Console.WriteLine($"  Linking: {lenName} == {cpName}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                catch { }
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
 
         // Helper: convert Expression to string key for set operations and dedup
         static string EKey(Expression e) => DnfEngine.ExprToString(e);
@@ -1219,7 +1371,8 @@ class Program
                     baseExclusions[baseKey] = new List<string>();
                 var inputExclusions = baseExclusions[baseKey];
 
-                var allExtra = new List<string>(extraConstraints);
+                var allExtra = new List<string>(globalExtraConstraints);
+                allExtra.AddRange(extraConstraints);
                 allExtra.AddRange(inputExclusions);
 
                 var (solvedValues, isDefinitiveUnsat) = await SolveOne(label, i + 1, displayTotal, literals, preLits, exclusions, allExtra);

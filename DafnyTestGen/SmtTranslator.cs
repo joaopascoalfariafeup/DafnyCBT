@@ -1362,6 +1362,8 @@ static class SmtTranslator
     /// </summary>
     internal static List<string> SplitArgs(string argsStr)
     {
+        if (string.IsNullOrWhiteSpace(argsStr))
+            return new List<string>();
         var result = new List<string>();
         int depth = 0;
         int start = 0;
