@@ -1287,6 +1287,19 @@ class Program
                         eqParts.Add($"(= {smtLen} {lenVal})");
                     }
                 }
+                else if (TypeUtils.IsSetType(type))
+                {
+                    var prefix = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                    if (values.TryGetValue(prefix + "_card", out var cardVal))
+                    {
+                        eqParts.Add($"(= {prefix}_card {cardVal})");
+                    }
+                    if (values.TryGetValue(prefix + "_members", out var membersStr))
+                    {
+                        foreach (var m in membersStr.Split(','))
+                            eqParts.Add($"(select {prefix} {m})");
+                    }
+                }
                 else
                 {
                     var lookupName = mutableNames.Contains(name) ? $"{name}_pre" : name;
@@ -1599,6 +1612,12 @@ class Program
                     tc.values.TryGetValue(prefix + "_len", out var len);
                     tc.values.TryGetValue(prefix + "_elems", out var elems);
                     return $"{name}:{len}:{elems}";
+                }
+                if (TypeUtils.IsSetType(type))
+                {
+                    tc.values.TryGetValue(prefix + "_card", out var card);
+                    tc.values.TryGetValue(prefix + "_members", out var members);
+                    return $"{name}:{card}:{members}";
                 }
                 tc.values.TryGetValue(prefix, out var val);
                 return $"{name}:{val}";
