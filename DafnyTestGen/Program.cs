@@ -1081,10 +1081,11 @@ class Program
                 Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
         }
 
-        // Helper: build schedule entries for a given mode (all-comb or simple, with or without boundary)
+        // Helper: build schedule entries for a given mode (all-comb or simple, with or without boundary).
+        // minPopcount/maxPopcount: if > 0, only include combinations with popcount in [minPopcount, maxPopcount].
         void BuildScheduleEntries(
             List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule,
-            bool useAllComb, bool useBoundary)
+            bool useAllComb, bool useBoundary, int minPopcount = 0, int maxPopcount = 0)
         {
             for (int pi = 0; pi < preCombinations.Count; pi++)
             {
@@ -1104,6 +1105,13 @@ class Program
 
                     for (int mask = 1; mask <= totalCombinations; mask++)
                     {
+                        // Filter by popcount if bounds are set
+                        int pc = BitCount(mask);
+                        if (maxPopcount > 0 && pc > maxPopcount)
+                            continue;
+                        if (minPopcount > 0 && pc < minPopcount)
+                            continue;
+
                         var included = new List<int>();
                         for (int bit = 0; bit < n; bit++)
                             if ((mask & (1 << bit)) != 0)
@@ -1452,23 +1460,72 @@ class Program
 
         if (progressive)
         {
-            // --- Phase 1: all-combinations, no boundary ---
-            BuildScheduleEntries(testSchedule, useAllComb: true, useBoundary: false);
-            SortScheduleByPopcount(testSchedule, 0, testSchedule.Count);
             int n = dnfExprs.Count;
-            int totalCombinations = (1 << n) - 1;
-            Console.WriteLine($"  Phase 1: all-combinations ({n} clauses -> {totalCombinations} combinations)");
+            var phaseStart = DateTime.UtcNow;
 
-            await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count, testCases, baseConditionExclusions, knownUnsatLiteralMasks);
+            // --- Phase 1: tier-by-tier escalation ---
+            // Tier 1 (singletons) always runs.
+            // Higher tiers run only if clause count allows and time budget permits.
+            // Thresholds: pairs if n<=10, triples if n<=8, full combos if n<=5.
+            int maxTier = n; // upper bound on popcount
+            if (n > 10) maxTier = 1;      // many clauses: singletons only
+            else if (n > 8) maxTier = 2;  // pairs at most
+            else if (n > 5) maxTier = 3;  // up to triples
+            // else: full combinations (n <= 5)
+
+            Console.WriteLine($"  Phase 1: {n} clauses, max tier {maxTier}" +
+                (maxTier < n ? $" (capped from {(1 << n) - 1} combinations)" : $" ({(1 << n) - 1} combinations)"));
+
+            for (int tier = 1; tier <= maxTier; tier++)
+            {
+                if (TimedOut()) break;
+                if (maxTests > 0 && testCases.Count >= maxTests) break;
+
+                // Time budget check: for tier > 1, check that previous tiers used less than
+                // 50% of remaining time. This prevents slow Z3 queries from wasting time on
+                // higher-order combinations that are even more complex.
+                if (tier > 1)
+                {
+                    var elapsed = DateTime.UtcNow - phaseStart;
+                    var remaining = deadline - DateTime.UtcNow;
+                    if (elapsed > remaining)
+                    {
+                        Console.WriteLine($"  Tier {tier}: skipped (time budget exhausted)");
+                        break;
+                    }
+                }
+
+                int schedStart = testSchedule.Count;
+                BuildScheduleEntries(testSchedule, useAllComb: true, useBoundary: false,
+                    minPopcount: tier, maxPopcount: tier);
+                int tierEntries = testSchedule.Count - schedStart;
+                if (tierEntries == 0) continue;
+
+                SortScheduleByPopcount(testSchedule, schedStart, testSchedule.Count);
+
+                if (verbose || tier == 1 || tierEntries > 0)
+                    Console.WriteLine($"  Tier {tier} ({TierLabel(tier)}): {tierEntries} entries");
+
+                await SolveRange(testSchedule, schedStart, testSchedule.Count, testSchedule.Count,
+                    testCases, baseConditionExclusions, knownUnsatLiteralMasks);
+            }
+
             if (!verbose) Console.Write("\r                          \r"); // clear progress line
             Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
 
             if (testCases.Count < minTests && boundaryTiersPerPre.Count > 0
-                && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
+                && n <= 10 && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
             {
-                // --- Phase 2: add boundary tiers ---
+                // --- Phase 2: add boundary tiers (singletons only, for efficiency) ---
                 int phase2Start = testSchedule.Count;
-                BuildScheduleEntries(testSchedule, useAllComb: true, useBoundary: true);
+                BuildScheduleEntries(testSchedule, useAllComb: true, useBoundary: true,
+                    minPopcount: 1, maxPopcount: 1);
+                // Keep only boundary-tier entries (base entries are already in Phase 1)
+                for (int i = testSchedule.Count - 1; i >= phase2Start; i--)
+                {
+                    if (testSchedule[i].extraConstraints.Count == 0)
+                        testSchedule.RemoveAt(i);
+                }
                 SortScheduleByPopcount(testSchedule, phase2Start, testSchedule.Count);
                 int newEntries = testSchedule.Count - phase2Start;
                 Console.WriteLine($"  Phase 2: adding boundary analysis ({newEntries} new entries)");
@@ -1705,6 +1762,14 @@ class Program
         while (n != 0) { count += n & 1; n >>= 1; }
         return count;
     }
+
+    static string TierLabel(int tier) => tier switch
+    {
+        1 => "singletons",
+        2 => "pairs",
+        3 => "triples",
+        _ => $"{tier}-way"
+    };
 
     /// <summary>
     /// Sort a schedule by popcount of postMask (singletons first, then pairs, etc.),

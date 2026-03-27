@@ -140,8 +140,30 @@ static class BoundaryAnalysis
         if (paramTiers.Count == 0)
             return new List<(string, List<string>)> { ("", new List<string>()) };
 
-        // Cross-product of all parameter tiers (pairwise to limit explosion)
+        // Cross-product of all parameter tiers, capped to avoid explosion
         var result = new List<(string tierLabel, List<string> tierConstraints)>();
+        // Estimate cross-product size; if too large, keep only the parameters with fewest tiers
+        long estimated = 1;
+        foreach (var (_, t) in paramTiers)
+            estimated *= t.Count;
+        const int maxBoundaryTiers = 64;
+        if (estimated > maxBoundaryTiers)
+        {
+            // Greedily drop the parameter with the most tiers until feasible
+            var trimmed = new List<(string paramName, List<(string label, string smtConstraint)> tiers)>(paramTiers);
+            while (trimmed.Count > 0)
+            {
+                long sz = 1;
+                foreach (var (_, t) in trimmed) sz *= t.Count;
+                if (sz <= maxBoundaryTiers) break;
+                // Drop the parameter with the most tiers
+                int maxIdx = 0;
+                for (int i = 1; i < trimmed.Count; i++)
+                    if (trimmed[i].tiers.Count > trimmed[maxIdx].tiers.Count) maxIdx = i;
+                trimmed.RemoveAt(maxIdx);
+            }
+            paramTiers = trimmed;
+        }
         CrossProductTiers(paramTiers, 0, "", new List<string>(), result);
 
         if (verbose)
