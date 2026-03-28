@@ -383,7 +383,7 @@ static class TestEmitter
         HashSet<string>? mutableNames = null,
         Dictionary<string, List<string>>? enumDatatypes = null,
         ClassInfo? classInfo = null,
-        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null)
+        List<(string name, List<string> paramNames, string body, bool isClassMember)>? inlinablePredicates = null)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("// Auto-generated test cases by DafnyTestGen");
@@ -506,6 +506,24 @@ static class TestEmitter
                         {
                             emitValues[fieldName + "_elems"] = arrElems;
                             emitValues[$"tmp_{fieldName}_elems"] = arrElems;
+                        }
+                        sb.AppendLine(EmitVarDecl($"tmp_{fieldName}", fType, emitValues, enumDatatypes));
+                        sb.AppendLine($"    obj.{fieldName} := tmp_{fieldName};");
+                    }
+                    else if (TypeUtils.IsSeqType(fType) || TypeUtils.IsSetType(fType) || TypeUtils.IsMultisetType(fType) || TypeUtils.IsMapType(fType))
+                    {
+                        // Collection field: emit via EmitVarDecl with proper key remapping
+                        var emitValues = new Dictionary<string, string>(values);
+                        var isMut = mutableNames != null && mutableNames.Contains(fieldName);
+                        var prefix = isMut ? $"{fieldName}_pre" : fieldName;
+                        // Remap collection keys from field prefix to tmp name
+                        foreach (var suffix in new[] { "_len", "_elems", "_card", "_members", "_keys", "_vals" })
+                        {
+                            if (values.TryGetValue(prefix + suffix, out var v))
+                            {
+                                emitValues[$"tmp_{fieldName}" + suffix] = v;
+                                emitValues[fieldName + suffix] = v;
+                            }
                         }
                         sb.AppendLine(EmitVarDecl($"tmp_{fieldName}", fType, emitValues, enumDatatypes));
                         sb.AppendLine($"    obj.{fieldName} := tmp_{fieldName};");
@@ -670,6 +688,8 @@ static class TestEmitter
             // Replace old() references and field prefixes.
             var expectLiterals = literals
                 .Where(lit => !TypeUtils.IsSpecOnlyLiteral(lit))
+                // For autocontracts, Valid() is auto-injected as expect obj.Valid() — skip from literals
+                .Where(lit => !(classInfo is { IsAutoContracts: true } && Regex.IsMatch(lit.Trim(), @"^Valid\s*\(\s*\)$")))
                 .Select(lit => ReplaceOldReferences(lit, oldCaptures, arrayParamNames))
                 .ToList();
 
@@ -693,13 +713,18 @@ static class TestEmitter
                     // Replace bare member predicate/function calls with obj.pred()
                     if (inlinablePredicates != null)
                     {
-                        foreach (var (predName, _, _) in inlinablePredicates)
+                        foreach (var (predName, _, _, isClassMember) in inlinablePredicates)
                         {
+                            if (!isClassMember) continue; // skip module-level predicates
                             result = Regex.Replace(result,
                                 @"(?<![a-zA-Z_0-9.])(?<!obj\.)" + Regex.Escape(predName) + @"(?=\s*\()",
                                 $"obj.{predName}");
                         }
                     }
+                    // Also replace bare Valid() calls for class methods (may not be in inlinablePredicates)
+                    result = Regex.Replace(result,
+                        @"(?<![a-zA-Z_0-9.])(?<!obj\.)Valid(?=\s*\()",
+                        "obj.Valid");
                     return result;
                 }).ToList();
             }

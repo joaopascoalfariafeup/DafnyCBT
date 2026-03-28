@@ -444,7 +444,6 @@ class Program
             }
 
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
-            Console.WriteLine();
 
             var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program);
 
@@ -660,7 +659,7 @@ class Program
     /// For each test condition (PRE && POST_clause), we ask Z3 to find satisfying values.
     /// </summary>
     static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
-        List<(string name, List<string> paramNames, string body)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool hasNonInlinableFuncs = false,
+        List<(string name, List<string> paramNames, string body, bool isClassMember)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool hasNonInlinableFuncs = false,
         Dictionary<string, List<string>>? enumDatatypes = null, Dictionary<string, (string dtName, int ordinal)>? enumConstructors = null,
         ClassInfo? classInfo = null, Microsoft.Dafny.Program? program = null)
     {
@@ -707,7 +706,7 @@ class Program
         // Skip predicates with built-in SMT handlers (e.g., IsSorted) to preserve patterns
         // that the SMT translator recognizes.
         var originalDnfExprs = dnfExprs;
-        List<(string name, List<string> paramNames, string body)>? predsToInline = null;
+        List<(string name, List<string> paramNames, string body, bool isClassMember)>? predsToInline = null;
         if (!hasNonInlinableFuncs && inlinablePredicates != null && inlinablePredicates.Count > 0)
         {
             var smtBuiltins = new HashSet<string> { "IsSorted" };
@@ -1783,7 +1782,7 @@ class Program
     /// Inline predicates in an Expression. If the string representation changes after inlining,
     /// return a LeafExpression with the inlined text; otherwise return the original AST node.
     /// </summary>
-    static Expression InlineExpr(Expression expr, List<(string name, List<string> paramNames, string body)> predsToInline)
+    static Expression InlineExpr(Expression expr, List<(string name, List<string> paramNames, string body, bool isClassMember)> predsToInline)
     {
         var original = DnfEngine.ExprToString(expr);
         var inlined = DafnyParser.InlinePredicates(original, predsToInline);

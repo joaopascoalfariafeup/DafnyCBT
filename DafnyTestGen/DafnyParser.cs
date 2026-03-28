@@ -207,14 +207,16 @@ static class DafnyParser
     /// Finds non-recursive predicates and functions that can be inlined into postcondition literals.
     /// Returns a list of (name, paramNames, bodyString) for each inlinable predicate/function.
     /// </summary>
-    internal static List<(string name, List<string> paramNames, string body)> FindInlinablePredicates(
+    internal static List<(string name, List<string> paramNames, string body, bool isClassMember)> FindInlinablePredicates(
         Microsoft.Dafny.Program program)
     {
-        var result = new List<(string name, List<string> paramNames, string body)>();
+        var result = new List<(string name, List<string> paramNames, string body, bool isClassMember)>();
         foreach (var topDecl in AllTopLevelDecls(program))
         {
             if (topDecl is TopLevelDeclWithMembers cls)
             {
+                // Module-level predicates are in DefaultClassDecl; class members are in user classes
+                bool isClassMember = cls is not DefaultClassDecl;
                 foreach (var member in cls.Members)
                 {
                     if (member is Function func && func.Body != null)
@@ -223,7 +225,7 @@ static class DafnyParser
                         // Skip recursive functions (body references the function name)
                         if (bodyStr.Contains(func.Name + "(")) continue;
                         var paramNames = func.Ins.Select(p => p.Name).ToList();
-                        result.Add((func.Name, paramNames, bodyStr));
+                        result.Add((func.Name, paramNames, bodyStr, isClassMember));
                     }
                 }
             }
@@ -250,14 +252,14 @@ static class DafnyParser
     /// Applies repeatedly to handle nested inlining (up to a depth limit).
     /// </summary>
     internal static string InlinePredicates(string literal,
-        List<(string name, List<string> paramNames, string body)> predicates)
+        List<(string name, List<string> paramNames, string body, bool isClassMember)> predicates)
     {
         var result = literal;
         const int maxInlinedLength = 50_000; // safety limit to prevent exponential growth
         for (int pass = 0; pass < 3; pass++) // max 3 inlining passes for nested calls
         {
             var changed = false;
-            foreach (var (name, paramNames, body) in predicates)
+            foreach (var (name, paramNames, body, _) in predicates)
             {
                 // Find occurrences of name(args...)
                 var pattern = @"\b" + Regex.Escape(name) + @"\s*\(";
