@@ -115,6 +115,7 @@ static class TestValidator
             var failedIds = new HashSet<int>();
             ParseFailMarkers(batchOut, failedIds);
             var completedIds = ParseDoneMarkers(batchOut);
+            var skippedIds = ParseSkipMarkers(batchOut);
             var capturedVals = ParseValMarkers(batchOut);
 
             // ── Phase 3: re-check incomplete tests individually ─────────────────
@@ -143,7 +144,9 @@ static class TestValidator
                     }
                     else
                     {
-                        // Check for FAIL marker or non-zero exit
+                        // Check for SKIP, FAIL marker or non-zero exit
+                        var reSkipped = ParseSkipMarkers(reOut);
+                        skippedIds.UnionWith(reSkipped);
                         var reFailed = new HashSet<int>();
                         ParseFailMarkers(reOut, reFailed);
                         if (reFailed.Count > 0 || reCode != 0)
@@ -165,10 +168,16 @@ static class TestValidator
             // ── Report and split ────────────────────────────────────────────────
             var passingBlocks = new List<(string comment, string body)>();
             var failingBlocks = new List<(string comment, string body)>();
+            int skippedCount = 0;
 
             for (int i = 0; i < testBlocks.Count; i++)
             {
-                if (failedIds.Contains(i))
+                if (skippedIds.Contains(i))
+                {
+                    skippedCount++;
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: SKIP (precondition violated)");
+                }
+                else if (failedIds.Contains(i))
                 {
                     failingBlocks.Add(testBlocks[i]);
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: FAIL");
@@ -181,8 +190,9 @@ static class TestValidator
                 }
             }
 
-            Console.WriteLine(
-                $"[DafnyTestGen] Results: {passingBlocks.Count} passing, {failingBlocks.Count} failing");
+            var resultMsg = $"[DafnyTestGen] Results: {passingBlocks.Count} passing, {failingBlocks.Count} failing";
+            if (skippedCount > 0) resultMsg += $", {skippedCount} skipped (precondition violated)";
+            Console.WriteLine(resultMsg);
 
             return EmitSplitTests(sourceHeader, passingBlocks, failingBlocks);
         }
@@ -257,11 +267,22 @@ static class TestValidator
     static string ReplaceExpectsWithChecks(string body, int testId)
     {
         return Regex.Replace(body,
-            @"^(\s*)expect (.+);",
+            @"^(\s*)expect (.+);(?: // PRE-CHECK)?",
             m =>
             {
                 var indent = m.Groups[1].Value;
-                var expr = m.Groups[2].Value;
+                var exprAndComment = m.Groups[2].Value;
+                var isPreCheck = m.Value.Contains("// PRE-CHECK");
+
+                // Strip any trailing comment from the expression
+                var expr = Regex.Replace(exprAndComment, @"\s*//.*$", "").TrimEnd();
+
+                if (isPreCheck)
+                {
+                    // Precondition check: if violated, print SKIP and return early
+                    return $"{indent}if !({expr}) {{ print \"SKIP:{testId}\\n\"; print \"DONE:{testId}\\n\"; return; }}";
+                }
+
                 var checkLine = $"{indent}CheckExpect({expr}, {testId});";
 
                 // Detect `var == ExprWithFuncCall` and emit VAL print for the variable
@@ -311,6 +332,15 @@ static class TestValidator
     {
         var ids = new HashSet<int>();
         foreach (Match m in Regex.Matches(output, @"DONE:(\d+)"))
+            if (int.TryParse(m.Groups[1].Value, out var id))
+                ids.Add(id);
+        return ids;
+    }
+
+    static HashSet<int> ParseSkipMarkers(string output)
+    {
+        var ids = new HashSet<int>();
+        foreach (Match m in Regex.Matches(output, @"SKIP:(\d+)"))
             if (int.TryParse(m.Groups[1].Value, out var id))
                 ids.Add(id);
         return ids;

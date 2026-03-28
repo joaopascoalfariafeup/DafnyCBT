@@ -777,6 +777,40 @@ static class TestEmitter
                 sb.AppendLine($"    var check_{lhs} := {rhs};");
             }
 
+            // Emit precondition checks (used by check mode to discard invalid test cases)
+            foreach (var pre in preClauses)
+            {
+                var preStr = DnfEngine.ExprToString(pre);
+                if (TypeUtils.IsSpecOnlyLiteral(preStr)) continue; // skip fresh(), etc.
+                // For class methods: replace field refs with obj.field, predicates with obj.pred
+                if (classInfo != null)
+                {
+                    var allClassFields = classInfo.Fields
+                        .Concat(classInfo.ConstFields ?? new List<(string, string)>())
+                        .Concat(ghostVarFields);
+                    foreach (var (fn, _) in allClassFields)
+                        preStr = Regex.Replace(preStr,
+                            @"(?<![a-zA-Z_0-9])(?<!old_)(?<!obj\.)" + Regex.Escape(fn) + @"(?![a-zA-Z_0-9])",
+                            $"obj.{fn}");
+                    // Replace bare Valid() with obj.Valid()
+                    preStr = Regex.Replace(preStr,
+                        @"(?<![a-zA-Z_0-9.])(?<!obj\.)Valid(?=\s*\()",
+                        "obj.Valid");
+                    // Replace class-member predicates with obj.pred
+                    if (inlinablePredicates != null)
+                    {
+                        foreach (var (predName, _, _, isClassMember) in inlinablePredicates)
+                        {
+                            if (!isClassMember) continue;
+                            preStr = Regex.Replace(preStr,
+                                @"(?<![a-zA-Z_0-9.])(?<!obj\.)" + Regex.Escape(predName) + @"(?=\s*\()",
+                                $"obj.{predName}");
+                        }
+                    }
+                }
+                sb.AppendLine($"    expect {preStr}; // PRE-CHECK");
+            }
+
             // Call the method
             var callPrefix = classInfo != null ? "obj." : "";
             var callArgs = string.Join(", ", method.Ins.Select(i => i.Name));
