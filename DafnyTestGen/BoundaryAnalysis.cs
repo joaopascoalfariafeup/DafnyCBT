@@ -80,6 +80,19 @@ static class BoundaryAnalysis
                     tiers.Add(($"{sz}", constraint));
                 }
             }
+            else if (TypeUtils.IsMapType(type))
+            {
+                // Cap tiers for enum key types (can't have more keys than constructors)
+                var mapKeyType = TypeUtils.GetMapKeyType(type);
+                var keyUniverse = TypeUtils.GetElementUniverse(mapKeyType);
+                var maxCard = Math.Min(tierCount, keyUniverse.Length + 1);
+                var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                for (int sz = 0; sz < maxCard; sz++)
+                {
+                    var constraint = $"(= {smtName}_card {sz})";
+                    tiers.Add(($"{sz}", constraint));
+                }
+            }
             else if (type == "int" || type == "nat" || type == "T")
             {
                 // For mutable scalar fields, boundary tiers constrain the pre-state

@@ -305,6 +305,7 @@ class Program
 
         foreach (var method in methods)
         {
+            Console.WriteLine();
             Console.WriteLine($"[DafnyTestGen] Processing method: {method.Name}");
 
             // Check for unsupported parameter types
@@ -391,21 +392,19 @@ class Program
                 continue;
             }
 
-            // Skip methods with iset, map, or imap parameters (not supported in SMT translation)
-            // Note: set<T> and multiset<T> are now supported
-            var mapParam = allParams.FirstOrDefault(f =>
+            // Skip methods with iset or imap parameters (not supported in SMT translation)
+            // Note: set<T>, multiset<T>, and map<K,V> are now supported
+            var unsupportedCollParam = allParams.FirstOrDefault(f =>
             {
                 var typeStr = f.Type.ToString();
-                return typeStr.StartsWith("iset<")
-                    || typeStr.StartsWith("map<") || typeStr.StartsWith("imap<")
-                    || typeStr == "iset"
-                    || typeStr == "map" || typeStr == "imap";
+                return typeStr.StartsWith("iset<") || typeStr == "iset"
+                    || typeStr.StartsWith("imap<") || typeStr == "imap";
             });
-            if (mapParam != null)
+            if (unsupportedCollParam != null)
             {
-                var typeStr = mapParam.Type.ToString();
-                var kind = typeStr.StartsWith("iset") ? "iset" : "map";
-                Console.WriteLine($"  Skipping '{method.Name}': parameter '{mapParam.Name}' has {kind} type '{mapParam.Type}' (not yet supported)");
+                var typeStr = unsupportedCollParam.Type.ToString();
+                var kind = typeStr.StartsWith("iset") ? "iset" : "imap";
+                Console.WriteLine($"  Skipping '{method.Name}': parameter '{unsupportedCollParam.Name}' has {kind} type '{unsupportedCollParam.Type}' (not yet supported)");
                 Console.WriteLine();
                 continue;
             }
@@ -1347,6 +1346,19 @@ class Program
                         }
                     }
                 }
+                else if (TypeUtils.IsMapType(type))
+                {
+                    var prefix = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                    if (values.TryGetValue(prefix + "_card", out var cardVal))
+                    {
+                        eqParts.Add($"(= {prefix}_card {cardVal})");
+                    }
+                    if (values.TryGetValue(prefix + "_keys", out var keysStr))
+                    {
+                        foreach (var k in keysStr.Split(','))
+                            eqParts.Add($"(select {prefix}_domain {k})");
+                    }
+                }
                 else
                 {
                     var lookupName = mutableNames.Contains(name) ? $"{name}_pre" : name;
@@ -1714,6 +1726,13 @@ class Program
                     tc.values.TryGetValue(prefix + "_card", out var card);
                     tc.values.TryGetValue(prefix + "_members", out var members);
                     return $"{name}:{card}:{members}";
+                }
+                if (TypeUtils.IsMapType(type))
+                {
+                    tc.values.TryGetValue(prefix + "_card", out var card);
+                    tc.values.TryGetValue(prefix + "_keys", out var keys);
+                    tc.values.TryGetValue(prefix + "_vals", out var vals);
+                    return $"{name}:{card}:{keys}:{vals}";
                 }
                 tc.values.TryGetValue(prefix, out var val);
                 return $"{name}:{val}";

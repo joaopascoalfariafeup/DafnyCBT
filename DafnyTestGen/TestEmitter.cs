@@ -302,6 +302,21 @@ static class TestEmitter
             return $"    var {name}: {typeStr} := multiset{{}};";
         }
 
+        if (TypeUtils.IsMapType(typeStr))
+        {
+            if (values.TryGetValue(name + "_keys", out var keysStr) && values.TryGetValue(name + "_vals", out var valsStr))
+            {
+                var keyType = TypeUtils.GetMapKeyType(typeStr);
+                var valType = TypeUtils.GetMapValueType(typeStr);
+                var keys = keysStr.Split(',');
+                var vals = valsStr.Split(',');
+                var entries = keys.Zip(vals, (k, v) =>
+                    $"{FormatScalarValue(k.Trim(), keyType, enumDatatypes)} := {FormatScalarValue(v.Trim(), valType, enumDatatypes)}");
+                return $"    var {name}: {typeStr} := map[{string.Join(", ", entries)}];";
+            }
+            return $"    var {name}: {typeStr} := map[];";
+        }
+
         // Enum datatype: map integer ordinal back to constructor name
         if (enumDatatypes != null && enumDatatypes.TryGetValue(typeStr, out var scalarEnumCtors))
         {
@@ -701,7 +716,7 @@ static class TestEmitter
                     coveredOutputs.Add(outp.Name);
                 else if (TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr2) && int.TryParse(lenStr2, out var seqLen2) && seqLen2 >= 0)
                     coveredOutputs.Add(outp.Name);
-                else if ((TypeUtils.IsSetType(typeStr) || TypeUtils.IsMultisetType(typeStr)) && (values.ContainsKey(outp.Name + "_members") || values.ContainsKey(outp.Name + "_card")))
+                else if (!hasUninterpFuncs && (TypeUtils.IsSetType(typeStr) || TypeUtils.IsMultisetType(typeStr)) && (values.ContainsKey(outp.Name + "_members") || values.ContainsKey(outp.Name + "_card")))
                     coveredOutputs.Add(outp.Name);
             }
 
@@ -807,29 +822,68 @@ static class TestEmitter
                     }
                     coveredOutputs.Add(outp.Name);
                 }
-                else if (TypeUtils.IsSetType(typeStr) && values.TryGetValue(outp.Name + "_members", out var setMembers))
-                {
-                    var setElemType = TypeUtils.GetSetElementType(typeStr);
-                    var members = setMembers.Split(',').Select(m => FormatScalarValue(m.Trim(), setElemType, enumDatatypes));
-                    sb.AppendLine($"    expect {outp.Name} == {{{string.Join(", ", members)}}};");
-                    coveredOutputs.Add(outp.Name);
-                }
                 else if (TypeUtils.IsSetType(typeStr))
                 {
-                    sb.AppendLine($"    expect {outp.Name} == {{}};");
-                    coveredOutputs.Add(outp.Name);
-                }
-                else if (TypeUtils.IsMultisetType(typeStr) && values.TryGetValue(outp.Name + "_members", out var msetMembers))
-                {
-                    var msetElemType = TypeUtils.GetMultisetElementType(typeStr);
-                    var members = msetMembers.Split(',').Select(m => FormatScalarValue(m.Trim(), msetElemType, enumDatatypes));
-                    sb.AppendLine($"    expect {outp.Name} == multiset{{{string.Join(", ", members)}}};");
-                    coveredOutputs.Add(outp.Name);
+                    if (rhsCaptures.ContainsKey(outp.Name))
+                    {
+                        // Let the literal expect mechanism use check_outName
+                    }
+                    else if (values.TryGetValue(outp.Name + "_members", out var setMembers))
+                    {
+                        var setElemType = TypeUtils.GetSetElementType(typeStr);
+                        var members = setMembers.Split(',').Select(m => FormatScalarValue(m.Trim(), setElemType, enumDatatypes));
+                        sb.AppendLine($"    expect {outp.Name} == {{{string.Join(", ", members)}}};");
+                        coveredOutputs.Add(outp.Name);
+                    }
+                    else
+                    {
+                        sb.AppendLine($"    expect {outp.Name} == {{}};");
+                        coveredOutputs.Add(outp.Name);
+                    }
                 }
                 else if (TypeUtils.IsMultisetType(typeStr))
                 {
-                    sb.AppendLine($"    expect {outp.Name} == multiset{{}};");
-                    coveredOutputs.Add(outp.Name);
+                    if (rhsCaptures.ContainsKey(outp.Name))
+                    {
+                        // Let the literal expect mechanism use check_outName
+                    }
+                    else if (values.TryGetValue(outp.Name + "_members", out var msetMembers))
+                    {
+                        var msetElemType = TypeUtils.GetMultisetElementType(typeStr);
+                        var members = msetMembers.Split(',').Select(m => FormatScalarValue(m.Trim(), msetElemType, enumDatatypes));
+                        sb.AppendLine($"    expect {outp.Name} == multiset{{{string.Join(", ", members)}}};");
+                        coveredOutputs.Add(outp.Name);
+                    }
+                    else
+                    {
+                        sb.AppendLine($"    expect {outp.Name} == multiset{{}};");
+                        coveredOutputs.Add(outp.Name);
+                    }
+                }
+                else if (TypeUtils.IsMapType(typeStr))
+                {
+                    // Prefer literal expect with check variable (runtime evaluation) over
+                    // Z3-computed map values, since map postconditions may not be fully translated.
+                    if (rhsCaptures.ContainsKey(outp.Name))
+                    {
+                        // Let the literal expect mechanism use check_outName
+                    }
+                    else if (values.TryGetValue(outp.Name + "_keys", out var mapKeys) && values.TryGetValue(outp.Name + "_vals", out var mapVals))
+                    {
+                        var mapKeyType = TypeUtils.GetMapKeyType(typeStr);
+                        var mapValType = TypeUtils.GetMapValueType(typeStr);
+                        var keys = mapKeys.Split(',');
+                        var vals = mapVals.Split(',');
+                        var entries = keys.Zip(vals, (k, v) =>
+                            $"{FormatScalarValue(k.Trim(), mapKeyType, enumDatatypes)} := {FormatScalarValue(v.Trim(), mapValType, enumDatatypes)}");
+                        sb.AppendLine($"    expect {outp.Name} == map[{string.Join(", ", entries)}];");
+                        coveredOutputs.Add(outp.Name);
+                    }
+                    else
+                    {
+                        sb.AppendLine($"    expect {outp.Name} == map[];");
+                        coveredOutputs.Add(outp.Name);
+                    }
                 }
             }
             // Emit postcondition literals for outputs not covered by concrete values,

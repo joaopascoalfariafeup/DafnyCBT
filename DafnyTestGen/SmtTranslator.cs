@@ -151,6 +151,29 @@ static class SmtTranslator
                 sb.AppendLine($"  (and {string.Join(" ", conjuncts)}))");
             }
         }
+
+        // Map operation macros (maps encoded as domain (Array Int Bool) + values (Array Int V))
+        var hasMapParam = inputs.Concat(outputs).Any(v => TypeUtils.IsMapType(v.Type));
+        if (hasMapParam)
+        {
+            sb.AppendLine();
+            sb.AppendLine("; Map operations over domain (Array Int Bool) + values (Array Int V) encoding");
+            // Collect union of all map key universes for pointwise expansion
+            var mapUniverseValues = inputs.Concat(outputs)
+                .Where(v => TypeUtils.IsMapType(v.Type))
+                .SelectMany(v => TypeUtils.GetElementUniverse(TypeUtils.GetMapKeyType(v.Type)))
+                .Distinct().OrderBy(x => x).ToArray();
+            // MapMerge: right-biased union — domain = d1 || d2, value = ite(d2, v2, v1)
+            sb.AppendLine("(define-fun MapMergeDomain ((d1 (Array Int Bool)) (d2 (Array Int Bool))) (Array Int Bool)");
+            sb.AppendLine($"  ((_ map or) d1 d2))");
+            sb.AppendLine("(define-fun MapMergeValues ((d1 (Array Int Bool)) (v1 (Array Int Int)) (d2 (Array Int Bool)) (v2 (Array Int Int))) (Array Int Int)");
+            {
+                var result = "((as const (Array Int Int)) 0)";
+                foreach (var i in mapUniverseValues)
+                    result = $"(store {result} {i} (ite (select d2 {i}) (select v2 {i}) (select v1 {i})))";
+                sb.AppendLine($"  {result})");
+            }
+        }
         sb.AppendLine();
 
         // Declare variables for inputs and outputs.
@@ -208,6 +231,49 @@ static class SmtTranslator
                 for (int i = 0; i < universe.Length; i++)
                     storeChain = $"(store {storeChain} {universe[i]} {name}_e{i})";
                 sb.AppendLine($"(define-fun {name} () (Array Int Int) {storeChain})");
+            }
+            else if (TypeUtils.IsMapType(type))
+            {
+                // Maps are encoded as two parallel arrays over bounded key universe:
+                //   domain (Array K Bool) — which keys are present
+                //   values (Array K V)    — the value for each key
+                var keyType = TypeUtils.GetMapKeyType(type);
+                var valType = TypeUtils.GetMapValueType(type);
+                var keyUniverse = TypeUtils.GetElementUniverse(keyType);
+                var valSmtType = TypeUtils.DafnyTypeToSmt(valType);
+                // Per-key variables: presence (Bool) and value
+                for (int i = 0; i < keyUniverse.Length; i++)
+                {
+                    sb.AppendLine($"(declare-const {name}_p{i} Bool)");
+                    sb.AppendLine($"(declare-const {name}_v{i} {valSmtType})");
+                }
+                // Domain array (like a set)
+                var domainChain = "((as const (Array Int Bool)) false)";
+                for (int i = 0; i < keyUniverse.Length; i++)
+                    domainChain = $"(store {domainChain} {keyUniverse[i]} {name}_p{i})";
+                sb.AppendLine($"(define-fun {name}_domain () (Array Int Bool) {domainChain})");
+                // Values array
+                var defaultVal = valSmtType == "Bool" ? "false" : valSmtType == "Real" ? "0.0" : "0";
+                var valuesChain = $"((as const (Array Int {valSmtType})) {defaultVal})";
+                for (int i = 0; i < keyUniverse.Length; i++)
+                    valuesChain = $"(store {valuesChain} {keyUniverse[i]} {name}_v{i})";
+                sb.AppendLine($"(define-fun {name}_values () (Array Int {valSmtType}) {valuesChain})");
+                // Value type constraints on per-key value variables
+                for (int i = 0; i < keyUniverse.Length; i++)
+                {
+                    if (valType == "nat")
+                        sb.AppendLine($"(assert (>= {name}_v{i} 0))");
+                    if (valType == "char")
+                    {
+                        sb.AppendLine($"(assert (>= {name}_v{i} 32))");
+                        sb.AppendLine($"(assert (<= {name}_v{i} 126))");
+                    }
+                    if (_enumDatatypes.TryGetValue(valType, out var valEnumCtors))
+                    {
+                        sb.AppendLine($"(assert (>= {name}_v{i} 0))");
+                        sb.AppendLine($"(assert (<= {name}_v{i} {valEnumCtors.Count - 1}))");
+                    }
+                }
             }
             else
             {
@@ -347,6 +413,21 @@ static class SmtTranslator
             }
         }
 
+        // Map cardinality helpers.
+        // Maps use per-key presence variables (name_p0..name_pN), so cardinality is
+        // the count of true presence variables.
+        foreach (var (name, type) in inputs.Concat(outputs).ToList())
+        {
+            if (TypeUtils.IsMapType(type))
+            {
+                var keyType = TypeUtils.GetMapKeyType(type);
+                var keyUniverse = TypeUtils.GetElementUniverse(keyType);
+                var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                var cardTerms = string.Join(" ", Enumerable.Range(0, keyUniverse.Length).Select(i => $"(ite {smtName}_p{i} 1 0)"));
+                sb.AppendLine($"(define-fun {smtName}_card () Int (+ {cardTerms}))");
+            }
+        }
+
         sb.AppendLine();
 
         // Reset well-formedness guards, uninterpreted functions, and translation status
@@ -356,6 +437,10 @@ static class SmtTranslator
 
         // Collect assertions in a separate buffer so we can discover uninterpreted functions first
         var assertions = new System.Text.StringBuilder();
+
+        // For postconditions, include outputs in the type-lookup list so that
+        // IsMapExprAst / IsSetExprAst / etc. can resolve output variable types.
+        var inputsAndOutputs = inputs.Concat(outputs).ToList();
 
         // Encode postcondition literals (skip fresh() which is specification-only).
         // ExprToSmt handles old()/mutable renaming at AST level.
@@ -367,7 +452,7 @@ static class SmtTranslator
                 assertions.AppendLine($"; Skipped specification-only literal: {litStr}");
                 continue;
             }
-            var smtExpr = ExprToSmt(literal, inputs, mutableNames, isPostContext: true);
+            var smtExpr = ExprToSmt(literal, inputsAndOutputs, mutableNames, isPostContext: true);
             if (smtExpr != null)
                 assertions.AppendLine($"(assert {smtExpr})");
             else
@@ -388,7 +473,7 @@ static class SmtTranslator
             {
                 var bgStr = DnfEngine.ExprToString(bgPost);
                 if (TypeUtils.IsSpecOnlyLiteral(bgStr)) continue;
-                var smtExpr = ExprToSmt(bgPost, inputs, mutableNames, isPostContext: true);
+                var smtExpr = ExprToSmt(bgPost, inputsAndOutputs, mutableNames, isPostContext: true);
                 if (smtExpr != null)
                     assertions.AppendLine($"(assert {smtExpr})");
             }
@@ -487,7 +572,7 @@ static class SmtTranslator
             {
                 var wfBefore = _wfGuards.Count;
                 // Exclusions are postcondition literals — translate for post-state
-                var smtExpr = ExprToSmt(excl, inputs, mutableNames, isPostContext: true);
+                var smtExpr = ExprToSmt(excl, inputsAndOutputs, mutableNames, isPostContext: true);
                 if (smtExpr != null)
                 {
                     // Collect WF guards generated specifically by this exclusion
@@ -531,7 +616,7 @@ static class SmtTranslator
         // Explicitly request scalar output values (get-model may omit them)
         foreach (var (name, type) in outputs)
         {
-            if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type) && !TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type))
+            if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type) && !TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type) && !TypeUtils.IsMapType(type))
                 sb.AppendLine($"(get-value ({name}))");
         }
 
@@ -574,6 +659,17 @@ static class SmtTranslator
                 var universe = TypeUtils.GetElementUniverse(elemType);
                 foreach (var v in universe)
                     sb.AppendLine($"(get-value ((select {smtName} {v})))");
+            }
+            else if (TypeUtils.IsMapType(type))
+            {
+                var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                var keyType = TypeUtils.GetMapKeyType(type);
+                var keyUniverse = TypeUtils.GetElementUniverse(keyType);
+                foreach (var v in keyUniverse)
+                {
+                    sb.AppendLine($"(get-value ((select {smtName}_domain {v})))");
+                    sb.AppendLine($"(get-value ((select {smtName}_values {v})))");
+                }
             }
         }
 
@@ -656,6 +752,16 @@ static class SmtTranslator
                     var msetSmt = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
                     if (msetSmt == null) goto fallback;
                     var memberExpr = $"(> (select {msetSmt} {valSmt}) 0)";
+                    return bin.Op == BinaryExpr.Opcode.NotIn ? $"(not {memberExpr})" : memberExpr;
+                }
+
+                // Check if RHS is a map type (k in m tests domain membership)
+                var rhsIsMap = rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsMapType(v.Type));
+                if (rhsIsMap)
+                {
+                    var mapSmt = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
+                    if (mapSmt == null) goto fallback;
+                    var memberExpr = $"(select {mapSmt}_domain {valSmt})";
                     return bin.Op == BinaryExpr.Opcode.NotIn ? $"(not {memberExpr})" : memberExpr;
                 }
 
@@ -833,6 +939,15 @@ static class SmtTranslator
                 var idxSmt = ExprToSmt(seqSel.E0, inputs, mutableNames, isPostContext, insideOld);
                 if (idxSmt == null) goto fallback;
                 return $"(select {seqBaseSmt} {idxSmt})";
+            }
+
+            var isMap = origName != null && inputs.Any(v => v.Name == origName && TypeUtils.IsMapType(v.Type));
+            if (isMap && seqSel.SelectOne && seqSel.E0 != null)
+            {
+                // m[k] → (select m_values k) — returns the value
+                var idxSmt = ExprToSmt(seqSel.E0, inputs, mutableNames, isPostContext, insideOld);
+                if (idxSmt == null) goto fallback;
+                return $"(select {seqBaseSmt}_values {idxSmt})";
             }
 
             if (seqSel.SelectOne)
@@ -1065,6 +1180,20 @@ static class SmtTranslator
                 return true;
         }
         if (expr is OldExpr oldE) return IsMultisetExprAst(oldE.Expr, inputs);
+        return false;
+    }
+
+    static bool IsMapExprAst(Expression expr, List<(string Name, string Type)> inputs)
+    {
+        expr = UnwrapExpr(expr);
+        var name = GetOriginalName(expr);
+        if (name != null)
+        {
+            var match = inputs.FirstOrDefault(v => v.Name == name);
+            if (match != default && TypeUtils.IsMapType(match.Type))
+                return true;
+        }
+        if (expr is OldExpr oldE) return IsMapExprAst(oldE.Expr, inputs);
         return false;
     }
 
@@ -1534,6 +1663,11 @@ static class SmtTranslator
                 if (isMultisetIn && !hasSlice)
                     return $"(> (select {seqName} {valExpr}) 0)";
 
+                // Check if RHS is a map (k in m tests domain membership)
+                var isMapIn = inputs.Any(v => v.Name == seqName && TypeUtils.IsMapType(v.Type));
+                if (isMapIn && !hasSlice)
+                    return $"(select {seqName}_domain {valExpr})";
+
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
                 if (sliceBound != null)
@@ -1585,6 +1719,11 @@ static class SmtTranslator
             {
                 return $"{innerStr}_card";
             }
+            var isMap = inputs.Any(v => v.Name == innerStr && TypeUtils.IsMapType(v.Type));
+            if (isMap)
+            {
+                return $"{innerStr}_card";
+            }
             var inner = DafnyExprToSmt(innerStr, inputs);
             if (inner != null) return $"(seq.len {inner})";
         }
@@ -1612,6 +1751,10 @@ static class SmtTranslator
                 var isMultisetAccess = inputs.Any(v => v.Name == seqName && TypeUtils.IsMultisetType(v.Type));
                 if (isMultisetAccess)
                     return $"(select {seqName} {idx})";
+                // Check if this is a map (m[k] returns value)
+                var isMapAccess = inputs.Any(v => v.Name == seqName && TypeUtils.IsMapType(v.Type));
+                if (isMapAccess)
+                    return $"(select {seqName}_values {idx})";
                 // Check if this is an array param (needs _seq suffix) or already a seq
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = isArray ? $"{seqName}_seq" : seqName;
