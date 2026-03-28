@@ -67,6 +67,16 @@ static class BoundaryAnalysis
                     tiers.Add(($"{sz}", constraint));
                 }
             }
+            else if (TypeUtils.IsMultisetType(type))
+            {
+                // Cardinality tiers: 0, 1, ..., tierCount-1
+                var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                for (int sz = 0; sz < tierCount; sz++)
+                {
+                    var constraint = $"(= {smtName}_card {sz})";
+                    tiers.Add(($"{sz}", constraint));
+                }
+            }
             else if (type == "int" || type == "nat" || type == "T")
             {
                 // For mutable scalar fields, boundary tiers constrain the pre-state

@@ -34,6 +34,16 @@ static class SmtTranslator
         return false;
     }
 
+    static bool IsMultisetExpr(string dafnyExpr, List<(string Name, string Type)> inputs)
+    {
+        dafnyExpr = dafnyExpr.Trim();
+        var match = inputs.FirstOrDefault(v => v.Name == dafnyExpr);
+        if (match != default && TypeUtils.IsMultisetType(match.Type))
+            return true;
+        if (dafnyExpr.StartsWith("multiset{")) return true;
+        return false;
+    }
+
     // Maximum bounded sequence length used in SMT queries
     internal const int MAX_SEQ_LEN = 8;
 
@@ -89,6 +99,53 @@ static class SmtTranslator
             sb.AppendLine("(define-fun SetDifference ((a (Array Int Bool)) (b (Array Int Bool))) (Array Int Bool)");
             sb.AppendLine($"  ((_ map and) a ((_ map not) b)))");
         }
+
+        // Multiset operation macros (multisets encoded as (Array Int Int) — counts)
+        var hasMultisetParam = inputs.Concat(outputs).Any(v => TypeUtils.IsMultisetType(v.Type));
+        if (hasMultisetParam)
+        {
+            sb.AppendLine();
+            sb.AppendLine("; Multiset operations over (Array Int Int) encoding (element -> count)");
+            sb.AppendLine("(define-fun EmptyMultiset () (Array Int Int) ((as const (Array Int Int)) 0))");
+            sb.AppendLine("(define-fun MultisetMember ((x Int) (m (Array Int Int))) Bool (> (select m x) 0))");
+            // Pointwise expansion over bounded universe — avoids (_ map) which requires
+            // declare-fun (not define-fun), and the forall axioms that entails cause Z3
+            // to return "unknown". Since our universe is {0..MAX_SET_UNIVERSE-1}, we can
+            // expand each operation as a chain of store expressions.
+            var indices = Enumerable.Range(0, MAX_SET_UNIVERSE);
+            string PointwiseArray(string aName, string bName, string op)
+            {
+                // Build: (store (store ... (const 0) 0 (op a[0] b[0])) 1 (op a[1] b[1])) ...
+                var result = "((as const (Array Int Int)) 0)";
+                foreach (var i in indices)
+                    result = $"(store {result} {i} ({op} (select {aName} {i}) (select {bName} {i})))";
+                return result;
+            }
+            sb.AppendLine("(define-fun MultisetUnion ((a (Array Int Int)) (b (Array Int Int))) (Array Int Int)");
+            sb.AppendLine($"  {PointwiseArray("a", "b", "+")})");
+            sb.AppendLine("(define-fun MultisetIntersection ((a (Array Int Int)) (b (Array Int Int))) (Array Int Int)");
+            // min(a,b) expanded as: ite(<= a b) a b
+            {
+                var result = "((as const (Array Int Int)) 0)";
+                foreach (var i in indices)
+                    result = $"(store {result} {i} (ite (<= (select a {i}) (select b {i})) (select a {i}) (select b {i})))";
+                sb.AppendLine($"  {result})");
+            }
+            sb.AppendLine("(define-fun MultisetDifference ((a (Array Int Int)) (b (Array Int Int))) (Array Int Int)");
+            // max(a-b, 0) expanded as: ite(>= a b) (- a b) 0
+            {
+                var result = "((as const (Array Int Int)) 0)";
+                foreach (var i in indices)
+                    result = $"(store {result} {i} (ite (>= (select a {i}) (select b {i})) (- (select a {i}) (select b {i})) 0))";
+                sb.AppendLine($"  {result})");
+            }
+            sb.AppendLine("(define-fun SubsetOfMultiset ((a (Array Int Int)) (b (Array Int Int))) Bool");
+            // Pointwise: all a[i] <= b[i]
+            {
+                var conjuncts = indices.Select(i => $"(<= (select a {i}) (select b {i}))");
+                sb.AppendLine($"  (and {string.Join(" ", conjuncts)}))");
+            }
+        }
         sb.AppendLine();
 
         // Declare variables for inputs and outputs.
@@ -133,6 +190,17 @@ static class SmtTranslator
                     sb.AppendLine($"(assert (>= {name}_post 0))");
                     sb.AppendLine($"(assert (<= {name}_post {enumCtorsMut.Count - 1}))");
                 }
+            }
+            else if (TypeUtils.IsMultisetType(type))
+            {
+                // Construct multiset from zero-default base with per-element variables.
+                // This ensures out-of-universe indices are always 0, avoiding forall constraints.
+                for (int i = 0; i < MAX_SET_UNIVERSE; i++)
+                    sb.AppendLine($"(declare-const {name}_e{i} Int)");
+                var storeChain = "((as const (Array Int Int)) 0)";
+                for (int i = 0; i < MAX_SET_UNIVERSE; i++)
+                    storeChain = $"(store {storeChain} {i} {name}_e{i})";
+                sb.AppendLine($"(define-fun {name} () (Array Int Int) {storeChain})");
             }
             else
             {
@@ -231,6 +299,38 @@ static class SmtTranslator
                     var postName = $"{name}_post";
                     sb.AppendLine($"(assert (forall ((x Int)) (=> (select {postName} x) (or {universeDisjuncts}))))");
                     var postCardTerms = string.Join(" ", Enumerable.Range(0, MAX_SET_UNIVERSE).Select(i => $"(ite (select {postName} {i}) 1 0)"));
+                    sb.AppendLine($"(define-fun {postName}_card () Int (+ {postCardTerms}))");
+                }
+            }
+        }
+
+        // Bound multiset element variables and define cardinality helpers.
+        // Multisets are constructed from zero-default base with per-element variables (name_e0..name_e7),
+        // so no forall constraints are needed — out-of-universe indices are automatically 0.
+        foreach (var (name, type) in inputs.Concat(outputs).ToList())
+        {
+            if (TypeUtils.IsMultisetType(type))
+            {
+                var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                // Bounds on per-element variables: 0 <= count <= MAX_SET_UNIVERSE
+                for (int i = 0; i < MAX_SET_UNIVERSE; i++)
+                {
+                    sb.AppendLine($"(assert (>= {smtName}_e{i} 0))");
+                    sb.AppendLine($"(assert (<= {smtName}_e{i} {MAX_SET_UNIVERSE}))");
+                }
+                // Cardinality: sum of element variables
+                var cardTerms = string.Join(" ", Enumerable.Range(0, MAX_SET_UNIVERSE).Select(i => $"{smtName}_e{i}"));
+                sb.AppendLine($"(define-fun {smtName}_card () Int (+ {cardTerms}))");
+
+                if (mutableNames.Contains(name))
+                {
+                    var postName = $"{name}_post";
+                    for (int i = 0; i < MAX_SET_UNIVERSE; i++)
+                    {
+                        sb.AppendLine($"(assert (>= {postName}_e{i} 0))");
+                        sb.AppendLine($"(assert (<= {postName}_e{i} {MAX_SET_UNIVERSE}))");
+                    }
+                    var postCardTerms = string.Join(" ", Enumerable.Range(0, MAX_SET_UNIVERSE).Select(i => $"{postName}_e{i}"));
                     sb.AppendLine($"(define-fun {postName}_card () Int (+ {postCardTerms}))");
                 }
             }
@@ -420,7 +520,7 @@ static class SmtTranslator
         // Explicitly request scalar output values (get-model may omit them)
         foreach (var (name, type) in outputs)
         {
-            if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type) && !TypeUtils.IsSetType(type))
+            if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type) && !TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type))
                 sb.AppendLine($"(get-value ({name}))");
         }
 
@@ -449,6 +549,12 @@ static class SmtTranslator
                 }
             }
             else if (TypeUtils.IsSetType(type))
+            {
+                var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                for (int i = 0; i < MAX_SET_UNIVERSE; i++)
+                    sb.AppendLine($"(get-value ((select {smtName} {i})))");
+            }
+            else if (TypeUtils.IsMultisetType(type))
             {
                 var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
                 for (int i = 0; i < MAX_SET_UNIVERSE; i++)
@@ -528,6 +634,16 @@ static class SmtTranslator
                     return bin.Op == BinaryExpr.Opcode.NotIn ? $"(not {memberExpr})" : memberExpr;
                 }
 
+                // Check if RHS is a multiset type
+                var rhsIsMultiset = rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsMultisetType(v.Type));
+                if (rhsIsMultiset)
+                {
+                    var msetSmt = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
+                    if (msetSmt == null) goto fallback;
+                    var memberExpr = $"(> (select {msetSmt} {valSmt}) 0)";
+                    return bin.Op == BinaryExpr.Opcode.NotIn ? $"(not {memberExpr})" : memberExpr;
+                }
+
                 // Sequence/array in
                 var seqInfo = ResolveSeqForContains(bin.E1, inputs, mutableNames, isPostContext, insideOld);
                 if (seqInfo == null) goto fallback;
@@ -562,20 +678,34 @@ static class SmtTranslator
                 BinaryExpr.Opcode.Iff => $"(= {left} {right})",
                 BinaryExpr.Opcode.Eq => $"(= {left} {right})",
                 BinaryExpr.Opcode.Neq => $"(not (= {left} {right}))",
-                BinaryExpr.Opcode.Lt => IsSetExprAst(bin.E0, inputs)
+                BinaryExpr.Opcode.Lt => IsMultisetExprAst(bin.E0, inputs)
+                    ? $"(and (SubsetOfMultiset {left} {right}) (not (= {left} {right})))"
+                    : IsSetExprAst(bin.E0, inputs)
                     ? $"(and (SubsetOf {left} {right}) (not (= {left} {right})))" : $"(< {left} {right})",
-                BinaryExpr.Opcode.Le => IsSetExprAst(bin.E0, inputs)
+                BinaryExpr.Opcode.Le => IsMultisetExprAst(bin.E0, inputs)
+                    ? $"(SubsetOfMultiset {left} {right})"
+                    : IsSetExprAst(bin.E0, inputs)
                     ? $"(SubsetOf {left} {right})" : $"(<= {left} {right})",
-                BinaryExpr.Opcode.Gt => IsSetExprAst(bin.E0, inputs)
+                BinaryExpr.Opcode.Gt => IsMultisetExprAst(bin.E0, inputs)
+                    ? $"(and (SubsetOfMultiset {right} {left}) (not (= {left} {right})))"
+                    : IsSetExprAst(bin.E0, inputs)
                     ? $"(and (SubsetOf {right} {left}) (not (= {left} {right})))" : $"(> {left} {right})",
-                BinaryExpr.Opcode.Ge => IsSetExprAst(bin.E0, inputs)
+                BinaryExpr.Opcode.Ge => IsMultisetExprAst(bin.E0, inputs)
+                    ? $"(SubsetOfMultiset {right} {left})"
+                    : IsSetExprAst(bin.E0, inputs)
                     ? $"(SubsetOf {right} {left})" : $"(>= {left} {right})",
-                BinaryExpr.Opcode.Add => IsSetExprAst(bin.E0, inputs)
+                BinaryExpr.Opcode.Add => IsMultisetExprAst(bin.E0, inputs)
+                    ? $"(MultisetUnion {left} {right})"
+                    : IsSetExprAst(bin.E0, inputs)
                     ? $"(SetUnion {left} {right})" : IsSeqExprAst(bin.E0, inputs)
                     ? $"(seq.++ {left} {right})" : $"(+ {left} {right})",
-                BinaryExpr.Opcode.Sub => IsSetExprAst(bin.E0, inputs)
+                BinaryExpr.Opcode.Sub => IsMultisetExprAst(bin.E0, inputs)
+                    ? $"(MultisetDifference {left} {right})"
+                    : IsSetExprAst(bin.E0, inputs)
                     ? $"(SetDifference {left} {right})" : $"(- {left} {right})",
-                BinaryExpr.Opcode.Mul => IsSetExprAst(bin.E0, inputs)
+                BinaryExpr.Opcode.Mul => IsMultisetExprAst(bin.E0, inputs)
+                    ? $"(MultisetIntersection {left} {right})"
+                    : IsSetExprAst(bin.E0, inputs)
                     ? $"(SetIntersection {left} {right})" : $"(* {left} {right})",
                 BinaryExpr.Opcode.Div => $"(div {left} {right})",
                 BinaryExpr.Opcode.Mod => $"(mod {left} {right})",
@@ -673,13 +803,22 @@ static class SmtTranslator
             return $"({quantifier} ({bindings}) {bodySmt})";
         }
 
-        // SeqSelectExpr: a[i], a[lo..hi], a[..]
+        // SeqSelectExpr: a[i], a[lo..hi], a[..], M[x] (multiset count)
         if (expr is SeqSelectExpr seqSel)
         {
             var origName = GetOriginalName(seqSel.Seq);
             var isArray = origName != null && inputs.Any(v => v.Name == origName && TypeUtils.IsArrayType(v.Type));
+            var isMultiset = origName != null && inputs.Any(v => v.Name == origName && TypeUtils.IsMultisetType(v.Type));
             var seqBaseSmt = ExprToSmt(seqSel.Seq, inputs, mutableNames, isPostContext, insideOld);
             if (seqBaseSmt == null) goto fallback;
+
+            if (isMultiset && seqSel.SelectOne && seqSel.E0 != null)
+            {
+                // M[x] → (select M x) — returns the count/multiplicity
+                var idxSmt = ExprToSmt(seqSel.E0, inputs, mutableNames, isPostContext, insideOld);
+                if (idxSmt == null) goto fallback;
+                return $"(select {seqBaseSmt} {idxSmt})";
+            }
 
             if (seqSel.SelectOne)
             {
@@ -788,6 +927,22 @@ static class SmtTranslator
             return result;
         }
 
+        // MultiSetDisplayExpr: multiset{e1, e2, ...} — multiset literal
+        if (expr is MultiSetDisplayExpr multisetDisplay)
+        {
+            if (multisetDisplay.Elements.Count == 0)
+                return "EmptyMultiset";
+            // Build by incrementing counts: (store M e (+ (select M e) 1))
+            var result = "EmptyMultiset";
+            foreach (var elem in multisetDisplay.Elements)
+            {
+                var elemSmt = ExprToSmt(elem, inputs, mutableNames, isPostContext, insideOld);
+                if (elemSmt == null) goto fallback;
+                result = $"(store {result} {elemSmt} (+ (select {result} {elemSmt}) 1))";
+            }
+            return result;
+        }
+
     fallback:
         // Fallback: convert to string and use the string-based translator
 
@@ -881,6 +1036,20 @@ static class SmtTranslator
                 return true;
         }
         if (expr is OldExpr oldE) return IsSetExprAst(oldE.Expr, inputs);
+        return false;
+    }
+
+    static bool IsMultisetExprAst(Expression expr, List<(string Name, string Type)> inputs)
+    {
+        expr = UnwrapExpr(expr);
+        var name = GetOriginalName(expr);
+        if (name != null)
+        {
+            var match = inputs.FirstOrDefault(v => v.Name == name);
+            if (match != default && TypeUtils.IsMultisetType(match.Type))
+                return true;
+        }
+        if (expr is OldExpr oldE) return IsMultisetExprAst(oldE.Expr, inputs);
         return false;
     }
 
@@ -1032,6 +1201,27 @@ static class SmtTranslator
         // Handle empty set literal: {}
         if (expr == "{}")
             return "EmptySet";
+
+        // Handle empty multiset literal: multiset{}
+        if (expr == "multiset{}")
+            return "EmptyMultiset";
+
+        // Handle multiset literal: multiset{e1, e2, ...}
+        if (expr.StartsWith("multiset{") && expr.EndsWith("}"))
+        {
+            var inner = expr.Substring(9, expr.Length - 10).Trim();
+            if (inner.Length == 0)
+                return "EmptyMultiset";
+            var elems = SplitArgs(inner);
+            var result = "EmptyMultiset";
+            foreach (var elem in elems)
+            {
+                var elemSmt = DafnyExprToSmt(elem.Trim(), inputs);
+                if (elemSmt == null) return null;
+                result = $"(store {result} {elemSmt} (+ (select {result} {elemSmt}) 1))";
+            }
+            return result;
+        }
 
         // Handle negation
         if (expr.StartsWith("!(") && expr.EndsWith(")"))
@@ -1290,6 +1480,11 @@ static class SmtTranslator
                 if (isSet && !hasSlice)
                     return $"(not (select {seqName} {valExpr}))";
 
+                // Check if RHS is a multiset
+                var isMultisetNi = inputs.Any(v => v.Name == seqName && TypeUtils.IsMultisetType(v.Type));
+                if (isMultisetNi && !hasSlice)
+                    return $"(not (> (select {seqName} {valExpr}) 0))";
+
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
                 if (sliceBound != null)
@@ -1318,6 +1513,11 @@ static class SmtTranslator
                 var isSet = inputs.Any(v => v.Name == seqName && TypeUtils.IsSetType(v.Type));
                 if (isSet && !hasSlice)
                     return $"(select {seqName} {valExpr})";
+
+                // Check if RHS is a multiset
+                var isMultisetIn = inputs.Any(v => v.Name == seqName && TypeUtils.IsMultisetType(v.Type));
+                if (isMultisetIn && !hasSlice)
+                    return $"(> (select {seqName} {valExpr}) 0)";
 
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
@@ -1358,12 +1558,17 @@ static class SmtTranslator
         if (seqLenMatch.Success)
         {
             var innerStr = seqLenMatch.Groups[1].Value.Trim();
-            // Check if inner expression is a set variable
+            // Check if inner expression is a set or multiset variable
             var isSet = inputs.Any(v => v.Name == innerStr && TypeUtils.IsSetType(v.Type));
             if (isSet)
             {
                 var smtName = inputs.Any(v => v.Name == innerStr) ? innerStr : innerStr;
                 return $"{smtName}_card";
+            }
+            var isMultiset = inputs.Any(v => v.Name == innerStr && TypeUtils.IsMultisetType(v.Type));
+            if (isMultiset)
+            {
+                return $"{innerStr}_card";
             }
             var inner = DafnyExprToSmt(innerStr, inputs);
             if (inner != null) return $"(seq.len {inner})";
@@ -1380,7 +1585,7 @@ static class SmtTranslator
                 return $"(seq.extract {seqExpr} {from} (- {to} {from}))";
         }
 
-        // Handle seq[i] (sequence/array element access)
+        // Handle seq[i] (sequence/array element access) or M[x] (multiset count)
         var seqAccessMatch = Regex.Match(expr, @"^(\w+)\[(.+)\]$");
         if (seqAccessMatch.Success)
         {
@@ -1388,6 +1593,10 @@ static class SmtTranslator
             var idx = DafnyExprToSmt(seqAccessMatch.Groups[2].Value, inputs);
             if (idx != null)
             {
+                // Check if this is a multiset (M[x] returns count)
+                var isMultisetAccess = inputs.Any(v => v.Name == seqName && TypeUtils.IsMultisetType(v.Type));
+                if (isMultisetAccess)
+                    return $"(select {seqName} {idx})";
                 // Check if this is an array param (needs _seq suffix) or already a seq
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = isArray ? $"{seqName}_seq" : seqName;

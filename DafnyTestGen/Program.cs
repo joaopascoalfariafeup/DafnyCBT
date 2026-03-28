@@ -391,22 +391,20 @@ class Program
                 continue;
             }
 
-            // Skip methods with iset, map, imap, or multiset parameters (not supported in SMT translation)
-            // Note: set<T> is now supported
+            // Skip methods with iset, map, or imap parameters (not supported in SMT translation)
+            // Note: set<T> and multiset<T> are now supported
             var mapParam = allParams.FirstOrDefault(f =>
             {
                 var typeStr = f.Type.ToString();
                 return typeStr.StartsWith("iset<")
                     || typeStr.StartsWith("map<") || typeStr.StartsWith("imap<")
-                    || typeStr.StartsWith("multiset<")
                     || typeStr == "iset"
-                    || typeStr == "map" || typeStr == "imap" || typeStr == "multiset";
+                    || typeStr == "map" || typeStr == "imap";
             });
             if (mapParam != null)
             {
                 var typeStr = mapParam.Type.ToString();
-                var kind = typeStr.StartsWith("iset") ? "iset"
-                    : typeStr.StartsWith("multiset") ? "multiset" : "map";
+                var kind = typeStr.StartsWith("iset") ? "iset" : "map";
                 Console.WriteLine($"  Skipping '{method.Name}': parameter '{mapParam.Name}' has {kind} type '{mapParam.Type}' (not yet supported)");
                 Console.WriteLine();
                 continue;
@@ -1326,6 +1324,29 @@ class Program
                             eqParts.Add($"(select {prefix} {m})");
                     }
                 }
+                else if (TypeUtils.IsMultisetType(type))
+                {
+                    var prefix = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                    if (values.TryGetValue(prefix + "_card", out var cardVal))
+                    {
+                        eqParts.Add($"(= {prefix}_card {cardVal})");
+                    }
+                    // Exclude based on per-element counts
+                    for (int i = 0; i < SmtTranslator.MAX_SET_UNIVERSE; i++)
+                    {
+                        if (values.TryGetValue($"{prefix}_elem_{i}", out var countVal))
+                            eqParts.Add($"(= (select {prefix} {i}) {countVal})");
+                    }
+                    // Fallback: if no per-element data, use members
+                    if (values.TryGetValue(prefix + "_members", out var membersStr) && !values.ContainsKey($"{prefix}_elem_0"))
+                    {
+                        foreach (var m in membersStr.Split(',').Distinct())
+                        {
+                            int count = membersStr.Split(',').Count(x => x == m);
+                            eqParts.Add($"(= (select {prefix} {m}) {count})");
+                        }
+                    }
+                }
                 else
                 {
                     var lookupName = mutableNames.Contains(name) ? $"{name}_pre" : name;
@@ -1688,7 +1709,7 @@ class Program
                     tc.values.TryGetValue(prefix + "_elems", out var elems);
                     return $"{name}:{len}:{elems}";
                 }
-                if (TypeUtils.IsSetType(type))
+                if (TypeUtils.IsSetType(type) || TypeUtils.IsMultisetType(type))
                 {
                     tc.values.TryGetValue(prefix + "_card", out var card);
                     tc.values.TryGetValue(prefix + "_members", out var members);

@@ -290,6 +290,16 @@ static class TestEmitter
             return $"    var {name}: {typeStr} := {{}};";
         }
 
+        if (TypeUtils.IsMultisetType(typeStr))
+        {
+            if (values.TryGetValue(name + "_members", out var membersStr))
+            {
+                var members = membersStr.Split(',');
+                return $"    var {name}: {typeStr} := multiset{{{string.Join(", ", members)}}};";
+            }
+            return $"    var {name}: {typeStr} := multiset{{}};";
+        }
+
         // Enum datatype: map integer ordinal back to constructor name
         if (enumDatatypes != null && enumDatatypes.TryGetValue(typeStr, out var scalarEnumCtors))
         {
@@ -685,11 +695,11 @@ static class TestEmitter
                 if (!literals.Any(lit => Regex.IsMatch(lit, outPattern)))
                     continue;
                 var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
-                if (!hasUninterpFuncs && values.TryGetValue(outp.Name, out _) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr))
+                if (!hasUninterpFuncs && values.TryGetValue(outp.Name, out _) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
                     coveredOutputs.Add(outp.Name);
                 else if (TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr2) && int.TryParse(lenStr2, out var seqLen2) && seqLen2 >= 0)
                     coveredOutputs.Add(outp.Name);
-                else if (TypeUtils.IsSetType(typeStr) && (values.ContainsKey(outp.Name + "_members") || values.ContainsKey(outp.Name + "_card")))
+                else if ((TypeUtils.IsSetType(typeStr) || TypeUtils.IsMultisetType(typeStr)) && (values.ContainsKey(outp.Name + "_members") || values.ContainsKey(outp.Name + "_card")))
                     coveredOutputs.Add(outp.Name);
             }
 
@@ -752,7 +762,7 @@ static class TestEmitter
                 var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
                 // When postconditions use non-inlinable functions, Z3's scalar output
                 // values are unreliable (arbitrary satisfying assignments), so skip them.
-                if (!hasUninterpFuncs && values.TryGetValue(outp.Name, out var val) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr))
+                if (!hasUninterpFuncs && values.TryGetValue(outp.Name, out var val) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
                 {
                     // Ensure real output values have a decimal point
                     if (typeStr == "real" && !val.Contains('.'))
@@ -804,6 +814,17 @@ static class TestEmitter
                 else if (TypeUtils.IsSetType(typeStr))
                 {
                     sb.AppendLine($"    expect {outp.Name} == {{}};");
+                    coveredOutputs.Add(outp.Name);
+                }
+                else if (TypeUtils.IsMultisetType(typeStr) && values.TryGetValue(outp.Name + "_members", out var msetMembers))
+                {
+                    var members = msetMembers.Split(',');
+                    sb.AppendLine($"    expect {outp.Name} == multiset{{{string.Join(", ", members)}}};");
+                    coveredOutputs.Add(outp.Name);
+                }
+                else if (TypeUtils.IsMultisetType(typeStr))
+                {
+                    sb.AppendLine($"    expect {outp.Name} == multiset{{}};");
                     coveredOutputs.Add(outp.Name);
                 }
             }

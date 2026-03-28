@@ -13,6 +13,9 @@ static class TypeUtils
     internal static bool IsSetType(string type) =>
         type.StartsWith("set<") || type == "set" || type.StartsWith("iset<") || type == "iset";
 
+    internal static bool IsMultisetType(string type) =>
+        type.StartsWith("multiset<") || type == "multiset";
+
     /// <summary>
     /// Returns true if the type is a nested collection (seq of seq, seq of array, array of seq, etc.)
     /// These are not yet supported for SMT element parsing and Dafny emission.
@@ -21,9 +24,11 @@ static class TypeUtils
 
     internal static bool IsNestedCollectionType(string type)
     {
-        if (!IsSeqType(type) && !IsArrayType(type) && !IsSetType(type)) return false;
-        var elemType = IsSetType(type) ? GetSetElementType(type) : GetSeqElementType(type);
-        return IsSeqType(elemType) || IsArrayType(elemType) || IsSetType(elemType);
+        if (!IsSeqType(type) && !IsArrayType(type) && !IsSetType(type) && !IsMultisetType(type)) return false;
+        var elemType = IsSetType(type) ? GetSetElementType(type)
+            : IsMultisetType(type) ? GetMultisetElementType(type)
+            : GetSeqElementType(type);
+        return IsSeqType(elemType) || IsArrayType(elemType) || IsSetType(elemType) || IsMultisetType(elemType);
     }
 
     internal static string GetSeqElementType(string type)
@@ -38,6 +43,12 @@ static class TypeUtils
     {
         if (type.StartsWith("set<")) return type.Substring(4, type.Length - 5);
         if (type.StartsWith("iset<")) return type.Substring(5, type.Length - 6);
+        return "int";
+    }
+
+    internal static string GetMultisetElementType(string type)
+    {
+        if (type.StartsWith("multiset<")) return type.Substring(9, type.Length - 10);
         return "int";
     }
 
@@ -59,6 +70,8 @@ static class TypeUtils
         if (dafnyType.StartsWith("array<")) return "Int"; // represent as length; actual array modeled separately
         if (dafnyType.StartsWith("set<") || dafnyType.StartsWith("iset<"))
             return $"(Array {DafnyTypeToSmt(GetSetElementType(dafnyType))} Bool)";
+        if (dafnyType.StartsWith("multiset<"))
+            return $"(Array {DafnyTypeToSmt(GetMultisetElementType(dafnyType))} Int)";
         return "Int"; // fallback
     }
 
@@ -70,8 +83,8 @@ static class TypeUtils
         // Look for (define-fun varname () Type value) patterns in the model
         foreach (var (name, type) in vars)
         {
-            if (IsArrayType(type) || IsSeqType(type))
-                continue; // sequences handled separately below
+            if (IsArrayType(type) || IsSeqType(type) || IsSetType(type) || IsMultisetType(type))
+                continue; // collections handled separately below
 
             if (type == "real")
             {
@@ -130,7 +143,7 @@ static class TypeUtils
         // Extract sequence/array values from get-value responses
         foreach (var (name, type) in vars)
         {
-            if (!IsArrayType(type) && !IsSeqType(type) && !IsSetType(type))
+            if (!IsArrayType(type) && !IsSeqType(type) && !IsSetType(type) && !IsMultisetType(type))
                 continue;
 
             if (IsSetType(type))
@@ -148,6 +161,32 @@ static class TypeUtils
                     }
                 }
                 result[name + "_card"] = members.Count.ToString();
+                if (members.Count > 0)
+                    result[name + "_members"] = string.Join(",", members);
+                continue;
+            }
+
+            if (IsMultisetType(type))
+            {
+                // Parse multiset counts from get-value responses: ((select msetName i) N)
+                var members = new List<string>();
+                int totalCard = 0;
+                for (int i = 0; i < SmtTranslator.MAX_SET_UNIVERSE; i++)
+                {
+                    var countPattern = new Regex(@$"\(\(select\s+{Regex.Escape(name)}\s+{i}\)\s+([-\d]+|\(- \d+\))\)");
+                    var countMatch = countPattern.Match(fullText);
+                    if (countMatch.Success)
+                    {
+                        int count = int.Parse(NormalizeZ3Int(countMatch.Groups[1].Value));
+                        if (count > 0)
+                        {
+                            for (int j = 0; j < count; j++)
+                                members.Add(i.ToString());
+                            totalCard += count;
+                        }
+                    }
+                }
+                result[name + "_card"] = totalCard.ToString();
                 if (members.Count > 0)
                     result[name + "_members"] = string.Join(",", members);
                 continue;
@@ -304,7 +343,7 @@ static class TypeUtils
     internal static bool IsSupportedFieldType(string type, Dictionary<string, List<string>>? enumDatatypes = null)
     {
         if (type is "int" or "nat" or "bool" or "real" or "char") return true;
-        if (IsArrayType(type) || IsSeqType(type) || IsSetType(type))
+        if (IsArrayType(type) || IsSeqType(type) || IsSetType(type) || IsMultisetType(type))
             return !IsNestedCollectionType(type);
         if (enumDatatypes != null && enumDatatypes.ContainsKey(type)) return true;
         return false;
