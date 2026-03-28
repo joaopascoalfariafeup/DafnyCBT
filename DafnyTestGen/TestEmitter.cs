@@ -481,6 +481,11 @@ static class TestEmitter
                     });
                     sb.AppendLine($"    var obj := new {classNameWithTypes}({string.Join(", ", ctorArgs)});");
                 }
+                else if (classInfo.ConstructorParams != null)
+                {
+                    // Constructor exists but has no params — still need parens
+                    sb.AppendLine($"    var obj := new {classNameWithTypes}();");
+                }
                 else
                 {
                     sb.AppendLine($"    var obj := new {classNameWithTypes};");
