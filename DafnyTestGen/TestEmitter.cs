@@ -757,8 +757,8 @@ static class TestEmitter
             var rhsCaptures = new Dictionary<string, string>(); // outName -> check_outName
             foreach (var lit in expectLiterals)
             {
-                // Match "outName == <expr>" at the start of the literal
-                var m = Regex.Match(lit, @"^(\w+)\s*==\s*(.+)$", RegexOptions.Singleline);
+                // Match "outName == <expr>" at the start of the literal (but not <==> or ==>)
+                var m = Regex.Match(lit, @"^(\w+)\s*==\s*(?![>=])(.+)$", RegexOptions.Singleline);
                 if (!m.Success) continue;
                 var lhs = m.Groups[1].Value;
                 var rhs = m.Groups[2].Value.Trim();
@@ -937,7 +937,7 @@ static class TestEmitter
                 if (!mentionsAnyOutput || !mentionsOnlyCoveredOutputs)
                 {
                     // If this literal is "outName == <expr>" and we captured RHS, use check_outName
-                    var litMatch = Regex.Match(lit, @"^(\w+)\s*==\s*(.+)$", RegexOptions.Singleline);
+                    var litMatch = Regex.Match(lit, @"^(\w+)\s*==\s*(?![>=])(.+)$", RegexOptions.Singleline);
                     if (litMatch.Success && rhsCaptures.TryGetValue(litMatch.Groups[1].Value, out var checkVar))
                         sb.AppendLine($"    expect {litMatch.Groups[1].Value} == {checkVar};");
                     else
