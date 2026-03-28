@@ -706,14 +706,16 @@ class Program
         // Skip predicates with built-in SMT handlers (e.g., IsSorted) to preserve patterns
         // that the SMT translator recognizes.
         var originalDnfExprs = dnfExprs;
+        var smtBuiltins = new HashSet<string> { "IsSorted" };
+        // Always compute predsToInline for preconditions (even when hasNonInlinableFuncs),
+        // but only inline postconditions when there are no non-inlinable functions.
         List<(string name, List<string> paramNames, string body, bool isClassMember)>? predsToInline = null;
-        if (!hasNonInlinableFuncs && inlinablePredicates != null && inlinablePredicates.Count > 0)
+        if (inlinablePredicates != null && inlinablePredicates.Count > 0)
         {
-            var smtBuiltins = new HashSet<string> { "IsSorted" };
             predsToInline = inlinablePredicates
                 .Where(p => !smtBuiltins.Contains(p.name))
                 .ToList();
-            if (predsToInline.Count > 0)
+            if (!hasNonInlinableFuncs && predsToInline.Count > 0)
             {
                 backgroundPostconditions = backgroundPostconditions
                     .Select(e => InlineExpr(e, predsToInline)).ToList();

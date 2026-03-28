@@ -900,9 +900,21 @@ static class SmtTranslator
 
             foreach (var bv in boundVars) _boundVars.Add(bv.Name);
             var bodySmt = ExprToSmt(quantExpr.Term, inputs, mutableNames, isPostContext, insideOld);
+            // Translate the range guard (e.g., "1 < nr < n" in "forall nr | 1 < nr < n :: body")
+            string? rangeSmt = null;
+            if (quantExpr.Range != null)
+                rangeSmt = ExprToSmt(quantExpr.Range, inputs, mutableNames, isPostContext, insideOld);
             foreach (var bv in boundVars) _boundVars.Remove(bv.Name);
 
             if (bodySmt == null) goto fallback;
+
+            // Combine range guard with body: forall => (=> range body), exists => (and range body)
+            if (rangeSmt != null)
+            {
+                bodySmt = quantifier == "forall"
+                    ? $"(=> {rangeSmt} {bodySmt})"
+                    : $"(and {rangeSmt} {bodySmt})";
+            }
 
             // For single-variable quantifiers with seq.nth, expand finitely
             if (boundVars.Count == 1 && bodySmt.Contains("seq.nth"))
@@ -1399,6 +1411,18 @@ static class SmtTranslator
             var boundVarsStr = quantMatch.Groups[2].Value;
             var body = quantMatch.Groups[3].Value;
 
+            // Strip trigger annotations {:trigger ...}
+            boundVarsStr = Regex.Replace(boundVarsStr, @"\{:trigger\s+[^}]*\}", "").Trim();
+
+            // Separate range guard from bound vars: "nr: int | 1 < nr < n" -> vars="nr: int", range="1 < nr < n"
+            string? rangeGuard = null;
+            var pipeIdx = boundVarsStr.IndexOf('|');
+            if (pipeIdx >= 0)
+            {
+                rangeGuard = boundVarsStr.Substring(pipeIdx + 1).Trim();
+                boundVarsStr = boundVarsStr.Substring(0, pipeIdx).Trim();
+            }
+
             // Parse bound variables (e.g., "k" or "i, j" or "k: int")
             var boundVars = new List<(string name, string smtType)>();
             foreach (var part in boundVarsStr.Split(','))
@@ -1420,12 +1444,22 @@ static class SmtTranslator
                 _boundVars.Add(bv.name);
 
             var bodySmt = DafnyExprToSmt(body, inputs);
+            // Translate range guard and combine with body
+            string? rangeSmt = rangeGuard != null ? DafnyExprToSmt(rangeGuard, inputs) : null;
 
             foreach (var bv in boundVars)
                 _boundVars.Remove(bv.name);
 
             if (bodySmt != null)
             {
+                // Combine range guard with body: forall => (=> range body), exists => (and range body)
+                if (rangeSmt != null)
+                {
+                    bodySmt = quantifier == "forall"
+                        ? $"(=> {rangeSmt} {bodySmt})"
+                        : $"(and {rangeSmt} {bodySmt})";
+                }
+
                 // For single-variable quantifiers whose body references seq.nth,
                 // expand into explicit conjunctions/disjunctions over 0..MAX_SEQ_LEN-1.
                 // Z3's quantifier instantiation is incomplete for seq.nth patterns,
