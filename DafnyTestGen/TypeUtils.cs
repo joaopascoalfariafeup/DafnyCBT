@@ -53,6 +53,23 @@ static class TypeUtils
     }
 
     /// <summary>
+    /// Returns the concrete SMT integer values that form the bounded universe for
+    /// set/multiset elements of the given type. All supported element types map to
+    /// Int in SMT, but use different representative value ranges.
+    /// </summary>
+    internal static int[] GetElementUniverse(string elementType)
+    {
+        if (elementType == "nat")
+            return Enumerable.Range(0, SmtTranslator.MAX_SET_UNIVERSE).ToArray();
+        if (elementType == "char")
+            return Enumerable.Range(97, SmtTranslator.MAX_SET_UNIVERSE).ToArray(); // 'a'..'h'
+        if (SmtTranslator._enumDatatypes.TryGetValue(elementType, out var ctors))
+            return Enumerable.Range(0, Math.Min(ctors.Count, SmtTranslator.MAX_SET_UNIVERSE)).ToArray();
+        // int, T, fallback: include some negatives for better coverage
+        return new[] { -2, -1, 0, 1, 2, 3, 4, 5 };
+    }
+
+    /// <summary>
     /// Returns the SMT name used for a sequence variable.
     /// For array params, the seq is named "name_seq". For seq params, it's just "name".
     /// </summary>
@@ -148,16 +165,18 @@ static class TypeUtils
 
             if (IsSetType(type))
             {
-                // Parse set membership from get-value responses: ((select setName i) true/false)
+                // Parse set membership from get-value responses: ((select setName v) true/false)
                 var members = new List<string>();
                 var setElemType = GetSetElementType(type);
-                for (int i = 0; i < SmtTranslator.MAX_SET_UNIVERSE; i++)
+                var universe = GetElementUniverse(setElemType);
+                foreach (var v in universe)
                 {
-                    var memberPattern = new Regex(@$"\(\(select\s+{Regex.Escape(name)}\s+{i}\)\s+(true|false)\)");
+                    var escapedV = v < 0 ? @$"\(\-\s+{-v}\)" : v.ToString();
+                    var memberPattern = new Regex(@$"\(\(select\s+{Regex.Escape(name)}\s+{escapedV}\)\s+(true|false)\)");
                     var memberMatch = memberPattern.Match(fullText);
                     if (memberMatch.Success && memberMatch.Groups[1].Value == "true")
                     {
-                        members.Add(i.ToString());
+                        members.Add(v.ToString());
                     }
                 }
                 result[name + "_card"] = members.Count.ToString();
@@ -168,12 +187,15 @@ static class TypeUtils
 
             if (IsMultisetType(type))
             {
-                // Parse multiset counts from get-value responses: ((select msetName i) N)
+                // Parse multiset counts from get-value responses: ((select msetName v) N)
                 var members = new List<string>();
                 int totalCard = 0;
-                for (int i = 0; i < SmtTranslator.MAX_SET_UNIVERSE; i++)
+                var msetElemType = GetMultisetElementType(type);
+                var universe = GetElementUniverse(msetElemType);
+                foreach (var v in universe)
                 {
-                    var countPattern = new Regex(@$"\(\(select\s+{Regex.Escape(name)}\s+{i}\)\s+([-\d]+|\(- \d+\))\)");
+                    var escapedV = v < 0 ? @$"\(\-\s+{-v}\)" : v.ToString();
+                    var countPattern = new Regex(@$"\(\(select\s+{Regex.Escape(name)}\s+{escapedV}\)\s+([-\d]+|\(- \d+\))\)");
                     var countMatch = countPattern.Match(fullText);
                     if (countMatch.Success)
                     {
@@ -181,7 +203,7 @@ static class TypeUtils
                         if (count > 0)
                         {
                             for (int j = 0; j < count; j++)
-                                members.Add(i.ToString());
+                                members.Add(v.ToString());
                             totalCard += count;
                         }
                     }

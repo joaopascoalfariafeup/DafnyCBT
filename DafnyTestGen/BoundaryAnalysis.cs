@@ -59,9 +59,12 @@ static class BoundaryAnalysis
             }
             else if (TypeUtils.IsSetType(type))
             {
-                // Cardinality tiers: 0, 1, ..., tierCount-1
+                // Cap tiers for enum element types (can't have more elements than constructors)
+                var setElemType = TypeUtils.GetSetElementType(type);
+                var universe = TypeUtils.GetElementUniverse(setElemType);
+                var maxCard = Math.Min(tierCount, universe.Length + 1);
                 var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
-                for (int sz = 0; sz < tierCount; sz++)
+                for (int sz = 0; sz < maxCard; sz++)
                 {
                     var constraint = $"(= {smtName}_card {sz})";
                     tiers.Add(($"{sz}", constraint));

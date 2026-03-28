@@ -110,9 +110,14 @@ static class SmtTranslator
             sb.AppendLine("(define-fun MultisetMember ((x Int) (m (Array Int Int))) Bool (> (select m x) 0))");
             // Pointwise expansion over bounded universe — avoids (_ map) which requires
             // declare-fun (not define-fun), and the forall axioms that entails cause Z3
-            // to return "unknown". Since our universe is {0..MAX_SET_UNIVERSE-1}, we can
-            // expand each operation as a chain of store expressions.
-            var indices = Enumerable.Range(0, MAX_SET_UNIVERSE);
+            // to return "unknown". Since our universe is bounded, we can expand each
+            // operation as a chain of store expressions.
+            // Use the union of all multiset element type universes so macros cover all types.
+            var msetUniverseValues = inputs.Concat(outputs)
+                .Where(v => TypeUtils.IsMultisetType(v.Type))
+                .SelectMany(v => TypeUtils.GetElementUniverse(TypeUtils.GetMultisetElementType(v.Type)))
+                .Distinct().OrderBy(x => x).ToArray();
+            var indices = msetUniverseValues.AsEnumerable();
             string PointwiseArray(string aName, string bName, string op)
             {
                 // Build: (store (store ... (const 0) 0 (op a[0] b[0])) 1 (op a[1] b[1])) ...
@@ -195,11 +200,13 @@ static class SmtTranslator
             {
                 // Construct multiset from zero-default base with per-element variables.
                 // This ensures out-of-universe indices are always 0, avoiding forall constraints.
-                for (int i = 0; i < MAX_SET_UNIVERSE; i++)
+                var elemType = TypeUtils.GetMultisetElementType(type);
+                var universe = TypeUtils.GetElementUniverse(elemType);
+                for (int i = 0; i < universe.Length; i++)
                     sb.AppendLine($"(declare-const {name}_e{i} Int)");
                 var storeChain = "((as const (Array Int Int)) 0)";
-                for (int i = 0; i < MAX_SET_UNIVERSE; i++)
-                    storeChain = $"(store {storeChain} {i} {name}_e{i})";
+                for (int i = 0; i < universe.Length; i++)
+                    storeChain = $"(store {storeChain} {universe[i]} {name}_e{i})";
                 sb.AppendLine($"(define-fun {name} () (Array Int Int) {storeChain})");
             }
             else
@@ -279,18 +286,20 @@ static class SmtTranslator
             }
         }
 
-        // Bound set types: closed-world assumption over universe {0..MAX_SET_UNIVERSE-1}
+        // Bound set types: closed-world assumption over element-type-dependent universe
         // and define a cardinality helper for each set variable
         foreach (var (name, type) in inputs.Concat(outputs).ToList())
         {
             if (TypeUtils.IsSetType(type))
             {
+                var elemType = TypeUtils.GetSetElementType(type);
+                var universe = TypeUtils.GetElementUniverse(elemType);
                 var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
                 // Closed-world: membership implies element in universe
-                var universeDisjuncts = string.Join(" ", Enumerable.Range(0, MAX_SET_UNIVERSE).Select(i => $"(= x {i})"));
+                var universeDisjuncts = string.Join(" ", universe.Select(v => $"(= x {v})"));
                 sb.AppendLine($"(assert (forall ((x Int)) (=> (select {smtName} x) (or {universeDisjuncts}))))");
                 // Cardinality helper: sum of (ite (select S i) 1 0) for each universe element
-                var cardTerms = string.Join(" ", Enumerable.Range(0, MAX_SET_UNIVERSE).Select(i => $"(ite (select {smtName} {i}) 1 0)"));
+                var cardTerms = string.Join(" ", universe.Select(v => $"(ite (select {smtName} {v}) 1 0)"));
                 sb.AppendLine($"(define-fun {smtName}_card () Int (+ {cardTerms}))");
 
                 // If mutable, also bound post-state set and define its cardinality
@@ -298,39 +307,41 @@ static class SmtTranslator
                 {
                     var postName = $"{name}_post";
                     sb.AppendLine($"(assert (forall ((x Int)) (=> (select {postName} x) (or {universeDisjuncts}))))");
-                    var postCardTerms = string.Join(" ", Enumerable.Range(0, MAX_SET_UNIVERSE).Select(i => $"(ite (select {postName} {i}) 1 0)"));
+                    var postCardTerms = string.Join(" ", universe.Select(v => $"(ite (select {postName} {v}) 1 0)"));
                     sb.AppendLine($"(define-fun {postName}_card () Int (+ {postCardTerms}))");
                 }
             }
         }
 
         // Bound multiset element variables and define cardinality helpers.
-        // Multisets are constructed from zero-default base with per-element variables (name_e0..name_e7),
+        // Multisets are constructed from zero-default base with per-element variables (name_e0..name_eN),
         // so no forall constraints are needed — out-of-universe indices are automatically 0.
         foreach (var (name, type) in inputs.Concat(outputs).ToList())
         {
             if (TypeUtils.IsMultisetType(type))
             {
+                var elemType = TypeUtils.GetMultisetElementType(type);
+                var universe = TypeUtils.GetElementUniverse(elemType);
                 var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
                 // Bounds on per-element variables: 0 <= count <= MAX_SET_UNIVERSE
-                for (int i = 0; i < MAX_SET_UNIVERSE; i++)
+                for (int i = 0; i < universe.Length; i++)
                 {
                     sb.AppendLine($"(assert (>= {smtName}_e{i} 0))");
                     sb.AppendLine($"(assert (<= {smtName}_e{i} {MAX_SET_UNIVERSE}))");
                 }
                 // Cardinality: sum of element variables
-                var cardTerms = string.Join(" ", Enumerable.Range(0, MAX_SET_UNIVERSE).Select(i => $"{smtName}_e{i}"));
+                var cardTerms = string.Join(" ", Enumerable.Range(0, universe.Length).Select(i => $"{smtName}_e{i}"));
                 sb.AppendLine($"(define-fun {smtName}_card () Int (+ {cardTerms}))");
 
                 if (mutableNames.Contains(name))
                 {
                     var postName = $"{name}_post";
-                    for (int i = 0; i < MAX_SET_UNIVERSE; i++)
+                    for (int i = 0; i < universe.Length; i++)
                     {
                         sb.AppendLine($"(assert (>= {postName}_e{i} 0))");
                         sb.AppendLine($"(assert (<= {postName}_e{i} {MAX_SET_UNIVERSE}))");
                     }
-                    var postCardTerms = string.Join(" ", Enumerable.Range(0, MAX_SET_UNIVERSE).Select(i => $"{postName}_e{i}"));
+                    var postCardTerms = string.Join(" ", Enumerable.Range(0, universe.Length).Select(i => $"{postName}_e{i}"));
                     sb.AppendLine($"(define-fun {postName}_card () Int (+ {postCardTerms}))");
                 }
             }
@@ -551,14 +562,18 @@ static class SmtTranslator
             else if (TypeUtils.IsSetType(type))
             {
                 var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
-                for (int i = 0; i < MAX_SET_UNIVERSE; i++)
-                    sb.AppendLine($"(get-value ((select {smtName} {i})))");
+                var elemType = TypeUtils.GetSetElementType(type);
+                var universe = TypeUtils.GetElementUniverse(elemType);
+                foreach (var v in universe)
+                    sb.AppendLine($"(get-value ((select {smtName} {v})))");
             }
             else if (TypeUtils.IsMultisetType(type))
             {
                 var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
-                for (int i = 0; i < MAX_SET_UNIVERSE; i++)
-                    sb.AppendLine($"(get-value ((select {smtName} {i})))");
+                var elemType = TypeUtils.GetMultisetElementType(type);
+                var universe = TypeUtils.GetElementUniverse(elemType);
+                foreach (var v in universe)
+                    sb.AppendLine($"(get-value ((select {smtName} {v})))");
             }
         }
 

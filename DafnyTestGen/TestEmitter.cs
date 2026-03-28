@@ -284,7 +284,8 @@ static class TestEmitter
         {
             if (values.TryGetValue(name + "_members", out var membersStr))
             {
-                var members = membersStr.Split(',');
+                var elemType = TypeUtils.GetSetElementType(typeStr);
+                var members = membersStr.Split(',').Select(m => FormatScalarValue(m.Trim(), elemType, enumDatatypes));
                 return $"    var {name}: {typeStr} := {{{string.Join(", ", members)}}};";
             }
             return $"    var {name}: {typeStr} := {{}};";
@@ -294,7 +295,8 @@ static class TestEmitter
         {
             if (values.TryGetValue(name + "_members", out var membersStr))
             {
-                var members = membersStr.Split(',');
+                var elemType = TypeUtils.GetMultisetElementType(typeStr);
+                var members = membersStr.Split(',').Select(m => FormatScalarValue(m.Trim(), elemType, enumDatatypes));
                 return $"    var {name}: {typeStr} := multiset{{{string.Join(", ", members)}}};";
             }
             return $"    var {name}: {typeStr} := multiset{{}};";
@@ -807,7 +809,8 @@ static class TestEmitter
                 }
                 else if (TypeUtils.IsSetType(typeStr) && values.TryGetValue(outp.Name + "_members", out var setMembers))
                 {
-                    var members = setMembers.Split(',');
+                    var setElemType = TypeUtils.GetSetElementType(typeStr);
+                    var members = setMembers.Split(',').Select(m => FormatScalarValue(m.Trim(), setElemType, enumDatatypes));
                     sb.AppendLine($"    expect {outp.Name} == {{{string.Join(", ", members)}}};");
                     coveredOutputs.Add(outp.Name);
                 }
@@ -818,7 +821,8 @@ static class TestEmitter
                 }
                 else if (TypeUtils.IsMultisetType(typeStr) && values.TryGetValue(outp.Name + "_members", out var msetMembers))
                 {
-                    var members = msetMembers.Split(',');
+                    var msetElemType = TypeUtils.GetMultisetElementType(typeStr);
+                    var members = msetMembers.Split(',').Select(m => FormatScalarValue(m.Trim(), msetElemType, enumDatatypes));
                     sb.AppendLine($"    expect {outp.Name} == multiset{{{string.Join(", ", members)}}};");
                     coveredOutputs.Add(outp.Name);
                 }
