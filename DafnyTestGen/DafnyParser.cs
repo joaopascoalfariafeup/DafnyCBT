@@ -94,8 +94,7 @@ static class DafnyParser
                             var ci = GetClassInfo(m, (ClassDecl)cls, enumDatatypes);
                             if (ci == null)
                             {
-                                Console.WriteLine($"  Skipping '{m.Name}' (class method in '{cls.Name}' — not simple enough)");
-                                continue;
+                                continue; // reason already printed by GetClassInfo
                             }
                         }
                         result.Add(m);
@@ -120,6 +119,12 @@ static class DafnyParser
         return null;
     }
 
+    static ClassInfo? RejectClass(string methodName, string className, string reason)
+    {
+        Console.WriteLine($"  Skipping '{methodName}' (class '{className}': {reason})");
+        return null;
+    }
+
     internal static ClassInfo? GetClassInfo(Method method, ClassDecl cls,
         Dictionary<string, List<string>>? enumDatatypes = null)
     {
@@ -132,7 +137,8 @@ static class DafnyParser
         }
 
         // Check for trait parents (skip autocontracts: Dafny may inject object trait)
-        if (!isAutoContracts && cls.ParentTraitHeads.Count > 0) return null;
+        if (!isAutoContracts && cls.ParentTraitHeads.Count > 0)
+            return RejectClass(method.Name, cls.Name, "extends a trait");
 
         // Collect non-ghost var fields
         var fields = new List<(string Name, string Type)>();
@@ -172,9 +178,9 @@ static class DafnyParser
         }
 
         // All fields (var + const) must have supported types
-        foreach (var (_, type) in fields.Concat(constFields))
+        foreach (var (name, type) in fields.Concat(constFields))
             if (!TypeUtils.IsSupportedFieldType(type, enumDatatypes))
-                return null;
+                return RejectClass(method.Name, cls.Name, $"field '{name}' has unsupported type '{type}'");
 
         // Find the constructor and its params/requires
         List<(string Name, string Type)>? ctorParams = null;
