@@ -31,14 +31,14 @@ static class TypeUtils
         {
             var keyType = GetMapKeyType(type);
             var valType = GetMapValueType(type);
-            return IsSeqType(keyType) || IsArrayType(keyType) || IsSetType(keyType) || IsMultisetType(keyType) || IsMapType(keyType)
-                || IsSeqType(valType) || IsArrayType(valType) || IsSetType(valType) || IsMultisetType(valType) || IsMapType(valType);
+            return IsSeqType(keyType) || IsArrayType(keyType) || IsSetType(keyType) || IsMultisetType(keyType) || IsMapType(keyType) || IsTupleType(keyType)
+                || IsSeqType(valType) || IsArrayType(valType) || IsSetType(valType) || IsMultisetType(valType) || IsMapType(valType) || IsTupleType(valType);
         }
         if (!IsSeqType(type) && !IsArrayType(type) && !IsSetType(type) && !IsMultisetType(type)) return false;
         var elemType = IsSetType(type) ? GetSetElementType(type)
             : IsMultisetType(type) ? GetMultisetElementType(type)
             : GetSeqElementType(type);
-        return IsSeqType(elemType) || IsArrayType(elemType) || IsSetType(elemType) || IsMultisetType(elemType) || IsMapType(elemType);
+        return IsSeqType(elemType) || IsArrayType(elemType) || IsSetType(elemType) || IsMultisetType(elemType) || IsMapType(elemType) || IsTupleType(elemType);
     }
 
     internal static string GetSeqElementType(string type)
