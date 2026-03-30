@@ -12,7 +12,7 @@ static class TestEmitter
     /// </summary>
     static HashSet<string> ExtractFreeVariables(string expr)
     {
-        var keywords = new HashSet<string> { "forall", "exists", "old", "true", "false", "null", "this", "var", "in", "if", "then", "else", "match", "case" };
+        var keywords = new HashSet<string> { "forall", "exists", "old", "true", "false", "null", "this", "var", "in", "if", "then", "else", "match", "case", "multiset", "set", "seq", "map", "iset", "imap", "int", "nat", "real", "bool", "char", "string" };
         var result = new HashSet<string>();
         foreach (Match m in Regex.Matches(expr, @"\b([a-zA-Z_]\w*)\b"))
         {
@@ -398,10 +398,17 @@ static class TestEmitter
         testSource = Regex.Replace(testSource, @"\bghost\s+predicate\b", "predicate");
         testSource = Regex.Replace(testSource, @"\bghost\s+var\b", "var");
         testSource = Regex.Replace(testSource, @"\bghost\s+const\b", "const");
-        // Strip old() wrappers in method bodies — when ghost vars become concrete,
-        // old() in non-spec code is invalid; the semantics are preserved since
-        // old(x) in an assignment refers to x's value before this method call.
-        testSource = Regex.Replace(testSource, @"\bold\(", "(");
+        // Strip old() wrappers only in non-spec lines (statements, assertions).
+        // old() in ensures/invariant/requires/decreases clauses must be preserved
+        // because it has valid semantics there (refers to pre-state values).
+        var specKeywords = new[] { "ensures", "invariant", "requires", "decreases", "modifies" };
+        testSource = string.Join("\n", testSource.Split('\n').Select(line =>
+        {
+            var trimmed = line.TrimStart();
+            if (specKeywords.Any(kw => trimmed.StartsWith(kw + " ") || trimmed.StartsWith(kw + "(")))
+                return line; // preserve old() in spec clauses
+            return Regex.Replace(line, @"\bold\(", "(");
+        }));
         sb.AppendLine(testSource);
         sb.AppendLine();
 
