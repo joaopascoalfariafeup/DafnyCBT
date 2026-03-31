@@ -159,24 +159,23 @@ static class DafnyParser
                 constFields.Add((cf.Name, cf.Type.ToString()));
         }
 
-        // Collect ghost fields (for non-autocontracts: pass to Z3, skip in test code)
+        // Collect ghost fields
+        // For non-autocontracts: pass to Z3 as inputs, skip assignment in test code
+        // For autocontracts: collect for obj. prefix + old() capture (ghost qualifier stripped in test copy)
         var ghostFields = new List<(string Name, string Type)>();
-        if (!isAutoContracts)
+        foreach (var member in cls.Members)
         {
-            foreach (var member in cls.Members)
+            if (member is Field f && f is not ConstantField && f.IsGhost && f.Name != "Repr")
             {
-                if (member is Field f && f is not ConstantField && f.IsGhost && f.Name != "Repr")
-                {
-                    var ft = f.Type.ToString();
-                    if (TypeUtils.IsSupportedFieldType(ft, enumDatatypes, classNames))
-                        ghostFields.Add((f.Name, ft));
-                }
-                if (member is ConstantField cf && cf.IsGhost && cf.Name != "Repr")
-                {
-                    var ct = cf.Type.ToString();
-                    if (TypeUtils.IsSupportedFieldType(ct, enumDatatypes, classNames))
-                        ghostFields.Add((cf.Name, ct));
-                }
+                var ft = f.Type.ToString();
+                if (TypeUtils.IsSupportedFieldType(ft, enumDatatypes, classNames))
+                    ghostFields.Add((f.Name, ft));
+            }
+            if (member is ConstantField cf && cf.IsGhost && cf.Name != "Repr")
+            {
+                var ct = cf.Type.ToString();
+                if (TypeUtils.IsSupportedFieldType(ct, enumDatatypes, classNames))
+                    ghostFields.Add((cf.Name, ct));
             }
         }
 

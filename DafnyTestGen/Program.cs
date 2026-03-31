@@ -846,6 +846,10 @@ class Program
                     foreach (var (cfName, cfType) in classInfo.ConstFields)
                         if (TypeUtils.IsArrayType(cfType))
                             mutableNames.Add(cfName);
+                // Ghost fields can also be modified in autocontracts (modifies Repr)
+                if (classInfo.GhostFields != null)
+                    foreach (var (gfName, _) in classInfo.GhostFields)
+                        mutableNames.Add(gfName);
             }
         }
 
@@ -880,8 +884,8 @@ class Program
                     inputs.Add((cpName, cpType));
                 }
             }
-            // For non-autocontracts: add ghost fields as SMT inputs (Z3 uses them, test code doesn't assign them)
-            if (!classInfo.IsAutoContracts && classInfo.GhostFields != null)
+            // Add ghost fields as SMT inputs (Z3 uses them; test code assigns them from Z3 values)
+            if (classInfo.GhostFields != null)
             {
                 foreach (var (gfName, gfType) in classInfo.GhostFields)
                 {

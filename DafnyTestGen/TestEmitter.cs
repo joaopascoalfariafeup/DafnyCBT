@@ -670,6 +670,14 @@ static class TestEmitter
             knownIdentifiers.UnionWith(constFieldNames);
             knownIdentifiers.UnionWith(ctorParamNames);
             knownIdentifiers.UnionWith(ghostFieldNames);
+            if (classInfo != null)
+            {
+                knownIdentifiers.Add("obj"); // class instance name
+                // Class function/predicate names are callable and capturable
+                if (inlinablePredicates != null)
+                    foreach (var (pName, _, _, isClassMember) in inlinablePredicates)
+                        if (isClassMember) knownIdentifiers.Add(pName);
+            }
             var oldCaptures = ExtractOldCaptures(literals, arrayParamNames, knownIdentifiers);
             foreach (var (oldExpr, varName, isArrayCapture) in oldCaptures)
             {
@@ -685,7 +693,7 @@ static class TestEmitter
                     }
                     else
                     {
-                        // Whole-expression capture: replace all field references with obj.field
+                        // Whole-expression capture: replace all field/function references with obj.x
                         var allClassFields = classInfo.Fields
                             .Concat(classInfo.ConstFields ?? new List<(string, string)>())
                             .Concat(ghostVarFields);
@@ -693,6 +701,13 @@ static class TestEmitter
                             captureExpr = Regex.Replace(captureExpr,
                                 @"(?<![a-zA-Z_0-9])(?<!obj\.)" + Regex.Escape(fn) + @"(?![a-zA-Z_0-9])",
                                 $"obj.{fn}");
+                        // Also prefix bare class function/predicate calls with obj.
+                        if (inlinablePredicates != null)
+                            foreach (var (pName, _, _, isClassMember) in inlinablePredicates)
+                                if (isClassMember)
+                                    captureExpr = Regex.Replace(captureExpr,
+                                        @"(?<![a-zA-Z_0-9.])(?<!obj\.)" + Regex.Escape(pName) + @"(?=\s*\()",
+                                        $"obj.{pName}");
                     }
                 }
                 sb.AppendLine($"    var {varName} := {captureExpr};");
