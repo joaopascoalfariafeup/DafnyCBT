@@ -1762,6 +1762,23 @@ static class SmtTranslator
             if (inner != null) return $"(seq.len {inner})";
         }
 
+        // Handle a[..][i] — array-to-seq slice then element access (from predicate inlining
+        // where seq param s is substituted with a[..], turning s[k] into a[..][k]).
+        var sliceIndexMatch = Regex.Match(expr, @"^(\w+)\[\.\.\]\[(.+)\]$");
+        if (sliceIndexMatch.Success)
+        {
+            var arrName = sliceIndexMatch.Groups[1].Value;
+            var idx = DafnyExprToSmt(sliceIndexMatch.Groups[2].Value, inputs);
+            if (idx != null)
+            {
+                var isArray = inputs.Any(v => v.Name == arrName && TypeUtils.IsArrayType(v.Type));
+                var smtSeq = isArray ? $"{arrName}_seq" : arrName;
+                if (!_boundVars.Contains(sliceIndexMatch.Groups[2].Value.Trim()))
+                    _wfGuards.Add($"(and (<= 0 {idx}) (< {idx} (seq.len {smtSeq})))");
+                return $"(seq.nth {smtSeq} {idx})";
+            }
+        }
+
         // Handle seq[a .. b] (sequence slicing) - must come before seq[i]
         var sliceMatch = Regex.Match(expr, @"^(\w+)\[(.+)\s*\.\.\s*(.+)\]$");
         if (sliceMatch.Success)

@@ -460,6 +460,16 @@ class Program
                 Console.WriteLine($"  Note: parameter/return uses bitvector type — will test with full postcondition expects");
             }
 
+            // Set/multiset comprehensions (set x | P(x)) can't be encoded in SMT — Z3 picks
+            // arbitrary values for the output.  Fall back to runtime postcondition evaluation.
+            bool hasSetComprehension = method.Ens.Any(ens =>
+                Regex.IsMatch(DnfEngine.ExprToString(ens.E), @"\bset\s+\w+\s*\|"));
+            if (hasSetComprehension)
+            {
+                hasNonInlinableFuncs = true;
+                Console.WriteLine($"  Note: postcondition uses set comprehension — will test with full postcondition expects");
+            }
+
             if (verbose)
             {
                 DafnyParser.DisplayContracts(method);
