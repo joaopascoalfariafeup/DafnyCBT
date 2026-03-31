@@ -460,11 +460,27 @@ static class TypeUtils
     /// <summary>
     /// Returns true if the type is supported as a class field for simple class testing.
     /// </summary>
-    internal static bool IsSupportedFieldType(string type, Dictionary<string, List<string>>? enumDatatypes = null)
+    internal static bool IsSupportedFieldType(string type, Dictionary<string, List<string>>? enumDatatypes = null, HashSet<string>? classNames = null)
     {
-        if (type is "int" or "nat" or "bool" or "real" or "char") return true;
-        if (IsArrayType(type) || IsSeqType(type) || IsSetType(type) || IsMultisetType(type) || IsMapType(type))
-            return !IsNestedCollectionType(type);
+        if (type is "int" or "nat" or "bool" or "real" or "char" or "string") return true;
+        if (IsArrayType(type) || IsSeqType(type) || IsSetType(type) || IsMultisetType(type))
+        {
+            if (IsNestedCollectionType(type)) return false;
+            // Reject collections whose element type is a class/reference type
+            var elemType = IsSetType(type) ? GetSetElementType(type)
+                : IsMultisetType(type) ? GetMultisetElementType(type)
+                : GetSeqElementType(type);
+            if (classNames != null && classNames.Contains(elemType)) return false;
+            return true;
+        }
+        if (IsMapType(type))
+        {
+            if (IsNestedCollectionType(type)) return false;
+            var keyType = GetMapKeyType(type);
+            var valType = GetMapValueType(type);
+            if (classNames != null && (classNames.Contains(keyType) || classNames.Contains(valType))) return false;
+            return true;
+        }
         if (enumDatatypes != null && enumDatatypes.ContainsKey(type)) return true;
         return false;
     }

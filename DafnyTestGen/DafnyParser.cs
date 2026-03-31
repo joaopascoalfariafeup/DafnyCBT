@@ -67,7 +67,8 @@ static class DafnyParser
     }
 
     internal static List<Method> FindTestableMethodsAuto(Microsoft.Dafny.Program program,
-        Dictionary<string, List<string>>? enumDatatypes = null)
+        Dictionary<string, List<string>>? enumDatatypes = null,
+        HashSet<string>? classNames = null)
     {
         var result = new List<Method>();
         foreach (var topDecl in AllTopLevelDecls(program))
@@ -91,7 +92,7 @@ static class DafnyParser
                         // For methods inside classes, allow simple classes through
                         if (cls is ClassDecl && cls is not DefaultClassDecl)
                         {
-                            var ci = GetClassInfo(m, (ClassDecl)cls, enumDatatypes);
+                            var ci = GetClassInfo(m, (ClassDecl)cls, enumDatatypes, classNames);
                             if (ci == null)
                             {
                                 continue; // reason already printed by GetClassInfo
@@ -111,11 +112,12 @@ static class DafnyParser
     /// supported types, and the method doesn't require Valid()/RepInv().
     /// </summary>
     internal static ClassInfo? GetClassInfo(Method method,
-        Dictionary<string, List<string>>? enumDatatypes = null)
+        Dictionary<string, List<string>>? enumDatatypes = null,
+        HashSet<string>? classNames = null)
     {
         // Try to get the enclosing class from the method's AST
         if (method.EnclosingClass is ClassDecl cls)
-            return GetClassInfo(method, cls, enumDatatypes);
+            return GetClassInfo(method, cls, enumDatatypes, classNames);
         return null;
     }
 
@@ -126,7 +128,8 @@ static class DafnyParser
     }
 
     internal static ClassInfo? GetClassInfo(Method method, ClassDecl cls,
-        Dictionary<string, List<string>>? enumDatatypes = null)
+        Dictionary<string, List<string>>? enumDatatypes = null,
+        HashSet<string>? classNames = null)
     {
         // Detect {:autocontracts}
         bool isAutoContracts = false;
@@ -165,13 +168,13 @@ static class DafnyParser
                 if (member is Field f && f is not ConstantField && f.IsGhost && f.Name != "Repr")
                 {
                     var ft = f.Type.ToString();
-                    if (TypeUtils.IsSupportedFieldType(ft, enumDatatypes))
+                    if (TypeUtils.IsSupportedFieldType(ft, enumDatatypes, classNames))
                         ghostFields.Add((f.Name, ft));
                 }
                 if (member is ConstantField cf && cf.IsGhost && cf.Name != "Repr")
                 {
                     var ct = cf.Type.ToString();
-                    if (TypeUtils.IsSupportedFieldType(ct, enumDatatypes))
+                    if (TypeUtils.IsSupportedFieldType(ct, enumDatatypes, classNames))
                         ghostFields.Add((cf.Name, ct));
                 }
             }
@@ -179,7 +182,7 @@ static class DafnyParser
 
         // All fields (var + const) must have supported types
         foreach (var (name, type) in fields.Concat(constFields))
-            if (!TypeUtils.IsSupportedFieldType(type, enumDatatypes))
+            if (!TypeUtils.IsSupportedFieldType(type, enumDatatypes, classNames))
                 return RejectClass(method.Name, cls.Name, $"field '{name}' has unsupported type '{type}'");
 
         // Find the constructor and its params/requires

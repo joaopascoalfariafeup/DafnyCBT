@@ -367,6 +367,8 @@ static class TestEmitter
         }
         if (typeStr == "bool")
             return val == "true" ? "true" : "false";
+        if (typeStr == "string")
+            return "\"\""; // string constructor params: use empty string
         return val;
     }
 

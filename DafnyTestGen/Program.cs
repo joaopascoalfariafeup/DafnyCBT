@@ -203,6 +203,13 @@ class Program
         if (enumDatatypes.Count > 0)
             Console.WriteLine($"[DafnyTestGen] Enum datatypes: {string.Join(", ", enumDatatypes.Select(e => $"{e.Key}({string.Join("|", e.Value)})"))}");
 
+        // Collect user-defined class names — parameters of class/reference type can't be
+        // represented as concrete SMT values and must be rejected.
+        var classNames = new HashSet<string>(DafnyParser.AllTopLevelDecls(program)
+            .OfType<ClassDecl>()
+            .Where(c => c.GetType().Name != "DefaultClassDecl")
+            .Select(c => c.Name));
+
         List<Method> methods;
         if (methodName != null)
         {
@@ -224,7 +231,7 @@ class Program
         else
         {
             // Auto-discover: all non-ghost methods that don't have "test" in the name
-            methods = DafnyParser.FindTestableMethodsAuto(program, enumDatatypes);
+            methods = DafnyParser.FindTestableMethodsAuto(program, enumDatatypes, classNames);
             if (!methods.Any())
             {
                 Console.Error.WriteLine("No testable methods found (methods with ensures and without 'test' in name).");
@@ -243,7 +250,7 @@ class Program
                 {
                     if (member is Method m && methods.Contains(m))
                     {
-                        var ci = DafnyParser.GetClassInfo(m, cd, enumDatatypes);
+                        var ci = DafnyParser.GetClassInfo(m, cd, enumDatatypes, classNames);
                         if (ci != null)
                         {
                             classInfoMap[m] = ci;
@@ -388,6 +395,24 @@ class Program
                 var matchedDt = Regex.Matches(typeStr, @"\b([A-Za-z_]\w*)\b")
                     .Cast<Match>().First(m => datatypeNames.Contains(m.Groups[1].Value)).Groups[1].Value;
                 Console.WriteLine($"  Skipping '{method.Name}': parameter '{datatypeParam.Name}' uses datatype '{matchedDt}' (type '{datatypeParam.Type}' — not yet supported)");
+                Console.WriteLine();
+                continue;
+            }
+
+            // Skip methods with class/reference type parameters — class instances can't be
+            // represented as concrete SMT values (int literals, etc.)
+            var classParam = allParams.FirstOrDefault(f =>
+            {
+                var typeStr = f.Type.ToString();
+                var identifiers = Regex.Matches(typeStr, @"\b([A-Za-z_]\w*)\b");
+                return identifiers.Cast<Match>().Any(m => classNames.Contains(m.Groups[1].Value));
+            });
+            if (classParam != null)
+            {
+                var typeStr = classParam.Type.ToString();
+                var matchedClass = Regex.Matches(typeStr, @"\b([A-Za-z_]\w*)\b")
+                    .Cast<Match>().First(m => classNames.Contains(m.Groups[1].Value)).Groups[1].Value;
+                Console.WriteLine($"  Skipping '{method.Name}': parameter '{classParam.Name}' uses class type '{matchedClass}' (not yet supported)");
                 Console.WriteLine();
                 continue;
             }
