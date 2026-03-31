@@ -770,7 +770,7 @@ static class TestEmitter
                 var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
                 if (!hasUninterpFuncs && values.TryGetValue(outp.Name, out _) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
                     coveredOutputs.Add(outp.Name);
-                else if (TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr2) && int.TryParse(lenStr2, out var seqLen2) && seqLen2 >= 0)
+                else if (!hasUninterpFuncs && TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr2) && int.TryParse(lenStr2, out var seqLen2) && seqLen2 >= 0)
                     coveredOutputs.Add(outp.Name);
                 else if (!hasUninterpFuncs && (TypeUtils.IsSetType(typeStr) || TypeUtils.IsMultisetType(typeStr)) && (values.ContainsKey(outp.Name + "_members") || values.ContainsKey(outp.Name + "_card")))
                     coveredOutputs.Add(outp.Name);
@@ -885,7 +885,7 @@ static class TestEmitter
                     sb.AppendLine($"    expect {outp.Name} == {val};");
                     coveredOutputs.Add(outp.Name);
                 }
-                else if (TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr)
+                else if (!hasUninterpFuncs && TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr)
                          && int.TryParse(lenStr, out var seqLen) && seqLen >= 0)
                 {
                     // Emit the full expected sequence value

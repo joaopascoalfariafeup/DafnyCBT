@@ -449,6 +449,17 @@ class Program
             if (hasNonInlinableFuncs)
                 Console.WriteLine($"  Note: postcondition uses non-inlinable function(s) {string.Join(", ", unsupportedFuncs.Select(f => $"'{f}'"))} — will test with full postcondition expects");
 
+            // Bitvector types (bv8, bv16, bv32, ...) are mapped to Int in SMT, so bitwise
+            // operators (^, &, |, <<, >>) become uninterpreted — Z3 picks arbitrary values.
+            // Force full-postcondition expects so the Dafny runtime evaluates them natively.
+            bool hasBitvectorTypes = method.Ins.Concat(method.Outs)
+                .Any(p => ContainsBitvectorType(p.Type.ToString()));
+            if (hasBitvectorTypes)
+            {
+                hasNonInlinableFuncs = true;
+                Console.WriteLine($"  Note: parameter/return uses bitvector type — will test with full postcondition expects");
+            }
+
             if (verbose)
             {
                 DafnyParser.DisplayContracts(method);
@@ -1808,6 +1819,10 @@ class Program
         foreach (var sub in expr.SubExpressions)
             CollectFunctionCalls(sub, names);
     }
+
+    /// Returns true if the type string is or contains a bitvector type (bv8, bv16, bv32, etc.).
+    static bool ContainsBitvectorType(string typeStr) =>
+        Regex.IsMatch(typeStr, @"\bbv\d+\b");
 
     /// <summary>
     /// Inline predicates in an Expression. If the string representation changes after inlining,
