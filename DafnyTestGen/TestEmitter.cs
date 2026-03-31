@@ -399,7 +399,7 @@ static class TestEmitter
         var testSource = Regex.Replace(originalSource, @"\bghost\s+function\b", "function");
         testSource = Regex.Replace(testSource, @"\bghost\s+predicate\b", "predicate");
         testSource = Regex.Replace(testSource, @"\bghost\s+var\b", "var");
-        testSource = Regex.Replace(testSource, @"\bghost\s+const\b", "const");
+        testSource = Regex.Replace(testSource, @"\bghost\s+const\b", "var"); // var so test code can assign it
         // Strip old() wrappers only in non-spec lines (statements, assertions).
         // old() in ensures/invariant/requires/decreases clauses must be preserved
         // because it has valid semantics there (refers to pre-state values).
@@ -478,16 +478,18 @@ static class TestEmitter
 
                 if (classInfo.ConstructorParams != null && classInfo.ConstructorParams.Count > 0)
                 {
-                    // Use constructor with Z3-chosen parameter values
-                    var ctorArgs = classInfo.ConstructorParams.Select(p =>
+                    // Declare constructor params as local variables (so they're in scope for PRE-CHECKs)
+                    var ctorArgs = new List<string>();
+                    foreach (var p in classInfo.ConstructorParams)
                     {
-                        if (values.TryGetValue(p.Name, out var val))
-                        {
-                            val = FormatScalarValue(val, p.Type, enumDatatypes);
-                            return val;
-                        }
-                        return p.Type switch { "real" => "0.0", "char" => "' '", "bool" => "false", "nat" => "1", _ => "1" };
-                    });
+                        string val;
+                        if (values.TryGetValue(p.Name, out var rawVal))
+                            val = FormatScalarValue(rawVal, p.Type, enumDatatypes);
+                        else
+                            val = p.Type switch { "real" => "0.0", "char" => "' '", "bool" => "false", "nat" => "1", _ => "1" };
+                        sb.AppendLine(EmitVarDecl(p.Name, p.Type, new Dictionary<string, string> { [p.Name] = val }, enumDatatypes));
+                        ctorArgs.Add(p.Name);
+                    }
                     sb.AppendLine($"    var obj := new {classNameWithTypes}({string.Join(", ", ctorArgs)});");
                 }
                 else if (classInfo.ConstructorParams != null)
