@@ -161,6 +161,61 @@ static class TestEmitter
     }
 
     /// <summary>
+    /// Strips any remaining old() wrappers from a literal that weren't handled by
+    /// ReplaceOldReferences (e.g., old() inside forall triggers or with quantifier-bound
+    /// non-array variables). old() is only valid in specification contexts, not runtime expects.
+    /// Replaces old(expr) with just expr, which uses the post-state value — an imperfect
+    /// but safe fallback (the expect may be weaker but won't cause a compile error).
+    /// </summary>
+    internal static string StripRemainingOld(string literal)
+    {
+        // Strip {:trigger old(...)} attributes entirely, as triggers are ghost.
+        // Use balanced-paren matching since old(...) may contain brackets like old(a[k]).
+        while (true)
+        {
+            var trigMatch = Regex.Match(literal, @"\{:trigger\s+old\s*\(");
+            if (!trigMatch.Success) break;
+            // Find matching ')' for old(
+            int tStart = trigMatch.Index + trigMatch.Length;
+            int tDepth = 1, tPos = tStart;
+            while (tPos < literal.Length && tDepth > 0)
+            {
+                if (literal[tPos] == '(') tDepth++;
+                else if (literal[tPos] == ')') tDepth--;
+                tPos++;
+            }
+            if (tDepth != 0) break;
+            // Now find the closing '}' of the attribute
+            int bracePos = tPos;
+            while (bracePos < literal.Length && literal[bracePos] != '}') bracePos++;
+            if (bracePos < literal.Length)
+                literal = literal.Substring(0, trigMatch.Index) + literal.Substring(bracePos + 1);
+            else break;
+        }
+
+        while (Regex.IsMatch(literal, @"\bold\s*\("))
+        {
+            var match = Regex.Match(literal, @"\bold\s*\(");
+            int start = match.Index + match.Length; // after '('
+            int depth = 1;
+            int pos = start;
+            while (pos < literal.Length && depth > 0)
+            {
+                if (literal[pos] == '(') depth++;
+                else if (literal[pos] == ')') depth--;
+                pos++;
+            }
+            if (depth == 0)
+            {
+                var inner = literal.Substring(start, pos - 1 - start);
+                literal = literal.Substring(0, match.Index) + inner + literal.Substring(pos);
+            }
+            else break; // unbalanced — stop
+        }
+        return literal;
+    }
+
+    /// <summary>
     /// Substitutes type parameters in a type string, e.g. "seq&lt;T&gt;" -> "seq&lt;int&gt;"
     /// </summary>
     internal static string SubstTypeParams(string typeStr, Dictionary<string, string> typeParamMap)
@@ -476,6 +531,10 @@ static class TestEmitter
                 if (classInfo.ClassTypeParams != null && classInfo.ClassTypeParams.Count > 0)
                     classNameWithTypes += $"<{string.Join(", ", classInfo.ClassTypeParams.Select(tp => typeParamMap.TryGetValue(tp, out var t) ? t : "int"))}>";
 
+                // For named constructors: new ClassName.CtorName(args)
+                // For unnamed constructors: new ClassName(args) or new ClassName()
+                // For no constructor: new ClassName;  (but only if class has no explicit constructors)
+                var ctorSuffix = classInfo.ConstructorName != null ? $".{classInfo.ConstructorName}" : "";
                 if (classInfo.ConstructorParams != null && classInfo.ConstructorParams.Count > 0)
                 {
                     // Declare constructor params as local variables (so they're in scope for PRE-CHECKs)
@@ -490,12 +549,12 @@ static class TestEmitter
                         sb.AppendLine(EmitVarDecl(p.Name, p.Type, new Dictionary<string, string> { [p.Name] = val }, enumDatatypes));
                         ctorArgs.Add(p.Name);
                     }
-                    sb.AppendLine($"    var obj := new {classNameWithTypes}({string.Join(", ", ctorArgs)});");
+                    sb.AppendLine($"    var obj := new {classNameWithTypes}{ctorSuffix}({string.Join(", ", ctorArgs)});");
                 }
                 else if (classInfo.ConstructorParams != null)
                 {
                     // Constructor exists but has no params — still need parens
-                    sb.AppendLine($"    var obj := new {classNameWithTypes}();");
+                    sb.AppendLine($"    var obj := new {classNameWithTypes}{ctorSuffix}();");
                 }
                 else
                 {
@@ -722,6 +781,7 @@ static class TestEmitter
                 // For autocontracts, Valid() is auto-injected as expect obj.Valid() — skip from literals
                 .Where(lit => !(classInfo is { IsAutoContracts: true } && Regex.IsMatch(lit.Trim(), @"^Valid\s*\(\s*\)$")))
                 .Select(lit => ReplaceOldReferences(lit, oldCaptures, arrayParamNames))
+                .Select(lit => StripRemainingOld(lit))
                 .ToList();
 
             // For class methods, replace bare field references with obj.field in expects

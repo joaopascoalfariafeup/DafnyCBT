@@ -11,7 +11,8 @@ record ClassInfo(
     List<(string Name, string Type)>? ConstructorParams = null,
     List<Expression>? ConstructorRequires = null,
     List<(string Name, string Type)>? GhostFields = null,
-    List<string>? ClassTypeParams = null);
+    List<string>? ClassTypeParams = null,
+    string? ConstructorName = null);
 
 static class DafnyParser
 {
@@ -185,13 +186,15 @@ static class DafnyParser
                 return RejectClass(method.Name, cls.Name, $"field '{name}' has unsupported type '{type}'");
 
         // Find the constructor and its params/requires
+        // Dafny unnamed constructors have Name == "_ctor"; named constructors have their actual name.
+        // Detect by checking if the member's runtime type name contains "Constructor".
         List<(string Name, string Type)>? ctorParams = null;
         List<Expression>? ctorRequires = null;
+        string? ctorName = null;
         foreach (var member in cls.Members)
         {
-            if (member.Name == "_ctor")
+            if (member.Name == "_ctor" || member.GetType().Name.Contains("Constructor"))
             {
-                // Constructor may not be a Method subtype in this Dafny version — use dynamic
                 try
                 {
                     dynamic ctor = member;
@@ -199,6 +202,9 @@ static class DafnyParser
                     var reqs = (IEnumerable<AttributedExpression>)ctor.Req;
                     ctorParams = ins.Select(p => (p.Name, Type: p.Type.ToString())).ToList();
                     ctorRequires = reqs.Select(r => (Expression)r.E).ToList();
+                    // Named constructors: use actual name; unnamed ("_ctor"): leave null
+                    if (member.Name != "_ctor")
+                        ctorName = member.Name;
                 }
                 catch { /* ignore if properties don't exist */ }
                 break; // use the first constructor
@@ -208,7 +214,7 @@ static class DafnyParser
         // Capture class-level type parameters
         var classTypeParams = cls.TypeArgs?.Select(tp => tp.Name).ToList();
 
-        return new ClassInfo(cls.Name, fields, isAutoContracts, constFields, ctorParams, ctorRequires, ghostFields, classTypeParams);
+        return new ClassInfo(cls.Name, fields, isAutoContracts, constFields, ctorParams, ctorRequires, ghostFields, classTypeParams, ctorName);
     }
 
     /// <summary>
