@@ -36,6 +36,7 @@ static class TestEmitter
         List<string> literals, HashSet<string> arrayParamNames, HashSet<string> knownIdentifiers)
     {
         var captures = new Dictionary<string, (string varName, bool isArray)>(); // captureExpr -> (varName, isArray)
+        var arrayCaptures = new HashSet<string>(); // arrayNames that already have array captures
         foreach (var lit in literals)
         {
             foreach (Match m in Regex.Matches(lit, @"\bold\s*\("))
@@ -83,16 +84,33 @@ static class TestEmitter
                         if (arrayAccessMatch.Success && arrayParamNames.Contains(arrayAccessMatch.Groups[1].Value))
                         {
                             var arrayName = arrayAccessMatch.Groups[1].Value;
-                            var captureExpr = arrayName + "[..]";
-                            if (!captures.ContainsKey(captureExpr))
-                                captures[captureExpr] = ("old_" + arrayName, true);
+                            if (!arrayCaptures.Contains(arrayName))
+                            {
+                                var captureExpr = arrayName + "[..]";
+                                if (!captures.ContainsKey(captureExpr))
+                                    captures[captureExpr] = ("old_" + arrayName, true);
+                                // Even if captureExpr exists as whole-expression capture,
+                                // track the array capture so ReplaceOldReferences can
+                                // substitute old(arrayName[i]) -> old_arrayName[i].
+                                arrayCaptures.Add(arrayName);
+                            }
                         }
                         // else: can't capture this old() expression — will remain untranslated
                     }
                 }
             }
         }
-        return captures.Select(kv => (kv.Key, kv.Value.varName, kv.Value.isArray)).ToList();
+        var result = captures.Select(kv => (kv.Key, kv.Value.varName, kv.Value.isArray)).ToList();
+        // Add array captures that couldn't be stored in dict (key collision with whole-expression capture).
+        // These don't need a separate var emission (the array is captured via whole-expression),
+        // but ReplaceOldReferences needs them to substitute old(a[i]) -> old_a[i].
+        foreach (var arrayName in arrayCaptures)
+        {
+            var varName = "old_" + arrayName;
+            if (!result.Any(r => r.varName == varName && r.isArray))
+                result.Add((arrayName + "[..]", varName, true));
+        }
+        return result;
     }
 
     /// <summary>
@@ -161,38 +179,41 @@ static class TestEmitter
     }
 
     /// <summary>
+    /// Strips {:trigger ...} attributes from a literal. Triggers are ghost/specification-only
+    /// and cause compile errors in runtime expects. Must run BEFORE ReplaceOldReferences
+    /// so that old() inside triggers doesn't confuse array capture balanced-paren matching.
+    /// </summary>
+    internal static string StripTriggerAttributes(string literal)
+    {
+        // Remove all {:trigger ...} attributes using balanced-brace matching
+        while (true)
+        {
+            var trigMatch = Regex.Match(literal, @"\{:trigger\s+");
+            if (!trigMatch.Success) break;
+            // Find the closing '}' — need balanced braces in case of nested {...}
+            int tStart = trigMatch.Index + trigMatch.Length;
+            int depth = 1, tPos = tStart;
+            while (tPos < literal.Length && depth > 0)
+            {
+                if (literal[tPos] == '{') depth++;
+                else if (literal[tPos] == '}') depth--;
+                tPos++;
+            }
+            if (depth == 0)
+                literal = literal.Substring(0, trigMatch.Index) + literal.Substring(tPos);
+            else break;
+        }
+        return literal.Replace("  ", " "); // clean up double spaces left by removal
+    }
+
+    /// <summary>
     /// Strips any remaining old() wrappers from a literal that weren't handled by
-    /// ReplaceOldReferences (e.g., old() inside forall triggers or with quantifier-bound
-    /// non-array variables). old() is only valid in specification contexts, not runtime expects.
-    /// Replaces old(expr) with just expr, which uses the post-state value — an imperfect
-    /// but safe fallback (the expect may be weaker but won't cause a compile error).
+    /// ReplaceOldReferences (e.g., quantifier-bound non-array variables).
+    /// Replaces old(expr) with just expr — an imperfect but safe fallback.
+    /// Must run AFTER ReplaceOldReferences.
     /// </summary>
     internal static string StripRemainingOld(string literal)
     {
-        // Strip {:trigger old(...)} attributes entirely, as triggers are ghost.
-        // Use balanced-paren matching since old(...) may contain brackets like old(a[k]).
-        while (true)
-        {
-            var trigMatch = Regex.Match(literal, @"\{:trigger\s+old\s*\(");
-            if (!trigMatch.Success) break;
-            // Find matching ')' for old(
-            int tStart = trigMatch.Index + trigMatch.Length;
-            int tDepth = 1, tPos = tStart;
-            while (tPos < literal.Length && tDepth > 0)
-            {
-                if (literal[tPos] == '(') tDepth++;
-                else if (literal[tPos] == ')') tDepth--;
-                tPos++;
-            }
-            if (tDepth != 0) break;
-            // Now find the closing '}' of the attribute
-            int bracePos = tPos;
-            while (bracePos < literal.Length && literal[bracePos] != '}') bracePos++;
-            if (bracePos < literal.Length)
-                literal = literal.Substring(0, trigMatch.Index) + literal.Substring(bracePos + 1);
-            else break;
-        }
-
         while (Regex.IsMatch(literal, @"\bold\s*\("))
         {
             var match = Regex.Match(literal, @"\bold\s*\(");
@@ -740,8 +761,15 @@ static class TestEmitter
                         if (isClassMember) knownIdentifiers.Add(pName);
             }
             var oldCaptures = ExtractOldCaptures(literals, arrayParamNames, knownIdentifiers);
+            var emittedVarNames = new HashSet<string>();
             foreach (var (oldExpr, varName, isArrayCapture) in oldCaptures)
             {
+                // Skip array captures whose varName is already declared (from a whole-expression
+                // capture of the same array, e.g. old(nums) -> old_nums := nums already exists,
+                // so we don't also emit old_nums := nums[..] — the array capture is only
+                // needed for ReplaceOldReferences to know to substitute old(nums[i]) -> old_nums[i]).
+                if (emittedVarNames.Contains(varName))
+                    continue;
                 var captureExpr = oldExpr;
                 if (classInfo != null)
                 {
@@ -772,6 +800,7 @@ static class TestEmitter
                     }
                 }
                 sb.AppendLine($"    var {varName} := {captureExpr};");
+                emittedVarNames.Add(varName);
             }
 
             // Build expectLiterals early (before the call) so we can capture RHS expressions.
@@ -780,8 +809,9 @@ static class TestEmitter
                 .Where(lit => !TypeUtils.IsSpecOnlyLiteral(lit))
                 // For autocontracts, Valid() is auto-injected as expect obj.Valid() — skip from literals
                 .Where(lit => !(classInfo is { IsAutoContracts: true } && Regex.IsMatch(lit.Trim(), @"^Valid\s*\(\s*\)$")))
+                .Select(lit => StripTriggerAttributes(lit))    // triggers are ghost — strip before old() handling
                 .Select(lit => ReplaceOldReferences(lit, oldCaptures, arrayParamNames))
-                .Select(lit => StripRemainingOld(lit))
+                .Select(lit => StripRemainingOld(lit))          // fallback for any remaining old()
                 .ToList();
 
             // For class methods, replace bare field references with obj.field in expects
