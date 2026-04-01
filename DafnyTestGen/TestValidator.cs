@@ -295,27 +295,33 @@ static class TestValidator
     }
 
     /// <summary>
-    /// If the expect expression is `var == ExprContainingFunctionCall(...)` or
-    /// `var == check_var` (pre-call captured value), returns a print statement
-    /// like: print "VAL:testId:var=", var, "\n";
-    /// Returns null if the expect doesn't match these patterns.
+    /// If the expect expression is `var == <non-trivial expr>`, returns a print statement
+    /// that captures the actual runtime value: print "VAL:testId:var=", var, "\n";
+    /// Returns null if the RHS is already a simple literal (int/bool/char) — nothing to capture.
     /// </summary>
     static string? TryMakeValPrint(string expr, int testId, string indent)
     {
         // Match: varName == <expr>
-        // e.g., "f == Fact(n)" or "r == check_r"
         var m = Regex.Match(expr, @"^(\w+)\s*==\s*(.+)$");
         if (!m.Success) return null;
 
         var varName = m.Groups[1].Value;
-        var rhs = m.Groups[2].Value;
+        var rhs = m.Groups[2].Value.Trim();
 
-        // Emit VAL print if the RHS contains a function call OR is a check_ variable
-        if (!Regex.IsMatch(rhs, @"[A-Z]\w*\s*\(") && !Regex.IsMatch(rhs, @"^check_\w+$"))
-            return null;
+        // Don't emit VAL for simple scalar literals — the expect is already concrete
+        if (IsSimpleScalarLiteral(rhs)) return null;
 
         return $"{indent}print \"VAL:{testId}:{varName}=\", {varName}, \"\\n\";";
     }
+
+    /// <summary>
+    /// Returns true if the string is already a simple scalar literal:
+    /// integer, real, bool, or char. These don't need runtime capture.
+    /// </summary>
+    static bool IsSimpleScalarLiteral(string s) =>
+        Regex.IsMatch(s, @"^-?\d+(\.\d+)?$")   // int or real
+        || s == "true" || s == "false"           // bool
+        || Regex.IsMatch(s, @"^'.'$");           // char
 
     // ─────────────────────────────────────────────────────────────────────────
     // Marker parsing
@@ -391,11 +397,11 @@ static class TestValidator
                 var rhs = m.Groups[4].Value;
                 var semi = m.Groups[5].Value;
 
-                // Only replace if RHS has a function call or is check_var,
-                // we captured the value, and the value is a valid Dafny literal
+                // Replace if we captured the runtime value AND it's a valid injectable literal.
+                // Don't replace if RHS is already the same simple literal (nothing to gain).
                 if (vars.TryGetValue(varName, out var value) &&
-                    (Regex.IsMatch(rhs, @"[A-Z]\w*\s*\(") || Regex.IsMatch(rhs, @"^check_\w+$")) &&
-                    IsValidDafnyLiteral(value))
+                    IsValidDafnyLiteral(value) &&
+                    !IsSimpleScalarLiteral(rhs.Trim()))
                 {
                     return $"{indent}{varName}{eq}{value}{semi}";
                 }
@@ -404,9 +410,9 @@ static class TestValidator
             RegexOptions.Multiline);
 
         // Remove unused check_ variable declarations when the value was injected
-        foreach (var varName in vars.Keys)
+        foreach (var (varName, value) in vars)
         {
-            if (vars.TryGetValue(varName, out var value) && IsValidDafnyLiteral(value))
+            if (IsValidDafnyLiteral(value))
             {
                 // Remove lines like: "    var check_varName := <expr>;"
                 result = Regex.Replace(result,
@@ -420,15 +426,23 @@ static class TestValidator
     }
 
     /// <summary>
-    /// Checks if a captured value is a valid Dafny literal that can be injected.
-    /// Accepts: integers (-?digits), reals (-?digits.digits), booleans, char literals.
-    /// Rejects: strings, sequences, objects, or any other printed representation.
+    /// Checks if a captured runtime value can be injected directly as a Dafny literal.
+    /// Accepts scalars (int, real, bool, char) and collection displays printed by Dafny:
+    ///   sets:      {} or {1, 2, -3}
+    ///   multisets: multiset{} or multiset{1, 2, 2}
+    ///   sequences: [] or [1, 2, 3]
+    /// Rejects strings, objects, lambdas, or unknown formats.
     /// </summary>
     static bool IsValidDafnyLiteral(string value)
     {
-        return Regex.IsMatch(value, @"^-?\d+(\.\d+)?$")  // int or real
-            || value == "true" || value == "false"         // bool
-            || Regex.IsMatch(value, @"^'.'$");             // char
+        if (IsSimpleScalarLiteral(value)) return true;
+        // Set literal: {} or {n1, n2, ...} (integer elements)
+        if (Regex.IsMatch(value, @"^\{(\s*-?\d+\s*(,\s*-?\d+\s*)*)?\}$")) return true;
+        // Multiset literal: multiset{} or multiset{n1, n2, ...}
+        if (Regex.IsMatch(value, @"^multiset\{(\s*-?\d+\s*(,\s*-?\d+\s*)*)?\}$")) return true;
+        // Sequence literal: [] or [n1, n2, ...]
+        if (Regex.IsMatch(value, @"^\[(\s*-?\d+\s*(,\s*-?\d+\s*)*)?\]$")) return true;
+        return false;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
