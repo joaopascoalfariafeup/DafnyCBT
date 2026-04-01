@@ -101,16 +101,16 @@ static class TestEmitter
             }
         }
         var result = captures.Select(kv => (innerExpr: kv.Key, varName: kv.Value.varName, isArrayCapture: kv.Value.isArray)).ToList();
-        // For array captures that couldn't be stored in dict (key collision with
-        // whole-expression capture of "arrayName[..]"), add an array capture entry
-        // that reuses the existing sequence snapshot variable.
-        // old(a[i]) must index the sequence snapshot (contents), not the array reference,
-        // because arrays are reference types — old_a := a only copies the pointer.
+        // For each array that needs old(a[i]) substitution, ensure we have an array
+        // capture entry pointing to a SEQUENCE snapshot (not an array reference).
+        // Arrays are reference types — old_a := a only copies the pointer, so
+        // old_a[i] after mutation gives post-call values. We need a[..] snapshot.
         foreach (var arrayName in arrayCaptures)
         {
-            if (result.Any(r => r.isArrayCapture && r.varName == "old_" + arrayName))
-                continue; // already have a proper array capture
-            // Find the sequence snapshot variable (whole-expression capture of "arrayName[..]")
+            if (result.Any(r => r.isArrayCapture && r.innerExpr == arrayName + "[..]"))
+                continue; // already have a proper array capture in the dict
+
+            // Find existing sequence snapshot (whole-expression capture of "arrayName[..]")
             var snapshotCapture = result.FirstOrDefault(r =>
                 !r.isArrayCapture && r.innerExpr == arrayName + "[..]");
             if (snapshotCapture.varName != null)
@@ -120,8 +120,13 @@ static class TestEmitter
             }
             else
             {
-                // No sequence snapshot exists — create the array capture normally
-                result.Add((arrayName + "[..]", "old_" + arrayName, true));
+                // No sequence snapshot exists — create one with a unique name.
+                // Avoid collision with existing captures (e.g. old_a might already
+                // be a reference capture from old(a)).
+                var candidateName = "old_" + arrayName;
+                if (result.Any(r => r.varName == candidateName))
+                    candidateName = "old_" + arrayName + "_contents";
+                result.Add((arrayName + "[..]", candidateName, true));
             }
         }
         return result;
