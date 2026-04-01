@@ -777,10 +777,14 @@ static class TestEmitter
             }
 
             // For postconditions of the form "outName == <expr>" where <expr> only references
-            // inputs (not outputs), capture the RHS before the call so we get a concrete value.
-            // Only capture for outputs NOT already covered by concrete Z3 values.
+            // inputs (not outputs), we either:
+            //   a) pre-capture as "var check_X := <rhs>;" BEFORE the call if RHS references
+            //      mutable inputs (to snapshot the pre-call state), or
+            //   b) inline the RHS directly in the post-call expect (no extra variable needed).
+            // Only applies to outputs NOT already covered by concrete Z3 values.
             var outNames_set = new HashSet<string>(method.Outs.Select(o => o.Name));
-            var rhsCaptures = new Dictionary<string, string>(); // outName -> check_outName
+            var rhsCaptures = new Dictionary<string, string>(); // outName -> check_outName (pre-captured)
+            var rhsInline = new Dictionary<string, string>();   // outName -> rhs (inline after call)
             foreach (var lit in expectLiterals)
             {
                 // Match "outName == <expr>" at the start of the literal (but not <==> or ==>)
@@ -790,7 +794,7 @@ static class TestEmitter
                 var rhs = m.Groups[2].Value.Trim();
                 if (!outNames_set.Contains(lhs)) continue;
                 if (coveredOutputs.Contains(lhs)) continue; // Z3 already gave a concrete value
-                if (rhsCaptures.ContainsKey(lhs)) continue; // already captured from first matching literal
+                if (rhsCaptures.ContainsKey(lhs) || rhsInline.ContainsKey(lhs)) continue;
                 // Check that the RHS doesn't reference any output variable
                 bool rhsRefsOutput = false;
                 foreach (var outp in method.Outs)
@@ -799,8 +803,19 @@ static class TestEmitter
                     { rhsRefsOutput = true; break; }
                 }
                 if (rhsRefsOutput) continue;
-                rhsCaptures[lhs] = "check_" + lhs;
-                sb.AppendLine($"    var check_{lhs} := {rhs};");
+                // Pre-capture only if RHS references a mutable input (needs pre-call snapshot).
+                // Otherwise, inline the RHS directly in the post-call expect.
+                bool rhsRefsMutable = mutableNames != null &&
+                    mutableNames.Any(mn => Regex.IsMatch(rhs, @"\b" + Regex.Escape(mn) + @"\b"));
+                if (rhsRefsMutable)
+                {
+                    rhsCaptures[lhs] = "check_" + lhs;
+                    sb.AppendLine($"    var check_{lhs} := {rhs};");
+                }
+                else
+                {
+                    rhsInline[lhs] = rhs;
+                }
             }
 
             // Emit precondition checks (used by check mode to discard invalid test cases)
@@ -912,11 +927,11 @@ static class TestEmitter
                     }
                     coveredOutputs.Add(outp.Name);
                 }
-                else if (TypeUtils.IsSetType(typeStr))
+                else if (!hasUninterpFuncs && TypeUtils.IsSetType(typeStr))
                 {
-                    if (rhsCaptures.ContainsKey(outp.Name))
+                    if (rhsCaptures.ContainsKey(outp.Name) || rhsInline.ContainsKey(outp.Name))
                     {
-                        // Let the literal expect mechanism use check_outName
+                        // Let the literal expect mechanism use check_outName / inline rhs
                     }
                     else if (values.TryGetValue(outp.Name + "_members", out var setMembers))
                     {
@@ -931,11 +946,11 @@ static class TestEmitter
                         coveredOutputs.Add(outp.Name);
                     }
                 }
-                else if (TypeUtils.IsMultisetType(typeStr))
+                else if (!hasUninterpFuncs && TypeUtils.IsMultisetType(typeStr))
                 {
-                    if (rhsCaptures.ContainsKey(outp.Name))
+                    if (rhsCaptures.ContainsKey(outp.Name) || rhsInline.ContainsKey(outp.Name))
                     {
-                        // Let the literal expect mechanism use check_outName
+                        // Let the literal expect mechanism use check_outName / inline rhs
                     }
                     else if (values.TryGetValue(outp.Name + "_members", out var msetMembers))
                     {
@@ -954,9 +969,9 @@ static class TestEmitter
                 {
                     // Prefer literal expect with check variable (runtime evaluation) over
                     // Z3-computed map values, since map postconditions may not be fully translated.
-                    if (rhsCaptures.ContainsKey(outp.Name))
+                    if (rhsCaptures.ContainsKey(outp.Name) || rhsInline.ContainsKey(outp.Name))
                     {
-                        // Let the literal expect mechanism use check_outName
+                        // Let the literal expect mechanism use check_outName / inline rhs
                     }
                     else if (values.TryGetValue(outp.Name + "_keys", out var mapKeys) && values.TryGetValue(outp.Name + "_vals", out var mapVals))
                     {
@@ -978,7 +993,10 @@ static class TestEmitter
             }
             // Emit postcondition literals for outputs not covered by concrete values,
             // plus any literals that don't reference output variables at all.
-            // For "outName == <expr>" literals with a pre-call RHS capture, use check_outName.
+            // For "outName == <expr>" literals with a pre-call RHS capture, use check_outName;
+            // for inline-RHS literals, emit "expect outName == <rhs>" directly.
+            // Literals that mention no output variable are only emitted in full postcondition mode
+            // (hasUninterpFuncs) — in concrete-value mode they are redundant.
             foreach (var lit in expectLiterals)
             {
                 bool mentionsOnlyCoveredOutputs = true;
@@ -993,13 +1011,18 @@ static class TestEmitter
                             mentionsOnlyCoveredOutputs = false;
                     }
                 }
-                // Emit if: mentions no output (e.g. "x in C"), or mentions an uncovered output
+                // Skip literals mentioning no output when we have concrete values — they are
+                // implied by the output assertions and add noise to the test.
+                if (!mentionsAnyOutput && !hasUninterpFuncs)
+                    continue;
+                // Emit if: mentions an uncovered output (or no-output in full-postcondition mode)
                 if (!mentionsAnyOutput || !mentionsOnlyCoveredOutputs)
                 {
-                    // If this literal is "outName == <expr>" and we captured RHS, use check_outName
                     var litMatch = Regex.Match(lit, @"^(\w+)\s*==\s*(?![>=])(.+)$", RegexOptions.Singleline);
                     if (litMatch.Success && rhsCaptures.TryGetValue(litMatch.Groups[1].Value, out var checkVar))
                         sb.AppendLine($"    expect {litMatch.Groups[1].Value} == {checkVar};");
+                    else if (litMatch.Success && rhsInline.TryGetValue(litMatch.Groups[1].Value, out var inlineRhs))
+                        sb.AppendLine($"    expect {litMatch.Groups[1].Value} == {inlineRhs};");
                     else
                         sb.AppendLine($"    expect {lit};");
                 }
