@@ -1033,12 +1033,22 @@ static class SmtTranslator
         // FunctionCallExpr
         if (expr is FunctionCallExpr funcCall)
         {
-            // IsSorted: built-in SMT encoding
+            // IsSorted: built-in SMT encoding — finite consecutive-pair expansion
+            // (avoids Z3 quantifier instantiation failures with two-variable forall over seq.nth)
             if (funcCall.Name == "IsSorted" && funcCall.Args.Count == 1)
             {
                 var argSmt = ExprToSmt(funcCall.Args[0], inputs, mutableNames, isPostContext, insideOld);
                 if (argSmt != null)
-                    return $"(forall ((i Int) (j Int)) (=> (and (<= 0 i) (< i j) (< j (seq.len {argSmt}))) (<= (seq.nth {argSmt} i) (seq.nth {argSmt} j))))";
+                {
+                    // For array arguments, ExprToSmt returns the plain name (e.g. "a" or "a_pre").
+                    // Convert to the _seq form so the sort matches (Seq Int), not Int.
+                    var baseName = argSmt.EndsWith("_post") ? argSmt[..^5]
+                                 : argSmt.EndsWith("_pre")  ? argSmt[..^4]
+                                 : argSmt;
+                    var isArray = inputs.Any(v => v.Name == baseName && TypeUtils.IsArrayType(v.Type));
+                    var seqSmt = isArray ? $"{argSmt}_seq" : argSmt;
+                    return BuildIsSortedSmt(seqSmt);
+                }
             }
             // Generic: uninterpreted function
             var smtArgs = funcCall.Args.Select(a => ExprToSmt(a, inputs, mutableNames, isPostContext, insideOld)).ToList();
@@ -1721,7 +1731,7 @@ static class SmtTranslator
             return $"{lenMatch.Groups[1].Value}_len";
         }
 
-        // Handle IsSorted(a[..]) or IsSorted(s_a)
+        // Handle IsSorted(a[..]) or IsSorted(a) or IsSorted(s)
         if (expr.StartsWith("IsSorted("))
         {
             // Extract the argument
@@ -1730,10 +1740,14 @@ static class SmtTranslator
             if (arg.EndsWith("[..]"))
                 seqName = arg.Substring(0, arg.Length - 4) + "_seq";
             else
-                seqName = arg;
+            {
+                // If arg is a plain array variable name, use its _seq form
+                var isArray = inputs.Any(v => v.Name == arg && TypeUtils.IsArrayType(v.Type));
+                seqName = isArray ? $"{arg}_seq" : arg;
+            }
 
-            // Encode: forall i j. 0 <= i < j < |seq| => seq[i] <= seq[j]
-            return $"(forall ((i Int) (j Int)) (=> (and (<= 0 i) (< i j) (< j (seq.len {seqName}))) (<= (seq.nth {seqName} i) (seq.nth {seqName} j))))";
+            // Finite consecutive-pair expansion (avoids two-variable forall over seq.nth)
+            return BuildIsSortedSmt(seqName);
         }
 
         // Handle |expr| (sequence length or set cardinality)
@@ -2008,6 +2022,128 @@ static class SmtTranslator
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// Finitely expands IsSorted(seq) into consecutive-pair constraints.
+    /// Instead of an unreliable two-variable forall over seq.nth, generates:
+    ///   (and (=> (>= (seq.len s) 2) (<= (seq.nth s 0) (seq.nth s 1)))
+    ///        (=> (>= (seq.len s) 3) (<= (seq.nth s 1) (seq.nth s 2)))
+    ///        ...)
+    /// Consecutive pairs are sufficient because <= is transitive.
+    /// Z3 handles these ground constraints reliably (no quantifier instantiation needed).
+    /// </summary>
+    internal static string BuildIsSortedSmt(string seqName)
+    {
+        var conjuncts = new List<string>();
+        for (int i = 0; i < MAX_SEQ_LEN - 1; i++)
+            conjuncts.Add($"(=> (>= (seq.len {seqName}) {i + 2}) (<= (seq.nth {seqName} {i}) (seq.nth {seqName} {i + 1})))");
+        return conjuncts.Count == 1 ? conjuncts[0] : $"(and {string.Join(" ", conjuncts)})";
+    }
+
+    /// <summary>
+    /// Builds an SMT2 query that checks whether the outputs found in <paramref name="values"/>
+    /// are uniquely determined by the spec for those specific inputs.
+    ///
+    /// Strategy: take the original query (preconditions + postconditions), fix the input
+    /// values, negate the found output values, then ask Z3 to find a satisfying assignment.
+    ///   UNSAT → no other output is possible → output is uniquely determined.
+    ///   SAT   → another output satisfies the spec → spec is under-constrained for this case.
+    ///
+    /// Returns an empty string if there are no scorable outputs (nothing to check).
+    /// </summary>
+    internal static string BuildUniquenessQuery(
+        string originalQuery,
+        List<(string Name, string Type)> inputs,
+        List<(string Name, string Type)> outputs,
+        Dictionary<string, string> values,
+        HashSet<string> mutableNames)
+    {
+        // Strip everything from the last (check-sat) onward
+        var checkIdx = originalQuery.LastIndexOf("(check-sat)");
+        if (checkIdx < 0) return "";
+        var sb = new System.Text.StringBuilder(originalQuery.Substring(0, checkIdx));
+
+        // Fix input values to pin the specific scenario Z3 chose
+        foreach (var (name, type) in inputs)
+        {
+            var smtBase = mutableNames.Contains(name) ? $"{name}_pre" : name;
+            if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
+            {
+                var seqName = TypeUtils.SeqSmtName(smtBase, type);
+                if (values.TryGetValue(smtBase + "_len", out var lenStr) && int.TryParse(lenStr, out var len))
+                {
+                    sb.AppendLine($"(assert (= (seq.len {seqName}) {len}))");
+                    if (values.TryGetValue(smtBase + "_elems", out var elemsStr))
+                    {
+                        var elems = elemsStr.Split(',');
+                        for (int i = 0; i < Math.Min(len, elems.Length); i++)
+                            sb.AppendLine($"(assert (= (seq.nth {seqName} {i}) {elems[i]}))");
+                    }
+                }
+            }
+            else if (!TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type) && !TypeUtils.IsMapType(type))
+            {
+                if (values.TryGetValue(smtBase, out var val))
+                    sb.AppendLine($"(assert (= {smtBase} {val}))");
+            }
+        }
+
+        // Build blocking clause: negation of ALL found output values simultaneously.
+        // UNSAT after adding this clause → only one valid output exists for these inputs.
+        var eqParts = new List<string>();
+
+        // Mutable inputs' post-states are outputs (e.g. sorted array in BubbleSort)
+        foreach (var (name, type) in inputs)
+        {
+            if (!mutableNames.Contains(name)) continue;
+            var postBase = $"{name}_post";
+            if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
+            {
+                var seqName = TypeUtils.SeqSmtName(postBase, type);
+                if (values.TryGetValue(postBase + "_len", out var lenStr) && int.TryParse(lenStr, out var len))
+                {
+                    eqParts.Add($"(= (seq.len {seqName}) {len})");
+                    if (values.TryGetValue(postBase + "_elems", out var elemsStr))
+                    {
+                        var elems = elemsStr.Split(',');
+                        for (int i = 0; i < Math.Min(len, elems.Length); i++)
+                            eqParts.Add($"(= (seq.nth {seqName} {i}) {elems[i]})");
+                    }
+                }
+            }
+        }
+
+        // Explicit return outputs
+        foreach (var (name, type) in outputs)
+        {
+            if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
+            {
+                var seqName = TypeUtils.SeqSmtName(name, type);
+                if (values.TryGetValue(name + "_len", out var lenStr) && int.TryParse(lenStr, out var len))
+                {
+                    eqParts.Add($"(= (seq.len {seqName}) {len})");
+                    if (values.TryGetValue(name + "_elems", out var elemsStr))
+                    {
+                        var elems = elemsStr.Split(',');
+                        for (int i = 0; i < Math.Min(len, elems.Length); i++)
+                            eqParts.Add($"(= (seq.nth {seqName} {i}) {elems[i]})");
+                    }
+                }
+            }
+            else if (!TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type) && !TypeUtils.IsMapType(type))
+            {
+                if (values.TryGetValue(name, out var val))
+                    eqParts.Add($"(= {name} {val})");
+            }
+        }
+
+        if (eqParts.Count == 0) return ""; // nothing to block
+
+        var conjunction = eqParts.Count == 1 ? eqParts[0] : $"(and {string.Join(" ", eqParts)})";
+        sb.AppendLine($"(assert (not {conjunction}))");
+        sb.AppendLine("(check-sat)");
+        return sb.ToString();
     }
 
     /// <summary>

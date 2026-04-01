@@ -1270,6 +1270,15 @@ class Program
                 {
                     if (verbose)
                         Console.WriteLine($"  Combination {solveLabel}: SAT - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                    // Uniqueness check: is the output uniquely determined for these specific inputs?
+                    var uQuery = SmtTranslator.BuildUniquenessQuery(smt, inputs, outputs, values, mutableNames);
+                    if (!string.IsNullOrEmpty(uQuery) && !TimedOut())
+                    {
+                        var uResult = await Z3Runner.RunZ3(z3Path, uQuery);
+                        bool isUnique = uResult.Split('\n').Any(l => l.Trim() == "unsat");
+                        values["__unique__"] = isUnique ? "true" : "false";
+                        if (verbose) Console.WriteLine($"  Combination {solveLabel}: output uniqueness: {(isUnique ? "unique" : "not unique")}");
+                    }
                     return (values, false);
                 }
                 if (verbose) Console.WriteLine($"  Combination {solveLabel}: SAT but could not parse model");

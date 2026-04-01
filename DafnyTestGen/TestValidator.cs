@@ -231,7 +231,16 @@ static class TestValidator
         // Individual test methods
         for (int i = 0; i < testBlocks.Count; i++)
         {
-            var body = ReplaceExpectsWithChecks(testBlocks[i].body, i);
+            // Extract output variable names from method call pattern: "var x := Method(...);"
+            // or "var x, y := Method(...);"
+            HashSet<string>? outputNames = null;
+            var callMatch = Regex.Match(testBlocks[i].body, @"var\s+([\w,\s]+):=\s*\w+\(");
+            if (callMatch.Success)
+            {
+                outputNames = new HashSet<string>(
+                    callMatch.Groups[1].Value.Split(',').Select(n => n.Trim()).Where(n => n.Length > 0));
+            }
+            var body = ReplaceExpectsWithChecks(testBlocks[i].body, i, outputNames);
             sb.AppendLine($"method TestCase_{i}()");
             sb.AppendLine("{");
             sb.Append(body);
@@ -264,9 +273,11 @@ static class TestValidator
     /// For expects of the form `expect var == FuncCall(...);`, also adds a
     /// print statement to capture the actual value: `print "VAL:testId:var=", var, "\n";`
     /// </summary>
-    static string ReplaceExpectsWithChecks(string body, int testId)
+    static string ReplaceExpectsWithChecks(string body, int testId, HashSet<string>? outputNames = null)
     {
-        return Regex.Replace(body,
+        // Track which outputs already have VAL prints from "var == expr" patterns
+        var capturedOutputs = new HashSet<string>();
+        var result = Regex.Replace(body,
             @"^(\s*)expect (.+);(?: // PRE-CHECK)?",
             m =>
             {
@@ -288,10 +299,37 @@ static class TestValidator
                 // Detect `var == ExprWithFuncCall` and emit VAL print for the variable
                 var valPrint = TryMakeValPrint(expr, testId, indent);
                 if (valPrint != null)
+                {
+                    var eqMatch = Regex.Match(expr, @"^(\w+)\s*==");
+                    if (eqMatch.Success) capturedOutputs.Add(eqMatch.Groups[1].Value);
                     return valPrint + "\n" + checkLine;
+                }
                 return checkLine;
             },
             RegexOptions.Multiline);
+
+        // For outputs referenced in non-== expects (e.g. "m in a[..]", "forall k :: ..."),
+        // add VAL prints so their runtime values can be captured and injected as commented hints.
+        if (outputNames != null)
+        {
+            var uncaptured = outputNames.Where(n => !capturedOutputs.Contains(n)).ToList();
+            if (uncaptured.Count > 0)
+            {
+                // Insert VAL prints right after the method call (last "var ... :=" line)
+                result = Regex.Replace(result,
+                    @"(^[ \t]*var\s+\w+\s*:=\s*\w+\([^)]*\);\s*$)",
+                    m2 =>
+                    {
+                        var sb2 = new System.Text.StringBuilder(m2.Value);
+                        foreach (var name in uncaptured)
+                            sb2.AppendLine($"\n    print \"VAL:{testId}:{name}=\", {name}, \"\\n\";");
+                        return sb2.ToString();
+                    },
+                    RegexOptions.Multiline);
+            }
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -420,6 +458,24 @@ static class TestValidator
                     "",
                     RegexOptions.Multiline);
             }
+        }
+
+        // For outputs with captured runtime values but no "expect var == <expr>" to replace
+        // (e.g., Mode's "expect m in a[..]"), insert a commented hint after the method call.
+        foreach (var (varName, value) in vars)
+        {
+            if (!IsValidDafnyLiteral(value)) continue;
+            // Check if this variable already has an "expect var ==" line (already handled above)
+            if (Regex.IsMatch(result, @"^\s*expect\s+" + Regex.Escape(varName) + @"\s*==\s*", RegexOptions.Multiline))
+                continue;
+            // Check if this variable appears in non-== expects (e.g., "expect m in a[..]")
+            if (!Regex.IsMatch(result, @"^\s*expect\s+.*\b" + Regex.Escape(varName) + @"\b", RegexOptions.Multiline))
+                continue;
+            // Insert commented hint right after the method call
+            result = Regex.Replace(result,
+                @"(^[ \t]*var\s+" + Regex.Escape(varName) + @"\s*:=\s*\w+\([^)]*\);\s*)$",
+                m2 => m2.Value + $"\n    // expect {varName} == {value}; // (actual runtime value — not uniquely determined by spec)",
+                RegexOptions.Multiline);
         }
 
         return result;

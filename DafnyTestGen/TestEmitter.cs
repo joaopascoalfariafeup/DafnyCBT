@@ -760,19 +760,26 @@ static class TestEmitter
                 }).ToList();
             }
 
-            // Determine which outputs have concrete Z3 values (before emitting any code)
+            // Determine which outputs have concrete Z3 values (before emitting any code).
+            // Non-unique outputs (where spec allows other valid answers) are NOT covered here;
+            // they get a commented hint and fall through to the literal-based mechanism.
+            // When uniqueness is proven (isUnique), Z3's values are trusted even with
+            // uninterpreted functions: if no other output satisfies the spec (even with
+            // the functions free to take any value), then Z3's answer must be the real one.
             var coveredOutputs = new HashSet<string>();
+            bool isUnique = values.TryGetValue("__unique__", out var uqFlag) && uqFlag == "true";
+            bool trustZ3Values = isUnique;
             foreach (var outp in method.Outs)
             {
                 var outPattern = @"\b" + Regex.Escape(outp.Name) + @"\b";
                 if (!literals.Any(lit => Regex.IsMatch(lit, outPattern)))
                     continue;
                 var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
-                if (!hasUninterpFuncs && values.TryGetValue(outp.Name, out _) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
+                if (trustZ3Values && values.TryGetValue(outp.Name, out _) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
                     coveredOutputs.Add(outp.Name);
-                else if (!hasUninterpFuncs && TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr2) && int.TryParse(lenStr2, out var seqLen2) && seqLen2 >= 0)
+                else if (trustZ3Values && TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr2) && int.TryParse(lenStr2, out var seqLen2) && seqLen2 >= 0)
                     coveredOutputs.Add(outp.Name);
-                else if (!hasUninterpFuncs && (TypeUtils.IsSetType(typeStr) || TypeUtils.IsMultisetType(typeStr)) && (values.ContainsKey(outp.Name + "_members") || values.ContainsKey(outp.Name + "_card")))
+                else if (trustZ3Values && (TypeUtils.IsSetType(typeStr) || TypeUtils.IsMultisetType(typeStr)) && (values.ContainsKey(outp.Name + "_members") || values.ContainsKey(outp.Name + "_card")))
                     coveredOutputs.Add(outp.Name);
             }
 
@@ -882,9 +889,11 @@ static class TestEmitter
                     continue;
 
                 var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
-                // When postconditions use non-inlinable functions, Z3's scalar output
-                // values are unreliable (arbitrary satisfying assignments), so skip them.
-                if (!hasUninterpFuncs && values.TryGetValue(outp.Name, out var val) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
+                // When postconditions use non-inlinable functions AND uniqueness is not proven,
+                // Z3's output values are unreliable (arbitrary satisfying assignments), so skip them.
+                // When uniqueness IS proven, Z3's value is the only possible answer even with
+                // uninterpreted functions, so it can be trusted.
+                if (trustZ3Values && values.TryGetValue(outp.Name, out var val) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
                 {
                     // Ensure real output values have a decimal point
                     if (typeStr == "real" && !val.Contains('.'))
@@ -897,10 +906,19 @@ static class TestEmitter
                         else
                             val = $"'\\U{{{charCode:X4}}}'";
                     }
-                    sb.AppendLine($"    expect {outp.Name} == {val};");
-                    coveredOutputs.Add(outp.Name);
+                    if (isUnique)
+                    {
+                        sb.AppendLine($"    expect {outp.Name} == {val};");
+                        coveredOutputs.Add(outp.Name);
+                    }
+                    else
+                    {
+                        // Spec allows other valid values — emit as a hint comment only.
+                        // The active expect below is derived from the postcondition.
+                        sb.AppendLine($"    // expect {outp.Name} == {val}; // (one valid value — not uniquely determined by spec)");
+                    }
                 }
-                else if (!hasUninterpFuncs && TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr)
+                else if (trustZ3Values && TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr)
                          && int.TryParse(lenStr, out var seqLen) && seqLen >= 0)
                 {
                     // Emit the full expected sequence value
@@ -911,6 +929,7 @@ static class TestEmitter
                     else
                         elems = Enumerable.Range(0, seqLen).Select(_ => "0").ToArray();
 
+                    string seqLiteral;
                     if (elemType == "char")
                     {
                         var charElems = elems.Take(seqLen).Select(e =>
@@ -919,15 +938,23 @@ static class TestEmitter
                                 return $"'{(char)code}'";
                             return $"'\\U{{{(int.TryParse(e, out var c) ? c : 0):X4}}}'";
                         });
-                        sb.AppendLine($"    expect {outp.Name} == [{string.Join(", ", charElems)}];");
+                        seqLiteral = $"[{string.Join(", ", charElems)}]";
                     }
                     else
                     {
-                        sb.AppendLine($"    expect {outp.Name} == [{string.Join(", ", elems.Take(seqLen))}];");
+                        seqLiteral = $"[{string.Join(", ", elems.Take(seqLen))}]";
                     }
-                    coveredOutputs.Add(outp.Name);
+                    if (isUnique)
+                    {
+                        sb.AppendLine($"    expect {outp.Name} == {seqLiteral};");
+                        coveredOutputs.Add(outp.Name);
+                    }
+                    else
+                    {
+                        sb.AppendLine($"    // expect {outp.Name} == {seqLiteral}; // (one valid value — not uniquely determined by spec)");
+                    }
                 }
-                else if (!hasUninterpFuncs && TypeUtils.IsSetType(typeStr))
+                else if (trustZ3Values && TypeUtils.IsSetType(typeStr))
                 {
                     if (rhsCaptures.ContainsKey(outp.Name) || rhsInline.ContainsKey(outp.Name))
                     {
@@ -937,16 +964,28 @@ static class TestEmitter
                     {
                         var setElemType = TypeUtils.GetSetElementType(typeStr);
                         var members = setMembers.Split(',').Select(m => FormatScalarValue(m.Trim(), setElemType, enumDatatypes));
-                        sb.AppendLine($"    expect {outp.Name} == {{{string.Join(", ", members)}}};");
-                        coveredOutputs.Add(outp.Name);
+                        var setLiteral = $"{{{string.Join(", ", members)}}}";
+                        if (isUnique)
+                        {
+                            sb.AppendLine($"    expect {outp.Name} == {setLiteral};");
+                            coveredOutputs.Add(outp.Name);
+                        }
+                        else
+                        {
+                            sb.AppendLine($"    // expect {outp.Name} == {setLiteral}; // (one valid value — not uniquely determined by spec)");
+                        }
                     }
-                    else
+                    else if (isUnique)
                     {
                         sb.AppendLine($"    expect {outp.Name} == {{}};");
                         coveredOutputs.Add(outp.Name);
                     }
+                    else
+                    {
+                        sb.AppendLine($"    // expect {outp.Name} == {{}}; // (one valid value — not uniquely determined by spec)");
+                    }
                 }
-                else if (!hasUninterpFuncs && TypeUtils.IsMultisetType(typeStr))
+                else if (trustZ3Values && TypeUtils.IsMultisetType(typeStr))
                 {
                     if (rhsCaptures.ContainsKey(outp.Name) || rhsInline.ContainsKey(outp.Name))
                     {
@@ -956,13 +995,25 @@ static class TestEmitter
                     {
                         var msetElemType = TypeUtils.GetMultisetElementType(typeStr);
                         var members = msetMembers.Split(',').Select(m => FormatScalarValue(m.Trim(), msetElemType, enumDatatypes));
-                        sb.AppendLine($"    expect {outp.Name} == multiset{{{string.Join(", ", members)}}};");
+                        var msetLiteral = $"multiset{{{string.Join(", ", members)}}}";
+                        if (isUnique)
+                        {
+                            sb.AppendLine($"    expect {outp.Name} == {msetLiteral};");
+                            coveredOutputs.Add(outp.Name);
+                        }
+                        else
+                        {
+                            sb.AppendLine($"    // expect {outp.Name} == {msetLiteral}; // (one valid value — not uniquely determined by spec)");
+                        }
+                    }
+                    else if (isUnique)
+                    {
+                        sb.AppendLine($"    expect {outp.Name} == multiset{{}};");
                         coveredOutputs.Add(outp.Name);
                     }
                     else
                     {
-                        sb.AppendLine($"    expect {outp.Name} == multiset{{}};");
-                        coveredOutputs.Add(outp.Name);
+                        sb.AppendLine($"    // expect {outp.Name} == multiset{{}}; // (one valid value — not uniquely determined by spec)");
                     }
                 }
                 else if (TypeUtils.IsMapType(typeStr))
@@ -981,13 +1032,25 @@ static class TestEmitter
                         var vals = mapVals.Split(',');
                         var entries = keys.Zip(vals, (k, v) =>
                             $"{FormatScalarValue(k.Trim(), mapKeyType, enumDatatypes)} := {FormatScalarValue(v.Trim(), mapValType, enumDatatypes)}");
-                        sb.AppendLine($"    expect {outp.Name} == map[{string.Join(", ", entries)}];");
+                        var mapLiteral = $"map[{string.Join(", ", entries)}]";
+                        if (isUnique)
+                        {
+                            sb.AppendLine($"    expect {outp.Name} == {mapLiteral};");
+                            coveredOutputs.Add(outp.Name);
+                        }
+                        else
+                        {
+                            sb.AppendLine($"    // expect {outp.Name} == {mapLiteral}; // (one valid value — not uniquely determined by spec)");
+                        }
+                    }
+                    else if (isUnique)
+                    {
+                        sb.AppendLine($"    expect {outp.Name} == map[];");
                         coveredOutputs.Add(outp.Name);
                     }
                     else
                     {
-                        sb.AppendLine($"    expect {outp.Name} == map[];");
-                        coveredOutputs.Add(outp.Name);
+                        sb.AppendLine($"    // expect {outp.Name} == map[]; // (one valid value — not uniquely determined by spec)");
                     }
                 }
             }
@@ -1001,6 +1064,7 @@ static class TestEmitter
             {
                 bool mentionsOnlyCoveredOutputs = true;
                 bool mentionsAnyOutput = false;
+                bool mentionsMutable = false;
                 foreach (var outp in method.Outs)
                 {
                     var outPattern = @"\b" + Regex.Escape(outp.Name) + @"\b";
@@ -1011,9 +1075,23 @@ static class TestEmitter
                             mentionsOnlyCoveredOutputs = false;
                     }
                 }
-                // Skip literals mentioning no output when we have concrete values — they are
-                // implied by the output assertions and add noise to the test.
-                if (!mentionsAnyOutput && !hasUninterpFuncs)
+                // Check if literal references any mutable input (effectively an output)
+                if (mutableNames != null)
+                {
+                    foreach (var mn in mutableNames)
+                    {
+                        if (Regex.IsMatch(lit, @"\b" + Regex.Escape(mn) + @"\b"))
+                        {
+                            mentionsMutable = true;
+                            mentionsAnyOutput = true;
+                            mentionsOnlyCoveredOutputs = false;
+                            break;
+                        }
+                    }
+                }
+                // Skip literals mentioning no output/mutable when we have concrete values —
+                // they are implied by the output assertions and add noise to the test.
+                if (!mentionsAnyOutput && !mentionsMutable && trustZ3Values)
                     continue;
                 // Emit if: mentions an uncovered output (or no-output in full-postcondition mode)
                 if (!mentionsAnyOutput || !mentionsOnlyCoveredOutputs)
