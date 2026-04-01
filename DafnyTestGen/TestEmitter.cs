@@ -100,15 +100,29 @@ static class TestEmitter
                 }
             }
         }
-        var result = captures.Select(kv => (kv.Key, kv.Value.varName, kv.Value.isArray)).ToList();
-        // Add array captures that couldn't be stored in dict (key collision with whole-expression capture).
-        // These don't need a separate var emission (the array is captured via whole-expression),
-        // but ReplaceOldReferences needs them to substitute old(a[i]) -> old_a[i].
+        var result = captures.Select(kv => (innerExpr: kv.Key, varName: kv.Value.varName, isArrayCapture: kv.Value.isArray)).ToList();
+        // For array captures that couldn't be stored in dict (key collision with
+        // whole-expression capture of "arrayName[..]"), add an array capture entry
+        // that reuses the existing sequence snapshot variable.
+        // old(a[i]) must index the sequence snapshot (contents), not the array reference,
+        // because arrays are reference types — old_a := a only copies the pointer.
         foreach (var arrayName in arrayCaptures)
         {
-            var varName = "old_" + arrayName;
-            if (!result.Any(r => r.varName == varName && r.isArray))
-                result.Add((arrayName + "[..]", varName, true));
+            if (result.Any(r => r.isArrayCapture && r.varName == "old_" + arrayName))
+                continue; // already have a proper array capture
+            // Find the sequence snapshot variable (whole-expression capture of "arrayName[..]")
+            var snapshotCapture = result.FirstOrDefault(r =>
+                !r.isArrayCapture && r.innerExpr == arrayName + "[..]");
+            if (snapshotCapture.varName != null)
+            {
+                // Reuse the sequence snapshot for old(a[i]) -> snapshot[i]
+                result.Add((arrayName + "[..]", snapshotCapture.varName, true));
+            }
+            else
+            {
+                // No sequence snapshot exists — create the array capture normally
+                result.Add((arrayName + "[..]", "old_" + arrayName, true));
+            }
         }
         return result;
     }
@@ -134,13 +148,14 @@ static class TestEmitter
             result = Regex.Replace(result, pattern, varName);
         }
 
-        // Then handle array captures: old(arrayName[...]) -> old_arrayName[...]
+        // Then handle array captures: old(arrayName[...]) -> captureVar[...]
         // This is the fallback for quantifier-bound index expressions.
-        foreach (var (_, varName, isArrayCapture) in oldCaptures)
+        foreach (var (captureExpr, varName, isArrayCapture) in oldCaptures)
         {
             if (!isArrayCapture) continue;
-            // Extract the array name from varName (old_arrayName -> arrayName)
-            var arrayName = varName.Substring(4); // remove "old_" prefix
+            // Extract the array name from captureExpr ("arrayName[..]" -> "arrayName")
+            var bracketIdx = captureExpr.IndexOf('[');
+            var arrayName = bracketIdx >= 0 ? captureExpr.Substring(0, bracketIdx) : varName.Substring(4);
 
             // Replace all old(arrayName[...]) occurrences, preserving the index expression
             // Use balanced paren matching to correctly handle nested brackets
