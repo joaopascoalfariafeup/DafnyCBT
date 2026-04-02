@@ -2558,6 +2558,19 @@ static class SmtTranslator
     }
 
     /// <summary>
+    /// Builds consecutive-pair constraints with a given comparison operator.
+    /// Used by boundary analysis to generate ordering shape tiers:
+    ///   op="=" → all-equal array, op="&lt;" → strictly ascending, op="&gt;" → strictly descending.
+    /// </summary>
+    internal static string BuildConsecutivePairsSmt(string seqName, string op)
+    {
+        var conjuncts = new List<string>();
+        for (int i = 0; i < MAX_SEQ_LEN - 1; i++)
+            conjuncts.Add($"(=> (>= (seq.len {seqName}) {i + 2}) ({op} (seq.nth {seqName} {i}) (seq.nth {seqName} {i + 1})))");
+        return conjuncts.Count == 1 ? conjuncts[0] : $"(and {string.Join(" ", conjuncts)})";
+    }
+
+    /// <summary>
     /// Builds an SMT2 query that checks whether the outputs found in <paramref name="values"/>
     /// are uniquely determined by the spec for those specific inputs.
     ///

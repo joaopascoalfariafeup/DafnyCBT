@@ -28,6 +28,11 @@ static class BoundaryAnalysis
             ? preLiterals
             : preClauses.Select(e => DnfEngine.ExprToString(e)).ToList();
 
+        // Pre-detect ordering constraints to know which params have shape tiers
+        // (used to skip element distinctness constraints that would conflict with all-equal shape)
+        var orderingShapeTiers = DetectOrderingShapeTiers(inputs, preClauses, preStrings, mutableNames ?? new());
+        var paramsWithShapeTiers = new HashSet<string>(orderingShapeTiers.Select(t => t.paramName.Replace("-shape", "")));
+
         // Build per-parameter tiers
         var paramTiers = new List<(string paramName, List<(string label, string smtConstraint)> tiers)>();
 
@@ -63,7 +68,9 @@ static class BoundaryAnalysis
                 for (int sz = 0; sz < tierCount; sz++)
                 {
                     var constraint = $"(= (seq.len {smtName}) {sz})";
-                    if (sz >= 2 && !isTupleElem)
+                    // Skip distinctness when shape tiers control element relationships,
+                    // or for tuple element sequences
+                    if (sz >= 2 && !isTupleElem && !paramsWithShapeTiers.Contains(name))
                     {
                         var distincts = new List<string>();
                         for (int a = 0; a < sz; a++)
@@ -225,6 +232,9 @@ static class BoundaryAnalysis
                 paramTiers.Add((name, tiers));
         }
 
+        // Add ordering shape tiers (detected earlier, before size tiers)
+        paramTiers.AddRange(orderingShapeTiers);
+
         if (paramTiers.Count == 0)
             return new List<(string, List<string>)> { ("", new List<string>()) };
 
@@ -367,6 +377,134 @@ static class BoundaryAnalysis
                 {
                     if (!result.Contains(other))
                         result.Add(other);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Detects ordering constraints on array/seq parameters from preconditions and returns
+    /// "shape" boundary tiers. For a non-strict ordering like &lt;= (ascending) or &gt;= (descending),
+    /// the shape tiers decompose the weak ordering into structurally distinct cases:
+    ///   - "all-equal": all elements are equal (constant array/sequence)
+    ///   - "strict": all consecutive pairs are strictly ordered (no duplicates)
+    /// The default (mixed) case requires no extra constraint.
+    ///
+    /// Detection covers:
+    ///   1. IsSorted(a[..]) or IsSorted(s) — resolves to ascending &lt;=
+    ///   2. Inline forall with body like a[i] &lt;= a[j] or a[i] &gt;= a[j] (two-variable)
+    ///   3. Inline forall with body like a[i] &lt;= a[i+1] or a[i] &gt;= a[i+1] (consecutive)
+    /// </summary>
+    internal static List<(string paramName, List<(string label, string smtConstraint)> tiers)>
+        DetectOrderingShapeTiers(
+            List<(string Name, string Type)> inputs,
+            List<Expression> preClauses,
+            List<string> preStrings,
+            HashSet<string> mutableNames)
+    {
+        var result = new List<(string paramName, List<(string label, string smtConstraint)> tiers)>();
+        var seen = new HashSet<string>(); // avoid duplicate shape tiers for the same parameter
+
+        // Collect array and seq parameter names for resolving references
+        var arraySeqParams = inputs
+            .Where(v => TypeUtils.IsArrayType(v.Type) || TypeUtils.IsSeqType(v.Type))
+            .Select(v => v.Name)
+            .ToHashSet();
+
+        // Helper: add shape tiers for a parameter with a given weak operator (<= or >=)
+        void AddShapeTiers(string paramName, string weakOp)
+        {
+            if (!seen.Add(paramName)) return;
+            if (!arraySeqParams.Contains(paramName)) return;
+
+            var type = inputs.First(v => v.Name == paramName).Type;
+            var isTupleElem = TypeUtils.IsTupleType(TypeUtils.GetSeqElementType(type));
+            if (isTupleElem) return; // shape tiers for tuple-element collections not yet supported
+
+            var smtBase = mutableNames.Contains(paramName) ? $"{paramName}_pre" : paramName;
+            var seqSmt = TypeUtils.IsArrayType(type) ? $"{smtBase}_seq" : smtBase;
+
+            // The strict operator corresponding to the weak one
+            var strictOp = weakOp == "<=" ? "<" : ">";
+
+            var tiers = new List<(string label, string smtConstraint)>
+            {
+                ("const", SmtTranslator.BuildConsecutivePairsSmt(seqSmt, "=")),
+                (weakOp == "<=" ? "strict-asc" : "strict-desc", SmtTranslator.BuildConsecutivePairsSmt(seqSmt, strictOp))
+            };
+            result.Add(($"{paramName}-shape", tiers));
+        }
+
+        // --- Detection from string forms of preconditions ---
+        foreach (var pre in preStrings)
+        {
+            // 1. IsSorted(X[..]) or IsSorted(X) — ascending <=
+            var isSortedMatch = Regex.Match(pre, @"IsSorted\((\w+)(?:\[\.\.?\])?\)");
+            if (isSortedMatch.Success)
+            {
+                AddShapeTiers(isSortedMatch.Groups[1].Value, "<=");
+                continue;
+            }
+
+            // 2. forall with two-variable ordering: forall i, j :: ... ==> X[i] OP X[j]
+            //    Matches patterns like: a[i] <= a[j], s[i] >= s[j]
+            var forallTwoVar = Regex.Match(pre,
+                @"forall\s+\w+\s*,\s*\w+\s*::.+==>.*?(\w+)\[\w+\]\s*(<=|>=)\s*\1\[\w+\]");
+            if (forallTwoVar.Success)
+            {
+                AddShapeTiers(forallTwoVar.Groups[1].Value, forallTwoVar.Groups[2].Value);
+                continue;
+            }
+
+            // 3. forall with consecutive pairs: forall i :: ... ==> X[i] OP X[i+1]
+            //    Matches patterns like: a[i] <= a[i + 1], s[i] >= s[i + 1]
+            var forallConsec = Regex.Match(pre,
+                @"forall\s+(\w+)\s*::.+==>.*?(\w+)\[\1\]\s*(<=|>=)\s*\2\[\1\s*\+\s*1\]");
+            if (forallConsec.Success)
+            {
+                AddShapeTiers(forallConsec.Groups[2].Value, forallConsec.Groups[3].Value);
+                continue;
+            }
+        }
+
+        // --- Detection from AST (handles cases where string form may differ) ---
+        foreach (var clause in preClauses)
+        {
+            // FunctionCallExpr: IsSorted(a[..]) — AST preserves the predicate call
+            if (clause is FunctionCallExpr funcCall &&
+                funcCall.Name == "IsSorted" && funcCall.Args.Count == 1)
+            {
+                var argStr = DnfEngine.ExprToString(funcCall.Args[0]);
+                var arrMatch = Regex.Match(argStr, @"^(\w+)(?:\[\.\.?\])?$");
+                if (arrMatch.Success)
+                    AddShapeTiers(arrMatch.Groups[1].Value, "<=");
+            }
+
+            // ForallExpr with BinaryExpr body containing <= or >=
+            if (clause is ForallExpr forallExpr)
+            {
+                var body = forallExpr.Term;
+                // Unwrap implication: range ==> comparison
+                if (body is BinaryExpr impl && impl.ResolvedOp == BinaryExpr.ResolvedOpcode.Imp)
+                    body = impl.E1;
+                if (body is BinaryExpr cmp &&
+                    (cmp.ResolvedOp == BinaryExpr.ResolvedOpcode.Le ||
+                     cmp.ResolvedOp == BinaryExpr.ResolvedOpcode.Ge))
+                {
+                    var weakOp = cmp.ResolvedOp == BinaryExpr.ResolvedOpcode.Le ? "<=" : ">=";
+                    // Check if both sides are indexed accesses on the same collection
+                    var lhsStr = DnfEngine.ExprToString(cmp.E0);
+                    var rhsStr = DnfEngine.ExprToString(cmp.E1);
+                    // Pattern: X[i] op X[j] or X[i] op X[i+1]
+                    var lhsMatch = Regex.Match(lhsStr, @"^(\w+)\[");
+                    var rhsMatch = Regex.Match(rhsStr, @"^(\w+)\[");
+                    if (lhsMatch.Success && rhsMatch.Success &&
+                        lhsMatch.Groups[1].Value == rhsMatch.Groups[1].Value)
+                    {
+                        AddShapeTiers(lhsMatch.Groups[1].Value, weakOp);
+                    }
                 }
             }
         }
