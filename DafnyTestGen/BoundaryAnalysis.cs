@@ -38,15 +38,32 @@ static class BoundaryAnalysis
             if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
             {
                 // Boundary tiers constrain input (pre-state) sizes
-                var smtBase = mutableNames.Contains(name) ? $"{name}_pre" : name;
-                var smtName = TypeUtils.SeqSmtName(smtBase, type);
+                var elemTypeStr = TypeUtils.GetSeqElementType(type);
+                var isTupleElem = TypeUtils.IsTupleType(elemTypeStr);
+                string smtName;
+                if (isTupleElem)
+                {
+                    // Use first component sequence for length
+                    if (TypeUtils.IsArrayType(type))
+                    {
+                        var smtBase = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                        smtName = $"{smtBase}_seq_0";
+                    }
+                    else
+                        smtName = $"{name}_0";
+                }
+                else
+                {
+                    var smtBase = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                    smtName = TypeUtils.SeqSmtName(smtBase, type);
+                }
                 // Size tiers: 0, 1, ..., tierCount-1
                 // For seq/string with size > 1, add distinctness constraints on elements
-                // to help Z3 avoid spurious SAT from incomplete quantifier reasoning
+                // (skip distinctness for tuple elements — not applicable to component sequences)
                 for (int sz = 0; sz < tierCount; sz++)
                 {
                     var constraint = $"(= (seq.len {smtName}) {sz})";
-                    if (sz >= 2)
+                    if (sz >= 2 && !isTupleElem)
                     {
                         var distincts = new List<string>();
                         for (int a = 0; a < sz; a++)
@@ -92,6 +109,51 @@ static class BoundaryAnalysis
                     var constraint = $"(= {smtName}_card {sz})";
                     tiers.Add(($"{sz}", constraint));
                 }
+            }
+            else if (TypeUtils.IsTupleType(type))
+            {
+                // Each tuple component becomes a separate paramTiers entry so the
+                // cross-product generates diverse combinations across components.
+                var components = TypeUtils.GetTupleComponentTypes(type);
+                for (int ci = 0; ci < components.Count; ci++)
+                {
+                    var compType = components[ci];
+                    var compName = $"{name}_{ci}";
+                    var compTiers = new List<(string label, string smtConstraint)>();
+                    if (compType == "int" || compType == "nat" || compType == "T")
+                    {
+                        var compBounds = ExtractBounds(compName, preStrings);
+                        var compValues = new HashSet<int>();
+                        if (compBounds.lower.HasValue)
+                        {
+                            compValues.Add(compBounds.lower.Value);
+                            compValues.Add(compBounds.lower.Value + 1);
+                        }
+                        if (compBounds.upper.HasValue)
+                        {
+                            compValues.Add(compBounds.upper.Value);
+                            if (compBounds.upper.Value > 0) compValues.Add(compBounds.upper.Value - 1);
+                        }
+                        if (!compBounds.lower.HasValue || compBounds.lower.Value <= 0) compValues.Add(0);
+                        if (!compBounds.lower.HasValue || compBounds.lower.Value <= 1) compValues.Add(1);
+                        if (compType == "nat") compValues.RemoveWhere(v => v < 0);
+                        foreach (var val in compValues.OrderBy(v => v))
+                            compTiers.Add(($"{val}", $"(= {compName} {(val < 0 ? $"(- {-val})" : val.ToString())})"));
+                    }
+                    else if (compType == "real")
+                    {
+                        foreach (var (lbl, smtVal) in new[] { ("0.0", "0.0"), ("1.0", "1.0"), ("-1.0", "(- 1.0)") })
+                            compTiers.Add((lbl, $"(= {compName} {smtVal})"));
+                    }
+                    else if (compType == "bool")
+                    {
+                        compTiers.Add(("true", $"(= {compName} true)"));
+                        compTiers.Add(("false", $"(= {compName} false)"));
+                    }
+                    if (compTiers.Count > 0)
+                        paramTiers.Add(($"{name}.{ci}", compTiers));
+                }
+                continue; // skip the tiers.Count check below — already added to paramTiers
             }
             else if (type == "int" || type == "nat" || type == "T")
             {

@@ -276,6 +276,38 @@ static class TestEmitter
                 ? typeStr.Substring(6, typeStr.Length - 7)
                 : "int";
 
+            // Tuple element array: zip parallel component values into tuple literals
+            if (TypeUtils.IsTupleType(elemType))
+            {
+                var tupleComponents = TypeUtils.GetTupleComponentTypes(elemType);
+                if (values.TryGetValue(name + "_len", out var tLenStr) && int.TryParse(tLenStr, out var tLen) && tLen >= 0)
+                {
+                    var compArrays = new List<string[]>();
+                    for (int ci = 0; ci < tupleComponents.Count; ci++)
+                    {
+                        if (values.TryGetValue(name + "_elems_" + ci, out var compStr))
+                            compArrays.Add(compStr.Split(','));
+                        else
+                            compArrays.Add(Enumerable.Range(0, tLen).Select(_ => "0").ToArray());
+                    }
+                    var tupleElems = new List<string>();
+                    for (int i = 0; i < tLen; i++)
+                    {
+                        var compVals = new List<string>();
+                        for (int ci = 0; ci < tupleComponents.Count; ci++)
+                        {
+                            var raw = i < compArrays[ci].Length ? compArrays[ci][i] : "0";
+                            compVals.Add(FormatScalarValue(raw, tupleComponents[ci], enumDatatypes));
+                        }
+                        tupleElems.Add($"({string.Join(", ", compVals)})");
+                    }
+                    if (tLen == 0)
+                        return $"    var {name} := new {elemType}[0] [];";
+                    return $"    var {name} := new {elemType}[{tLen}] [{string.Join(", ", tupleElems)}];";
+                }
+                return $"    var {name} := new {elemType}[0] [];";
+            }
+
             var defaultElem = elemType == "bool" ? "false" : elemType == "real" ? "0.0" :
                 (enumDatatypes != null && enumDatatypes.TryGetValue(elemType, out var defCtors) ? defCtors[0] : "0");
 
@@ -325,6 +357,39 @@ static class TestEmitter
 
         if (TypeUtils.IsSeqType(typeStr))
         {
+            var seqElemType = TypeUtils.GetSeqElementType(typeStr);
+            // Tuple element seq: zip parallel component values into tuple literals
+            if (TypeUtils.IsTupleType(seqElemType))
+            {
+                var tupleComponents = TypeUtils.GetTupleComponentTypes(seqElemType);
+                if (values.TryGetValue(name + "_len", out var tLenStr) && int.TryParse(tLenStr, out var tLen) && tLen >= 0)
+                {
+                    var compArrays = new List<string[]>();
+                    for (int ci = 0; ci < tupleComponents.Count; ci++)
+                    {
+                        if (values.TryGetValue(name + "_elems_" + ci, out var compStr))
+                            compArrays.Add(compStr.Split(','));
+                        else
+                            compArrays.Add(Enumerable.Range(0, tLen).Select(_ => "0").ToArray());
+                    }
+                    var tupleElems = new List<string>();
+                    for (int i = 0; i < tLen; i++)
+                    {
+                        var compVals = new List<string>();
+                        for (int ci = 0; ci < tupleComponents.Count; ci++)
+                        {
+                            var raw = i < compArrays[ci].Length ? compArrays[ci][i] : "0";
+                            compVals.Add(FormatScalarValue(raw, tupleComponents[ci], enumDatatypes));
+                        }
+                        tupleElems.Add($"({string.Join(", ", compVals)})");
+                    }
+                    if (tLen == 0)
+                        return $"    var {name}: {typeStr} := [];";
+                    return $"    var {name}: {typeStr} := [{string.Join(", ", tupleElems)}];";
+                }
+                return $"    var {name}: {typeStr} := [];";
+            }
+
             if (values.TryGetValue(name + "_len", out var lenStr) && int.TryParse(lenStr, out var len) && len >= 0)
             {
                 string[] elems;
@@ -354,8 +419,8 @@ static class TestEmitter
                 }
 
                 // Map enum ordinals back to constructor names for seq<EnumType>
-                var seqElemType = TypeUtils.GetSeqElementType(typeStr);
-                if (enumDatatypes != null && enumDatatypes.TryGetValue(seqElemType, out var seqEnumCtors))
+                var seqElemType2 = TypeUtils.GetSeqElementType(typeStr);
+                if (enumDatatypes != null && enumDatatypes.TryGetValue(seqElemType2, out var seqEnumCtors))
                 {
                     elems = elems.Select(e =>
                     {
@@ -411,6 +476,22 @@ static class TestEmitter
                 return $"    var {name}: {typeStr} := map[{string.Join(", ", entries)}];";
             }
             return $"    var {name}: {typeStr} := map[];";
+        }
+
+        // Tuple: reconstruct from component variables
+        if (TypeUtils.IsTupleType(typeStr))
+        {
+            var components = TypeUtils.GetTupleComponentTypes(typeStr);
+            var componentValues = new List<string>();
+            for (int i = 0; i < components.Count; i++)
+            {
+                var compName = $"{name}_{i}";
+                if (values.TryGetValue(compName, out var compVal))
+                    componentValues.Add(FormatScalarValue(compVal, components[i], enumDatatypes));
+                else
+                    componentValues.Add(components[i] switch { "real" => "0.0", "char" => "' '", "bool" => "false", _ => "0" });
+            }
+            return $"    var {name} := ({string.Join(", ", componentValues)});";
         }
 
         // Enum datatype: map integer ordinal back to constructor name
@@ -885,7 +966,9 @@ static class TestEmitter
                 if (!literals.Any(lit => Regex.IsMatch(lit, outPattern)))
                     continue;
                 var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
-                if (trustZ3Values && values.TryGetValue(outp.Name, out _) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
+                if (trustZ3Values && TypeUtils.IsTupleType(typeStr) && values.ContainsKey($"{outp.Name}_0"))
+                    coveredOutputs.Add(outp.Name);
+                else if (trustZ3Values && values.TryGetValue(outp.Name, out _) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
                     coveredOutputs.Add(outp.Name);
                 else if (trustZ3Values && TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr2) && int.TryParse(lenStr2, out var seqLen2) && seqLen2 >= 0)
                     coveredOutputs.Add(outp.Name);
@@ -935,11 +1018,13 @@ static class TestEmitter
                 }
             }
 
-            // Emit precondition checks (used by check mode to discard invalid test cases)
+            // Emit precondition checks only for preconditions that could NOT be translated to SMT
+            // (e.g., recursive predicates). Translated preconditions are already guaranteed by Z3.
             foreach (var pre in preClauses)
             {
                 var preStr = DnfEngine.ExprToString(pre);
                 if (TypeUtils.IsSpecOnlyLiteral(preStr)) continue; // skip fresh(), etc.
+                if (SmtTranslator._translatedPreConditions.Contains(preStr)) continue; // Z3 guarantees this
                 // For class methods: replace field refs with obj.field, predicates with obj.pred
                 if (classInfo != null)
                 {
@@ -1003,7 +1088,31 @@ static class TestEmitter
                 // Z3's output values are unreliable (arbitrary satisfying assignments), so skip them.
                 // When uniqueness IS proven, Z3's value is the only possible answer even with
                 // uninterpreted functions, so it can be trusted.
-                if (trustZ3Values && values.TryGetValue(outp.Name, out var val) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
+                // Tuple output: reconstruct from component values
+                if (trustZ3Values && TypeUtils.IsTupleType(typeStr))
+                {
+                    var components = TypeUtils.GetTupleComponentTypes(typeStr);
+                    var allFound = true;
+                    var componentValues = new List<string>();
+                    for (int ci = 0; ci < components.Count; ci++)
+                    {
+                        if (values.TryGetValue($"{outp.Name}_{ci}", out var compVal))
+                            componentValues.Add(FormatScalarValue(compVal, components[ci], enumDatatypes));
+                        else { allFound = false; break; }
+                    }
+                    if (allFound)
+                    {
+                        var tupleVal = $"({string.Join(", ", componentValues)})";
+                        if (isUnique)
+                        {
+                            sb.AppendLine($"    expect {outp.Name} == {tupleVal};");
+                            coveredOutputs.Add(outp.Name);
+                        }
+                        else
+                            sb.AppendLine($"    // expect {outp.Name} == {tupleVal}; // (one valid value — not uniquely determined by spec)");
+                    }
+                }
+                else if (trustZ3Values && values.TryGetValue(outp.Name, out var val) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
                 {
                     // Ensure real output values have a decimal point
                     if (typeStr == "real" && !val.Contains('.'))

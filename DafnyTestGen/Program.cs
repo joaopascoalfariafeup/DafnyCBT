@@ -317,10 +317,18 @@ class Program
 
             // Check for unsupported parameter types
             var allParams = method.Ins.Concat(method.Outs).ToList();
-            var tupleParam = allParams.FirstOrDefault(f => TypeUtils.IsTupleType(f.Type.ToString()));
-            if (tupleParam != null)
+            // Tuples inside sets/multisets/maps are not yet supported
+            var unsupportedTupleParam = allParams.FirstOrDefault(f =>
             {
-                Console.WriteLine($"  Skipping: tuple type '{tupleParam.Type}' for parameter '{tupleParam.Name}' is not yet supported");
+                var t = f.Type.ToString();
+                if (TypeUtils.IsSetType(t) && TypeUtils.IsTupleType(TypeUtils.GetSetElementType(t))) return true;
+                if (TypeUtils.IsMultisetType(t) && TypeUtils.IsTupleType(TypeUtils.GetMultisetElementType(t))) return true;
+                if (TypeUtils.IsMapType(t) && (TypeUtils.IsTupleType(TypeUtils.GetMapKeyType(t)) || TypeUtils.IsTupleType(TypeUtils.GetMapValueType(t)))) return true;
+                return false;
+            });
+            if (unsupportedTupleParam != null)
+            {
+                Console.WriteLine($"  Skipping: tuple in set/multiset/map for parameter '{unsupportedTupleParam.Name}' is not yet supported");
                 Console.WriteLine();
                 continue;
             }
@@ -930,11 +938,19 @@ class Program
         if (mutableNames.Count > 0 && verbose)
             Console.WriteLine($"  Mutable (pre/post split): {string.Join(", ", mutableNames)}");
 
-        // Build allVars for Z3 model parsing — split mutable vars into _pre and _post
+        // Build allVars for Z3 model parsing — split mutable vars into _pre and _post,
+        // and expand tuple vars into component vars
         var allVars = new List<(string Name, string Type)>();
         foreach (var v in inputs.Concat(outputs))
         {
-            if (mutableNames.Contains(v.Name))
+            if (TypeUtils.IsTupleType(v.Type))
+            {
+                // Flatten tuple into components: t: (int, real) -> t_0: int, t_1: real
+                var components = TypeUtils.GetTupleComponentTypes(v.Type);
+                for (int i = 0; i < components.Count; i++)
+                    allVars.Add(($"{v.Name}_{i}", components[i]));
+            }
+            else if (mutableNames.Contains(v.Name))
             {
                 allVars.Add(($"{v.Name}_pre", v.Type));
                 allVars.Add(($"{v.Name}_post", v.Type));
@@ -1419,6 +1435,15 @@ class Program
                             eqParts.Add($"(select {prefix}_domain {k})");
                     }
                 }
+                else if (TypeUtils.IsTupleType(type))
+                {
+                    var components = TypeUtils.GetTupleComponentTypes(type);
+                    for (int i = 0; i < components.Count; i++)
+                    {
+                        if (values.TryGetValue($"{name}_{i}", out var compVal))
+                            eqParts.Add($"(= {name}_{i} {compVal})");
+                    }
+                }
                 else
                 {
                     var lookupName = mutableNames.Contains(name) ? $"{name}_pre" : name;
@@ -1793,6 +1818,14 @@ class Program
                     tc.values.TryGetValue(prefix + "_keys", out var keys);
                     tc.values.TryGetValue(prefix + "_vals", out var vals);
                     return $"{name}:{card}:{keys}:{vals}";
+                }
+                if (TypeUtils.IsTupleType(type))
+                {
+                    var components = TypeUtils.GetTupleComponentTypes(type);
+                    var compVals = Enumerable.Range(0, components.Count)
+                        .Select(i => tc.values.TryGetValue($"{prefix}_{i}", out var cv) ? cv : "")
+                        .ToArray();
+                    return $"{name}:{string.Join(",", compVals)}";
                 }
                 tc.values.TryGetValue(prefix, out var val);
                 return $"{name}:{val}";

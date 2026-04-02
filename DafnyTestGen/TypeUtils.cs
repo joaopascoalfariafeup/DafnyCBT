@@ -25,6 +25,31 @@ static class TypeUtils
     /// </summary>
     internal static bool IsTupleType(string type) => type.StartsWith("(") && type.EndsWith(")");
 
+    /// <summary>
+    /// Parses a tuple type string like "(int, real)" into its component types ["int", "real"].
+    /// Handles nested types by tracking parenthesis and angle bracket depth.
+    /// </summary>
+    internal static List<string> GetTupleComponentTypes(string type)
+    {
+        if (!IsTupleType(type)) return new List<string>();
+        var inner = type.Substring(1, type.Length - 2); // strip outer ( and )
+        var components = new List<string>();
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < inner.Length; i++)
+        {
+            if (inner[i] == '(' || inner[i] == '<') depth++;
+            else if (inner[i] == ')' || inner[i] == '>') depth--;
+            else if (inner[i] == ',' && depth == 0)
+            {
+                components.Add(inner.Substring(start, i - start).Trim());
+                start = i + 1;
+            }
+        }
+        components.Add(inner.Substring(start).Trim());
+        return components;
+    }
+
     internal static bool IsNestedCollectionType(string type)
     {
         if (IsMapType(type))
@@ -38,6 +63,12 @@ static class TypeUtils
         var elemType = IsSetType(type) ? GetSetElementType(type)
             : IsMultisetType(type) ? GetMultisetElementType(type)
             : GetSeqElementType(type);
+        // Tuples inside seq/array are supported if all components are scalar
+        if (IsTupleType(elemType))
+        {
+            var components = GetTupleComponentTypes(elemType);
+            return components.Any(c => IsSeqType(c) || IsArrayType(c) || IsSetType(c) || IsMultisetType(c) || IsMapType(c) || IsTupleType(c));
+        }
         return IsSeqType(elemType) || IsArrayType(elemType) || IsSetType(elemType) || IsMultisetType(elemType) || IsMapType(elemType) || IsTupleType(elemType);
     }
 
@@ -312,23 +343,78 @@ static class TypeUtils
                 continue;
             }
 
+            var elemType = GetSeqElementType(type);
+
+            // Tuple element type: parse parallel component sequences
+            if (IsTupleType(elemType))
+            {
+                var tupleComponents = GetTupleComponentTypes(elemType);
+                // Determine first component sequence name for length
+                string firstCompSeq;
+                if (IsArrayType(type))
+                    firstCompSeq = $"{name}_seq_0";
+                else
+                    firstCompSeq = $"{name}_0";
+
+                var lenPattern = new Regex(@$"\(\(seq\.len\s+{Regex.Escape(firstCompSeq)}\)\s+([-\d]+|\(- \d+\))\)");
+                var lenMatch = lenPattern.Match(fullText);
+                int seqLen = 0;
+                if (lenMatch.Success)
+                {
+                    var lenVal = NormalizeZ3Int(lenMatch.Groups[1].Value);
+                    result[name + "_len"] = lenVal;
+                    int.TryParse(lenVal, out seqLen);
+                }
+
+                // Parse each component sequence's elements
+                for (int ci = 0; ci < tupleComponents.Count; ci++)
+                {
+                    var compType = tupleComponents[ci];
+                    string compSeqName = IsArrayType(type) ? $"{name}_seq_{ci}" : $"{name}_{ci}";
+                    var compElements = new List<string>();
+                    for (int i = 0; i < Math.Min(seqLen, 8); i++)
+                    {
+                        if (compType == "real")
+                        {
+                            var ep = new Regex(@$"\(\(seq\.nth\s+{Regex.Escape(compSeqName)}\s+{i}\)\s+((?:\([^()]*(?:\([^()]*\)[^()]*)*\)|\d+\.\d+|\d+))\)");
+                            var em = ep.Match(fullText);
+                            compElements.Add(em.Success ? NormalizeZ3Real(em.Groups[1].Value) : "0.0");
+                        }
+                        else if (compType == "bool")
+                        {
+                            var ep = new Regex(@$"\(\(seq\.nth\s+{Regex.Escape(compSeqName)}\s+{i}\)\s+(true|false)\)");
+                            var em = ep.Match(fullText);
+                            compElements.Add(em.Success ? em.Groups[1].Value : "false");
+                        }
+                        else
+                        {
+                            var ep = new Regex(@$"\(\(seq\.nth\s+{Regex.Escape(compSeqName)}\s+{i}\)\s+([-\d]+|\(- \d+\))\)");
+                            var em = ep.Match(fullText);
+                            compElements.Add(em.Success ? NormalizeZ3Int(em.Groups[1].Value) : "0");
+                        }
+                    }
+                    if (compElements.Count > 0)
+                        result[name + "_elems_" + ci] = string.Join(",", compElements);
+                }
+                continue;
+            }
+
             var smtName = SeqSmtName(name, type);
 
             // Parse (get-value ((seq.len name))) -> ((seq.len name) N)
-            var lenPattern = new Regex(@$"\(\(seq\.len\s+{Regex.Escape(smtName)}\)\s+([-\d]+|\(- \d+\))\)");
-            var lenMatch = lenPattern.Match(fullText);
-            int seqLen = 0;
-            if (lenMatch.Success)
+            var lenPattern2 = new Regex(@$"\(\(seq\.len\s+{Regex.Escape(smtName)}\)\s+([-\d]+|\(- \d+\))\)");
+            var lenMatch2 = lenPattern2.Match(fullText);
+            int seqLen2 = 0;
+            if (lenMatch2.Success)
             {
-                var lenVal = NormalizeZ3Int(lenMatch.Groups[1].Value);
+                var lenVal = NormalizeZ3Int(lenMatch2.Groups[1].Value);
                 result[name + "_len"] = lenVal;
-                int.TryParse(lenVal, out seqLen);
+                int.TryParse(lenVal, out seqLen2);
             }
 
             // Parse element values: ((seq.nth name 0) value)
-            var elemType = GetSeqElementType(type);
             var elements = new List<string>();
-            for (int i = 0; i < Math.Min(seqLen, 8); i++)
+            for (int i = 0; i < Math.Min(seqLen2, 8); i++)
             {
                 if (elemType == "real")
                 {
