@@ -358,6 +358,55 @@ static class TestEmitter
         if (TypeUtils.IsSeqType(typeStr))
         {
             var seqElemType = TypeUtils.GetSeqElementType(typeStr);
+
+            // Nested seq<seq<T>> or seq<string>: reconstruct from per-inner-seq values
+            if (TypeUtils.IsSupportedNestedSeqType(typeStr))
+            {
+                if (values.TryGetValue(name + "_len", out var outerLenStr) && int.TryParse(outerLenStr, out var outerLen) && outerLen >= 0)
+                {
+                    var innerSeqStrs = new List<string>();
+                    bool isStringType = seqElemType == "string" || typeStr == "seq<string>";
+                    var innerElemType = isStringType ? "char" :
+                        TypeUtils.IsSeqType(seqElemType) ? TypeUtils.GetSeqElementType(seqElemType) : "int";
+
+                    for (int i = 0; i < outerLen; i++)
+                    {
+                        int innerLen = 0;
+                        if (values.TryGetValue($"{name}_{i}_len", out var innerLenStr))
+                            int.TryParse(innerLenStr, out innerLen);
+
+                        string[] innerElems;
+                        if (values.TryGetValue($"{name}_{i}_elems", out var innerElemsStr))
+                            innerElems = innerElemsStr.Split(',');
+                        else
+                            innerElems = Enumerable.Range(0, innerLen).Select(_ => "0").ToArray();
+
+                        if (isStringType)
+                        {
+                            // Emit as a string literal: "abc"
+                            var chars = innerElems.Select(e =>
+                            {
+                                if (int.TryParse(e, out var code) && code >= 32 && code < 127 && code != '"' && code != '\\')
+                                    return ((char)code).ToString();
+                                return "?";
+                            });
+                            innerSeqStrs.Add($"\"{string.Join("", chars)}\"");
+                        }
+                        else
+                        {
+                            // Emit as a seq literal: [1, 2, 3]
+                            var formattedElems = innerElems.Select(e => FormatScalarValue(e, innerElemType, enumDatatypes));
+                            innerSeqStrs.Add($"[{string.Join(", ", formattedElems)}]");
+                        }
+                    }
+
+                    if (outerLen == 0)
+                        return $"    var {name}: {typeStr} := [];";
+                    return $"    var {name}: {typeStr} := [{string.Join(", ", innerSeqStrs)}];";
+                }
+                return $"    var {name}: {typeStr} := [];";
+            }
+
             // Tuple element seq: zip parallel component values into tuple literals
             if (TypeUtils.IsTupleType(seqElemType))
             {

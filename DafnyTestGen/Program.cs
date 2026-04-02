@@ -271,6 +271,7 @@ class Program
         if (recursiveFunctions.Count > 0 && verbose)
             Console.WriteLine($"[DafnyTestGen] Found {recursiveFunctions.Count} recursive function(s): {string.Join(", ", recursiveFunctions.Select(f => f.name))}");
         // Pre-build define-fun for each; names are added to SmtTranslator._definedFuncNames
+        SmtTranslator._definedFuncs.Clear();
         SmtTranslator._definedFuncNames.Clear();
         SmtTranslator._definedFuncParamInfo.Clear();
         foreach (var (rName, rParams, rRetType, rBody, rKind) in recursiveFunctions)

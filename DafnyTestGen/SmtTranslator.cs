@@ -47,6 +47,9 @@ static class SmtTranslator
     // Maximum bounded sequence length used in SMT queries
     internal const int MAX_SEQ_LEN = 8;
 
+    // Maximum bounded inner sequence length for nested seq<seq<T>> types
+    internal const int MAX_INNER_SEQ_LEN = 4;
+
     // Maximum bounded set universe size (elements range from 0..MAX_SET_UNIVERSE-1)
     internal const int MAX_SET_UNIVERSE = 8;
 
@@ -477,6 +480,24 @@ static class SmtTranslator
                         sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
                     if (_enumDatatypes.TryGetValue(elemTypeStr, out var enumElemCtors2))
                         sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 0) (<= (seq.nth {smtName} i) {enumElemCtors2.Count - 1})))))");
+
+                    // Nested seq<seq<T>> or seq<string>: bound inner sequence lengths
+                    if (TypeUtils.IsSupportedNestedSeqType(type))
+                    {
+                        var innerElemType = elemTypeStr == "string" ? "char" :
+                            TypeUtils.IsSeqType(elemTypeStr) ? TypeUtils.GetSeqElementType(elemTypeStr) : "int";
+                        for (int i = 0; i < MAX_SEQ_LEN; i++)
+                        {
+                            sb.AppendLine($"(assert (=> (>= (seq.len {smtName}) {i + 1}) (and (>= (seq.len (seq.nth {smtName} {i})) 0) (<= (seq.len (seq.nth {smtName} {i})) {MAX_INNER_SEQ_LEN}))))");
+                            // Constrain inner elements: nat >= 0, char in printable range
+                            if (innerElemType == "char")
+                                for (int j = 0; j < MAX_INNER_SEQ_LEN; j++)
+                                    sb.AppendLine($"(assert (=> (and (>= (seq.len {smtName}) {i + 1}) (>= (seq.len (seq.nth {smtName} {i})) {j + 1})) (and (>= (seq.nth (seq.nth {smtName} {i}) {j}) 32) (<= (seq.nth (seq.nth {smtName} {i}) {j}) 126))))");
+                            if (innerElemType == "nat")
+                                for (int j = 0; j < MAX_INNER_SEQ_LEN; j++)
+                                    sb.AppendLine($"(assert (=> (and (>= (seq.len {smtName}) {i + 1}) (>= (seq.len (seq.nth {smtName} {i})) {j + 1})) (>= (seq.nth (seq.nth {smtName} {i}) {j}) 0)))");
+                        }
+                    }
                 }
             }
         }
@@ -821,8 +842,21 @@ static class SmtTranslator
                 {
                     var smtName = TypeUtils.SeqSmtName(name, type);
                     sb.AppendLine($"(get-value ((seq.len {smtName})))");
-                    for (int i = 0; i < 8; i++)
-                        sb.AppendLine($"(get-value ((seq.nth {smtName} {i})))");
+                    if (TypeUtils.IsSupportedNestedSeqType(type))
+                    {
+                        // Nested seq: query inner lengths and elements
+                        for (int i = 0; i < MAX_SEQ_LEN; i++)
+                        {
+                            sb.AppendLine($"(get-value ((seq.len (seq.nth {smtName} {i}))))");
+                            for (int j = 0; j < MAX_INNER_SEQ_LEN; j++)
+                                sb.AppendLine($"(get-value ((seq.nth (seq.nth {smtName} {i}) {j})))");
+                        }
+                    }
+                    else
+                    {
+                        for (int i = 0; i < 8; i++)
+                            sb.AppendLine($"(get-value ((seq.nth {smtName} {i})))");
+                    }
                 }
             }
             else if (TypeUtils.IsSetType(type))
