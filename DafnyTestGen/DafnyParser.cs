@@ -260,6 +260,97 @@ static class DafnyParser
     }
 
     /// <summary>
+    /// Finds recursive functions/predicates whose bodies can be finitely unrolled
+    /// into SMT define-fun declarations instead of uninterpreted functions.
+    /// Criteria: recursive (body references self), single self-call, scalar return type,
+    /// no higher-order parameters.
+    /// Returns: (name, paramNamesAndTypes, returnType, bodyString, recursionKind)
+    /// </summary>
+    internal enum RecursionKind { IntCountdown, SeqFold, ArrayIndexedCountdown }
+
+    internal static List<(string name, List<(string pName, string pType)> parameters,
+        string returnType, string body, RecursionKind kind)> FindRecursiveFunctions(
+        Microsoft.Dafny.Program program)
+    {
+        var result = new List<(string name, List<(string pName, string pType)> parameters,
+            string returnType, string body, RecursionKind kind)>();
+        foreach (var topDecl in AllTopLevelDecls(program))
+        {
+            if (topDecl is TopLevelDeclWithMembers cls)
+            {
+                foreach (var member in cls.Members)
+                {
+                    if (member is Function func && func.Body != null)
+                    {
+                        var bodyStr = DnfEngine.ExprToString(func.Body);
+                        // Must be recursive
+                        if (!bodyStr.Contains(func.Name + "(")) continue;
+                        // Count self-calls in the body string
+                        int selfCallCount = 0;
+                        int searchFrom = 0;
+                        while (true)
+                        {
+                            int idx = bodyStr.IndexOf(func.Name + "(", searchFrom);
+                            if (idx < 0) break;
+                            selfCallCount++;
+                            searchFrom = idx + 1;
+                        }
+                        // Allow 1 self-call (simple recursion) or 2 self-calls if they
+                        // are in mutually exclusive if-then-else branches (conditional fold)
+                        // e.g. "if a[n-1]<0 then F(a,n-1)+a[n-1] else F(a,n-1)"
+                        if (selfCallCount > 2 || selfCallCount == 0)
+                        {
+                            Console.WriteLine($"  Note: recursive function '{func.Name}' has {selfCallCount} self-calls — skipping");
+                            continue;
+                        }
+                        // Must have scalar return type (int, nat, real, bool)
+                        var retType = func.ResultType?.ToString() ?? "";
+                        if (retType != "int" && retType != "nat" && retType != "real" && retType != "bool")
+                        {
+                            Console.WriteLine($"  Note: recursive function '{func.Name}' returns '{retType}' — skipping (only scalar returns supported)");
+                            continue;
+                        }
+                        // Classify recursion kind
+                        var parameters = func.Ins.Select(p => (p.Name, p.Type.ToString())).ToList();
+                        RecursionKind kind;
+                        // Check for seq/array parameter
+                        bool hasSeqParam = parameters.Any(p =>
+                            TypeUtils.IsSeqType(p.Item2) || TypeUtils.IsArrayType(p.Item2));
+                        if (hasSeqParam)
+                        {
+                            // Distinguish: if body base case checks |seqParam| → SeqFold
+                            // If body base case checks an int/nat index param → ArrayIndexedCountdown
+                            bool hasArrayParam = parameters.Any(p => TypeUtils.IsArrayType(p.Item2));
+                            var intParams = parameters.Where(p =>
+                                p.Item2 == "int" || p.Item2 == "nat").ToList();
+                            if (hasArrayParam && intParams.Count > 0)
+                            {
+                                // Array + int param → ArrayIndexedCountdown
+                                // (e.g. SumOfNegatives(a: array<int>, n: nat))
+                                kind = RecursionKind.ArrayIndexedCountdown;
+                            }
+                            else
+                            {
+                                kind = RecursionKind.SeqFold;
+                            }
+                        }
+                        else
+                            kind = RecursionKind.IntCountdown;
+                        // No higher-order parameters (skip functions that take functions as args)
+                        if (func.Ins.Any(p => p.Type is ArrowType))
+                        {
+                            Console.WriteLine($"  Note: recursive function '{func.Name}' has higher-order parameters — skipping");
+                            continue;
+                        }
+                        result.Add((func.Name, parameters, retType, bodyStr, kind));
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Inlines non-recursive predicate/function calls in a literal string.
     /// E.g., "IsDigit(s[i])" with predicate IsDigit(c) = '0' <= c <= '9'
     /// becomes "('0' <= s[i] <= '9')".
