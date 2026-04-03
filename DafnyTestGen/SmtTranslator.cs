@@ -1222,8 +1222,13 @@ static class SmtTranslator
                             var instance = Regex.Replace(bodySmt,
                                 @"(?<![a-zA-Z_])" + Regex.Escape(bv0.Name) + @"(?![a-zA-Z_0-9])",
                                 elem);
-                            // Guard: only enforce when k is a valid index in the outer seq
-                            instance = $"(=> (>= (seq.len {outerSeqSmt}) {k + 1}) {instance})";
+                            // Guard: only consider when k is a valid index in the outer seq.
+                            // For forall: (=> guard body) — vacuously true for out-of-bounds (correct).
+                            // For exists: (and guard body) — out-of-bounds doesn't count as witness.
+                            var guard = $"(>= (seq.len {outerSeqSmt}) {k + 1})";
+                            instance = quantifier == "forall"
+                                ? $"(=> {guard} {instance})"
+                                : $"(and {guard} {instance})";
                             instances.Add(instance);
                         }
                         return quantifier == "forall"
@@ -2145,7 +2150,13 @@ static class SmtTranslator
                             var instance = Regex.Replace(bodySmt,
                                 @"(?<![a-zA-Z_])" + Regex.Escape(bv0s.name) + @"(?![a-zA-Z_0-9])",
                                 elem);
-                            instance = $"(=> (>= (seq.len {outerSeqSmtS}) {k + 1}) {instance})";
+                            // Guard: only consider when k is a valid index in the outer seq.
+                            // For forall: (=> guard body) — vacuously true for out-of-bounds.
+                            // For exists: (and guard body) — out-of-bounds doesn't count as witness.
+                            var guard = $"(>= (seq.len {outerSeqSmtS}) {k + 1})";
+                            instance = quantifier == "forall"
+                                ? $"(=> {guard} {instance})"
+                                : $"(and {guard} {instance})";
                             seqInstances.Add(instance);
                         }
                         return quantifier == "forall"
