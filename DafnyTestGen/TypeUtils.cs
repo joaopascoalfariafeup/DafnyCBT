@@ -369,11 +369,12 @@ static class TypeUtils
 
             var elemType = GetSeqElementType(type);
 
-            // Nested seq<seq<T>> or seq<string>: parse inner lengths and elements
+            // Nested seq<seq<T>> or seq<string>: parse flat encoding (list_len, list_0, list_1, ...)
             if (IsSupportedNestedSeqType(type))
             {
                 var smtName2 = SeqSmtName(name, type);
-                var outerLenPattern = new Regex(@$"\(\(seq\.len\s+{Regex.Escape(smtName2)}\)\s+([-\d]+|\(- \d+\))\)");
+                // Outer length: ((smtName_len K))
+                var outerLenPattern = new Regex(@$"\(\({Regex.Escape(smtName2)}_len\s+([-\d]+|\(- \d+\))\)\)");
                 var outerLenMatch = outerLenPattern.Match(fullText);
                 int outerLen = 0;
                 if (outerLenMatch.Success)
@@ -388,8 +389,8 @@ static class TypeUtils
 
                 for (int i = 0; i < Math.Min(outerLen, SmtTranslator.MAX_SEQ_LEN); i++)
                 {
-                    // Parse inner length: ((seq.len (seq.nth smtName i)) M)
-                    var innerLenPattern = new Regex(@$"\(\(seq\.len\s+\(seq\.nth\s+{Regex.Escape(smtName2)}\s+{i}\)\)\s+([-\d]+|\(- \d+\))\)");
+                    // Inner length: ((seq.len smtName_i) M)
+                    var innerLenPattern = new Regex(@$"\(\(seq\.len\s+{Regex.Escape(smtName2)}_{i}\)\s+([-\d]+|\(- \d+\))\)");
                     var innerLenMatch = innerLenPattern.Match(fullText);
                     int innerLen = 0;
                     if (innerLenMatch.Success)
@@ -399,25 +400,25 @@ static class TypeUtils
                         int.TryParse(innerLenVal, out innerLen);
                     }
 
-                    // Parse inner elements: ((seq.nth (seq.nth smtName i) j) V)
+                    // Inner elements: ((seq.nth smtName_i j) V)
                     var innerElements = new List<string>();
                     for (int j = 0; j < Math.Min(innerLen, SmtTranslator.MAX_INNER_SEQ_LEN); j++)
                     {
                         if (innerElemType == "real")
                         {
-                            var ep = new Regex(@$"\(\(seq\.nth\s+\(seq\.nth\s+{Regex.Escape(smtName2)}\s+{i}\)\s+{j}\)\s+((?:\([^()]*(?:\([^()]*\)[^()]*)*\)|\d+\.\d+|\d+))\)");
+                            var ep = new Regex(@$"\(\(seq\.nth\s+{Regex.Escape(smtName2)}_{i}\s+{j}\)\s+((?:\([^()]*(?:\([^()]*\)[^()]*)*\)|\d+\.\d+|\d+))\)");
                             var em = ep.Match(fullText);
                             innerElements.Add(em.Success ? NormalizeZ3Real(em.Groups[1].Value) : "0.0");
                         }
                         else if (innerElemType == "bool")
                         {
-                            var ep = new Regex(@$"\(\(seq\.nth\s+\(seq\.nth\s+{Regex.Escape(smtName2)}\s+{i}\)\s+{j}\)\s+(true|false)\)");
+                            var ep = new Regex(@$"\(\(seq\.nth\s+{Regex.Escape(smtName2)}_{i}\s+{j}\)\s+(true|false)\)");
                             var em = ep.Match(fullText);
                             innerElements.Add(em.Success ? em.Groups[1].Value : "false");
                         }
                         else
                         {
-                            var ep = new Regex(@$"\(\(seq\.nth\s+\(seq\.nth\s+{Regex.Escape(smtName2)}\s+{i}\)\s+{j}\)\s+([-\d]+|\(- \d+\))\)");
+                            var ep = new Regex(@$"\(\(seq\.nth\s+{Regex.Escape(smtName2)}_{i}\s+{j}\)\s+([-\d]+|\(- \d+\))\)");
                             var em = ep.Match(fullText);
                             innerElements.Add(em.Success ? NormalizeZ3Int(em.Groups[1].Value) : "0");
                         }

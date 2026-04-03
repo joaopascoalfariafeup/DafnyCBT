@@ -45,6 +45,7 @@ static class BoundaryAnalysis
                 // Boundary tiers constrain input (pre-state) sizes
                 var elemTypeStr = TypeUtils.GetSeqElementType(type);
                 var isTupleElem = TypeUtils.IsTupleType(elemTypeStr);
+                var isNestedSeq = TypeUtils.IsSupportedNestedSeqType(type);
                 string smtName;
                 if (isTupleElem)
                 {
@@ -62,6 +63,20 @@ static class BoundaryAnalysis
                     var smtBase = mutableNames.Contains(name) ? $"{name}_pre" : name;
                     smtName = TypeUtils.SeqSmtName(smtBase, type);
                 }
+                // For nested seq types, add inner-length floor tiers FIRST to force Z3
+                // to produce diverse minimum inner lengths early in the progressive
+                // strategy (e.g., v>=1, v>=2 for SmallestListLength).
+                if (isNestedSeq)
+                {
+                    for (int floor = 1; floor <= 2; floor++)
+                    {
+                        var parts = new List<string>();
+                        for (int k = 0; k < SmtTranslator.MAX_SEQ_LEN; k++)
+                            parts.Add($"(=> (>= {smtName}_len {k + 1}) (>= (seq.len {smtName}_{k}) {floor}))");
+                        tiers.Add(($"inner>={floor}", $"(and {string.Join(" ", parts)})"));
+                    }
+                }
+
                 // Size tiers: 0, 1, ..., tierCount-1
                 // For seq/string with size > 1, add distinctness constraints on elements
                 // (skip distinctness for tuple elements — not applicable to component sequences)
@@ -75,7 +90,14 @@ static class BoundaryAnalysis
                         var distincts = new List<string>();
                         for (int a = 0; a < sz; a++)
                             for (int b = a + 1; b < sz; b++)
-                                distincts.Add($"(not (= (seq.nth {smtName} {a}) (seq.nth {smtName} {b})))");
+                            {
+                                if (isNestedSeq)
+                                    // For nested seq<seq<T>>: force distinct inner lengths so min-length
+                                    // result is more likely to be uniquely determined
+                                    distincts.Add($"(not (= (seq.len (seq.nth {smtName} {a})) (seq.len (seq.nth {smtName} {b}))))");
+                                else
+                                    distincts.Add($"(not (= (seq.nth {smtName} {a}) (seq.nth {smtName} {b})))");
+                            }
                         constraint = $"(and {constraint} {string.Join(" ", distincts)})";
                     }
                     tiers.Add(($"{sz}", constraint));

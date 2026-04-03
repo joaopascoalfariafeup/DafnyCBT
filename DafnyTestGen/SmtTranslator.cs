@@ -324,6 +324,32 @@ static class SmtTranslator
                     }
                 }
             }
+            else if (TypeUtils.IsSupportedNestedSeqType(type))
+            {
+                // Flat encoding for nested seq<seq<T>> / seq<string>:
+                // Z3 cannot solve (Seq (Seq T)) symbolically, so we declare
+                // individual (Seq T) variables + an integer length variable.
+                var smtName = TypeUtils.SeqSmtName(name, type);
+                var innerElemType = TypeUtils.GetSeqElementType(type);
+                var innerInnerType = innerElemType == "string" ? "char" :
+                    TypeUtils.IsSeqType(innerElemType) ? TypeUtils.GetSeqElementType(innerElemType) : "int";
+                var innerSmtSort = TypeUtils.DafnyTypeToSmt(innerElemType == "string" ? "seq<char>" : innerElemType);
+                sb.AppendLine($"(declare-const {smtName}_len Int)");
+                sb.AppendLine($"(assert (>= {smtName}_len 0))");
+                sb.AppendLine($"(assert (<= {smtName}_len {MAX_SEQ_LEN}))");
+                for (int i = 0; i < MAX_SEQ_LEN; i++)
+                {
+                    sb.AppendLine($"(declare-const {smtName}_{i} {innerSmtSort})");
+                    sb.AppendLine($"(assert (>= (seq.len {smtName}_{i}) 0))");
+                    sb.AppendLine($"(assert (<= (seq.len {smtName}_{i}) {MAX_INNER_SEQ_LEN}))");
+                    if (innerInnerType == "char")
+                        for (int j = 0; j < MAX_INNER_SEQ_LEN; j++)
+                            sb.AppendLine($"(assert (=> (>= (seq.len {smtName}_{i}) {j + 1}) (and (>= (seq.nth {smtName}_{i} {j}) 32) (<= (seq.nth {smtName}_{i} {j}) 126))))");
+                    if (innerInnerType == "nat")
+                        for (int j = 0; j < MAX_INNER_SEQ_LEN; j++)
+                            sb.AppendLine($"(assert (=> (>= (seq.len {smtName}_{i}) {j + 1}) (>= (seq.nth {smtName}_{i} {j}) 0)))");
+                }
+            }
             else
             {
                 var smtType = TypeUtils.DafnyTypeToSmt(type);
@@ -471,8 +497,9 @@ static class SmtTranslator
                             sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 0) (<= (seq.nth {smtName} i) {enumElemCtors.Count - 1})))))");
                     }
                 }
-                else
+                else if (!TypeUtils.IsSupportedNestedSeqType(type))
                 {
+                    // Regular (non-nested) seq: bound length and constrain elements
                     var smtName = TypeUtils.SeqSmtName(name, type);
                     sb.AppendLine($"(assert (>= (seq.len {smtName}) 0))");
                     sb.AppendLine($"(assert (<= (seq.len {smtName}) {MAX_SEQ_LEN}))");
@@ -480,25 +507,8 @@ static class SmtTranslator
                         sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
                     if (_enumDatatypes.TryGetValue(elemTypeStr, out var enumElemCtors2))
                         sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 0) (<= (seq.nth {smtName} i) {enumElemCtors2.Count - 1})))))");
-
-                    // Nested seq<seq<T>> or seq<string>: bound inner sequence lengths
-                    if (TypeUtils.IsSupportedNestedSeqType(type))
-                    {
-                        var innerElemType = elemTypeStr == "string" ? "char" :
-                            TypeUtils.IsSeqType(elemTypeStr) ? TypeUtils.GetSeqElementType(elemTypeStr) : "int";
-                        for (int i = 0; i < MAX_SEQ_LEN; i++)
-                        {
-                            sb.AppendLine($"(assert (=> (>= (seq.len {smtName}) {i + 1}) (and (>= (seq.len (seq.nth {smtName} {i})) 0) (<= (seq.len (seq.nth {smtName} {i})) {MAX_INNER_SEQ_LEN}))))");
-                            // Constrain inner elements: nat >= 0, char in printable range
-                            if (innerElemType == "char")
-                                for (int j = 0; j < MAX_INNER_SEQ_LEN; j++)
-                                    sb.AppendLine($"(assert (=> (and (>= (seq.len {smtName}) {i + 1}) (>= (seq.len (seq.nth {smtName} {i})) {j + 1})) (and (>= (seq.nth (seq.nth {smtName} {i}) {j}) 32) (<= (seq.nth (seq.nth {smtName} {i}) {j}) 126))))");
-                            if (innerElemType == "nat")
-                                for (int j = 0; j < MAX_INNER_SEQ_LEN; j++)
-                                    sb.AppendLine($"(assert (=> (and (>= (seq.len {smtName}) {i + 1}) (>= (seq.len (seq.nth {smtName} {i})) {j + 1})) (>= (seq.nth (seq.nth {smtName} {i}) {j}) 0)))");
-                        }
-                    }
                 }
+                // (nested seq bounds are handled in the flat encoding declaration block above)
             }
         }
 
@@ -841,19 +851,20 @@ static class SmtTranslator
                 else
                 {
                     var smtName = TypeUtils.SeqSmtName(name, type);
-                    sb.AppendLine($"(get-value ((seq.len {smtName})))");
                     if (TypeUtils.IsSupportedNestedSeqType(type))
                     {
-                        // Nested seq: query inner lengths and elements
+                        // Flat encoding: query list_len, then each list_K's length and elements
+                        sb.AppendLine($"(get-value ({smtName}_len))");
                         for (int i = 0; i < MAX_SEQ_LEN; i++)
                         {
-                            sb.AppendLine($"(get-value ((seq.len (seq.nth {smtName} {i}))))");
+                            sb.AppendLine($"(get-value ((seq.len {smtName}_{i})))");
                             for (int j = 0; j < MAX_INNER_SEQ_LEN; j++)
-                                sb.AppendLine($"(get-value ((seq.nth (seq.nth {smtName} {i}) {j})))");
+                                sb.AppendLine($"(get-value ((seq.nth {smtName}_{i} {j})))");
                         }
                     }
                     else
                     {
+                        sb.AppendLine($"(get-value ((seq.len {smtName})))");
                         for (int i = 0; i < 8; i++)
                             sb.AppendLine($"(get-value ((seq.nth {smtName} {i})))");
                     }
@@ -888,7 +899,25 @@ static class SmtTranslator
             }
         }
 
-        return sb.ToString();
+        // Post-process: rewrite nested seq references to flat encoding.
+        // Replace (seq.nth varName K) → varName_K and (seq.len varName) → varName_len
+        // for all nested seq<seq<T>> / seq<string> parameters.
+        var smtText = sb.ToString();
+        foreach (var (name, type) in inputs.Concat(outputs))
+        {
+            if (TypeUtils.IsSupportedNestedSeqType(type))
+            {
+                var smtName = TypeUtils.SeqSmtName(name, type);
+                // Replace (seq.nth smtName K) with smtName_K for concrete indices K=0..MAX_SEQ_LEN-1
+                // Must process BEFORE (seq.len smtName) to avoid partial matches
+                for (int k = MAX_SEQ_LEN - 1; k >= 0; k--)
+                    smtText = smtText.Replace($"(seq.nth {smtName} {k})", $"{smtName}_{k}");
+                // Replace (seq.len smtName) with smtName_len
+                smtText = smtText.Replace($"(seq.len {smtName})", $"{smtName}_len");
+            }
+        }
+
+        return smtText;
     }
 
     // ───────────────── AST-based Expression → SMT translator ─────────────────
@@ -1168,21 +1197,75 @@ static class SmtTranslator
                     : $"(and {rangeSmt} {bodySmt})";
             }
 
-            // For single-variable quantifiers with seq.nth, expand finitely
-            if (boundVars.Count == 1 && bodySmt.Contains("seq.nth"))
+            // For quantifiers with seq.nth, expand finitely to avoid Z3 quantifier instantiation failures
+            if (boundVars.Count >= 1 && boundVars.Count <= 2 && bodySmt.Contains("seq.nth"))
             {
-                var varName = boundVars[0].Name;
-                var instances = new List<string>();
-                for (int idx = 0; idx < MAX_SEQ_LEN; idx++)
+                if (boundVars.Count == 1)
                 {
-                    var instance = Regex.Replace(bodySmt,
-                        @"(?<![a-zA-Z_])" + Regex.Escape(varName) + @"(?![a-zA-Z_0-9])",
-                        idx.ToString());
-                    instances.Add(instance);
+                    var bv0 = boundVars[0];
+                    // If the body contains (= varName (seq.nth SEQNAME K)), the bound variable
+                    // is seq-typed (e.g., "forall x :: x in outerSeq ==> body"). Substitute
+                    // (seq.nth outerSeq k) for each k instead of an integer index.
+                    // After post-processing, (seq.nth outerSeq k) → outerSeq_k (flat encoding).
+                    var seqNameMatch = Regex.Match(bodySmt,
+                        @"\(= " + Regex.Escape(bv0.Name) + @" \(seq\.nth (\S+) \d+\)\)");
+                    if (!seqNameMatch.Success)
+                        seqNameMatch = Regex.Match(bodySmt,
+                            @"\(= \(seq\.nth (\S+) \d+\) " + Regex.Escape(bv0.Name) + @"\)");
+                    if (seqNameMatch.Success)
+                    {
+                        var outerSeqSmt = seqNameMatch.Groups[1].Value;
+                        var instances = new List<string>();
+                        for (int k = 0; k < MAX_SEQ_LEN; k++)
+                        {
+                            var elem = $"(seq.nth {outerSeqSmt} {k})";
+                            var instance = Regex.Replace(bodySmt,
+                                @"(?<![a-zA-Z_])" + Regex.Escape(bv0.Name) + @"(?![a-zA-Z_0-9])",
+                                elem);
+                            // Guard: only enforce when k is a valid index in the outer seq
+                            instance = $"(=> (>= (seq.len {outerSeqSmt}) {k + 1}) {instance})";
+                            instances.Add(instance);
+                        }
+                        return quantifier == "forall"
+                            ? $"(and {string.Join(" ", instances)})"
+                            : $"(or {string.Join(" ", instances)})";
+                    }
+
+                    var varName = bv0.Name;
+                    var intInstances = new List<string>();
+                    for (int idx = 0; idx < MAX_SEQ_LEN; idx++)
+                    {
+                        var instance = Regex.Replace(bodySmt,
+                            @"(?<![a-zA-Z_])" + Regex.Escape(varName) + @"(?![a-zA-Z_0-9])",
+                            idx.ToString());
+                        intInstances.Add(instance);
+                    }
+                    return quantifier == "forall"
+                        ? $"(and {string.Join(" ", intInstances)})"
+                        : $"(or {string.Join(" ", intInstances)})";
                 }
-                return quantifier == "forall"
-                    ? $"(and {string.Join(" ", instances)})"
-                    : $"(or {string.Join(" ", instances)})";
+                else // boundVars.Count == 2
+                {
+                    var var1 = boundVars[0].Name;
+                    var var2 = boundVars[1].Name;
+                    var instances = new List<string>();
+                    for (int i = 0; i < MAX_SEQ_LEN; i++)
+                    {
+                        for (int j = 0; j < MAX_SEQ_LEN; j++)
+                        {
+                            var instance = Regex.Replace(bodySmt,
+                                @"(?<![a-zA-Z_])" + Regex.Escape(var1) + @"(?![a-zA-Z_0-9])",
+                                i.ToString());
+                            instance = Regex.Replace(instance,
+                                @"(?<![a-zA-Z_])" + Regex.Escape(var2) + @"(?![a-zA-Z_0-9])",
+                                j.ToString());
+                            instances.Add(instance);
+                        }
+                    }
+                    return quantifier == "forall"
+                        ? $"(and {string.Join(" ", instances)})"
+                        : $"(or {string.Join(" ", instances)})";
+                }
             }
 
             return $"({quantifier} ({bindings}) {bodySmt})";
@@ -2035,27 +2118,85 @@ static class SmtTranslator
                         : $"(and {rangeSmt} {bodySmt})";
                 }
 
-                // For single-variable quantifiers whose body references seq.nth,
+                // For quantifiers whose body references seq.nth,
                 // expand into explicit conjunctions/disjunctions over 0..MAX_SEQ_LEN-1.
                 // Z3's quantifier instantiation is incomplete for seq.nth patterns,
                 // causing forall preconditions over array elements to be ignored.
-                if (boundVars.Count == 1 && boundVars[0].smtType == "Int"
+                // Special case: if the bound variable is seq-typed (e.g., "forall x :: x in outerSeq"),
+                // substitute (seq.nth outerSeq k) rather than integer k.
+                if (boundVars.Count == 1 && bodySmt.Contains("seq.nth"))
+                {
+                    var bv0s = boundVars[0];
+                    // Try body-pattern detection: if body contains (= varName (seq.nth SEQNAME K)),
+                    // the bound variable is seq-typed. Use (seq.nth outerSeq k) substitution.
+                    // Do NOT require smtType check — string-path bound vars default to "Int".
+                    var seqNameMatchS = Regex.Match(bodySmt,
+                        @"\(= " + Regex.Escape(bv0s.name) + @" \(seq\.nth (\S+) \d+\)\)");
+                    if (!seqNameMatchS.Success)
+                        seqNameMatchS = Regex.Match(bodySmt,
+                            @"\(= \(seq\.nth (\S+) \d+\) " + Regex.Escape(bv0s.name) + @"\)");
+                    if (seqNameMatchS.Success)
+                    {
+                        var outerSeqSmtS = seqNameMatchS.Groups[1].Value;
+                        var seqInstances = new List<string>();
+                        for (int k = 0; k < MAX_SEQ_LEN; k++)
+                        {
+                            var elem = $"(seq.nth {outerSeqSmtS} {k})";
+                            var instance = Regex.Replace(bodySmt,
+                                @"(?<![a-zA-Z_])" + Regex.Escape(bv0s.name) + @"(?![a-zA-Z_0-9])",
+                                elem);
+                            instance = $"(=> (>= (seq.len {outerSeqSmtS}) {k + 1}) {instance})";
+                            seqInstances.Add(instance);
+                        }
+                        return quantifier == "forall"
+                            ? $"(and {string.Join(" ", seqInstances)})"
+                            : $"(or {string.Join(" ", seqInstances)})";
+                    }
+                }
+                if (boundVars.Count >= 1 && boundVars.Count <= 2
+                    && boundVars.All(v => v.smtType == "Int")
                     && bodySmt.Contains("seq.nth"))
                 {
-                    var varName = boundVars[0].name;
-                    var instances = new List<string>();
-                    for (int idx = 0; idx < MAX_SEQ_LEN; idx++)
+                    if (boundVars.Count == 1)
                     {
-                        // Replace the bound variable with the concrete index
-                        var instance = Regex.Replace(bodySmt,
-                            @"(?<![a-zA-Z_])" + Regex.Escape(varName) + @"(?![a-zA-Z_0-9])",
-                            idx.ToString());
-                        instances.Add(instance);
+                        var varName = boundVars[0].name;
+                        var instances = new List<string>();
+                        for (int idx = 0; idx < MAX_SEQ_LEN; idx++)
+                        {
+                            // Replace the bound variable with the concrete index
+                            var instance = Regex.Replace(bodySmt,
+                                @"(?<![a-zA-Z_])" + Regex.Escape(varName) + @"(?![a-zA-Z_0-9])",
+                                idx.ToString());
+                            instances.Add(instance);
+                        }
+                        if (quantifier == "forall")
+                            return $"(and {string.Join(" ", instances)})";
+                        else // exists
+                            return $"(or {string.Join(" ", instances)})";
                     }
-                    if (quantifier == "forall")
-                        return $"(and {string.Join(" ", instances)})";
-                    else // exists
-                        return $"(or {string.Join(" ", instances)})";
+                    else // boundVars.Count == 2
+                    {
+                        var var1 = boundVars[0].name;
+                        var var2 = boundVars[1].name;
+                        var instances = new List<string>();
+                        for (int i = 0; i < MAX_SEQ_LEN; i++)
+                        {
+                            for (int j = 0; j < MAX_SEQ_LEN; j++)
+                            {
+                                var instance = Regex.Replace(bodySmt,
+                                    @"(?<![a-zA-Z_])" + Regex.Escape(var1) + @"(?![a-zA-Z_0-9])",
+                                    i.ToString());
+                                instance = Regex.Replace(instance,
+                                    @"(?<![a-zA-Z_])" + Regex.Escape(var2) + @"(?![a-zA-Z_0-9])",
+                                    j.ToString());
+                                instances.Add(instance);
+                            }
+                        }
+                        if (quantifier == "forall")
+                            return $"(and {string.Join(" ", instances)})";
+                        else // exists
+                            return $"(or {string.Join(" ", instances)})";
+                    }
                 }
 
                 var bindings = string.Join(" ", boundVars.Select(v => $"({v.name} {v.smtType})"));
@@ -2401,6 +2542,17 @@ static class SmtTranslator
                 var smtSeq = isArray ? $"{seqExpr}_seq" : seqExpr;
                 return $"(seq.extract {smtSeq} {from} (- {to} {from}))";
             }
+        }
+
+        // Handle chained bracket access: base_expr[idx] where base_expr itself has brackets
+        // e.g., l[i][|l[i]| - 1] for nested seq types after function inlining
+        var chainedBracket = SplitLastTopLevelBracket(expr);
+        if (chainedBracket != null && chainedBracket.Value.baseExpr.Contains("["))
+        {
+            var baseSmt = DafnyExprToSmt(chainedBracket.Value.baseExpr, inputs);
+            var idxSmt = DafnyExprToSmt(chainedBracket.Value.index, inputs);
+            if (baseSmt != null && idxSmt != null)
+                return $"(seq.nth {baseSmt} {idxSmt})";
         }
 
         // Handle seq[i] (sequence/array element access) or M[x] (multiset count)
@@ -3264,6 +3416,34 @@ static class SmtTranslator
     }
 
     /// <summary>
+    /// Finds the last top-level [...] in expr (bracket-depth-aware).
+    /// Returns (baseExpr, index) where baseExpr is everything before the '[' and
+    /// index is the content inside the brackets.  Returns null if not found.
+    /// </summary>
+    static (string baseExpr, string index)? SplitLastTopLevelBracket(string expr)
+    {
+        if (!expr.EndsWith("]")) return null;
+        int depth = 0;
+        for (int i = expr.Length - 1; i >= 0; i--)
+        {
+            if (expr[i] == ']') depth++;
+            else if (expr[i] == '[')
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    var baseExpr = expr.Substring(0, i).Trim();
+                    var index = expr.Substring(i + 1, expr.Length - i - 2).Trim();
+                    if (baseExpr.Length > 0 && index.Length > 0)
+                        return (baseExpr, index);
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Splits a string on a binary operator at the top level (outside parens/brackets).
     /// Returns (left, right) or null if the operator is not found at the top level.
     /// </summary>
@@ -3326,6 +3506,27 @@ static class SmtTranslator
                         sb.AppendLine($"(assert (= {smtBase}_{i} {compVal}))");
                 }
             }
+            else if (TypeUtils.IsSupportedNestedSeqType(type))
+            {
+                var smtName = TypeUtils.SeqSmtName(smtBase, type);
+                if (values.TryGetValue(smtBase + "_len", out var outerLenStr) && int.TryParse(outerLenStr, out var outerLen))
+                {
+                    sb.AppendLine($"(assert (= {smtName}_len {outerLen}))");
+                    for (int i = 0; i < outerLen; i++)
+                    {
+                        if (values.TryGetValue($"{smtBase}_{i}_len", out var innerLenStr) && int.TryParse(innerLenStr, out var innerLen))
+                        {
+                            sb.AppendLine($"(assert (= (seq.len {smtName}_{i}) {innerLen}))");
+                            if (values.TryGetValue($"{smtBase}_{i}_elems", out var innerElemsStr))
+                            {
+                                var innerElems = innerElemsStr.Split(',');
+                                for (int j = 0; j < Math.Min(innerLen, innerElems.Length); j++)
+                                    sb.AppendLine($"(assert (= (seq.nth {smtName}_{i} {j}) {innerElems[j]}))");
+                            }
+                        }
+                    }
+                }
+            }
             else if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
             {
                 var seqName = TypeUtils.SeqSmtName(smtBase, type);
@@ -3356,7 +3557,28 @@ static class SmtTranslator
         {
             if (!mutableNames.Contains(name)) continue;
             var postBase = $"{name}_post";
-            if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
+            if (TypeUtils.IsSupportedNestedSeqType(type))
+            {
+                var smtName = TypeUtils.SeqSmtName(postBase, type);
+                if (values.TryGetValue(postBase + "_len", out var outerLenStr) && int.TryParse(outerLenStr, out var outerLen))
+                {
+                    eqParts.Add($"(= {smtName}_len {outerLen})");
+                    for (int i = 0; i < outerLen; i++)
+                    {
+                        if (values.TryGetValue($"{postBase}_{i}_len", out var innerLenStr) && int.TryParse(innerLenStr, out var innerLen))
+                        {
+                            eqParts.Add($"(= (seq.len {smtName}_{i}) {innerLen})");
+                            if (values.TryGetValue($"{postBase}_{i}_elems", out var innerElemsStr))
+                            {
+                                var innerElems = innerElemsStr.Split(',');
+                                for (int j = 0; j < Math.Min(innerLen, innerElems.Length); j++)
+                                    eqParts.Add($"(= (seq.nth {smtName}_{i} {j}) {innerElems[j]})");
+                            }
+                        }
+                    }
+                }
+            }
+            else if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
             {
                 var seqName = TypeUtils.SeqSmtName(postBase, type);
                 if (values.TryGetValue(postBase + "_len", out var lenStr) && int.TryParse(lenStr, out var len))
@@ -3382,6 +3604,27 @@ static class SmtTranslator
                 {
                     if (values.TryGetValue($"{name}_{i}", out var compVal))
                         eqParts.Add($"(= {name}_{i} {compVal})");
+                }
+            }
+            else if (TypeUtils.IsSupportedNestedSeqType(type))
+            {
+                var smtName = TypeUtils.SeqSmtName(name, type);
+                if (values.TryGetValue(name + "_len", out var outerLenStr) && int.TryParse(outerLenStr, out var outerLen))
+                {
+                    eqParts.Add($"(= {smtName}_len {outerLen})");
+                    for (int i = 0; i < outerLen; i++)
+                    {
+                        if (values.TryGetValue($"{name}_{i}_len", out var innerLenStr) && int.TryParse(innerLenStr, out var innerLen))
+                        {
+                            eqParts.Add($"(= (seq.len {smtName}_{i}) {innerLen})");
+                            if (values.TryGetValue($"{name}_{i}_elems", out var innerElemsStr))
+                            {
+                                var innerElems = innerElemsStr.Split(',');
+                                for (int j = 0; j < Math.Min(innerLen, innerElems.Length); j++)
+                                    eqParts.Add($"(= (seq.nth {smtName}_{i} {j}) {innerElems[j]})");
+                            }
+                        }
+                    }
                 }
             }
             else if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))

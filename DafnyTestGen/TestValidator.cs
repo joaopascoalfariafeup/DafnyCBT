@@ -353,13 +353,18 @@ static class TestValidator
     }
 
     /// <summary>
-    /// Returns true if the string is already a simple scalar literal:
-    /// integer, real, bool, or char. These don't need runtime capture.
+    /// Returns true if the string is already a concrete Dafny literal that doesn't
+    /// need runtime capture: scalar (int, real, bool, char) or collection display
+    /// (seq, set, multiset).  Dafny's print for seq&lt;char&gt; outputs raw string text,
+    /// so replacing a seq literal with captured output would corrupt char sequences.
     /// </summary>
     static bool IsSimpleScalarLiteral(string s) =>
         Regex.IsMatch(s, @"^-?\d+(\.\d+)?$")   // int or real
         || s == "true" || s == "false"           // bool
-        || Regex.IsMatch(s, @"^'.'$");           // char
+        || Regex.IsMatch(s, @"^'.'$")           // char
+        || Regex.IsMatch(s, @"^\[.*\]$")        // seq display
+        || Regex.IsMatch(s, @"^\{.*\}$")        // set display
+        || Regex.IsMatch(s, @"^multiset\{.*\}$"); // multiset display
 
     // ─────────────────────────────────────────────────────────────────────────
     // Marker parsing
