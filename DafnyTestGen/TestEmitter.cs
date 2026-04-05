@@ -594,7 +594,12 @@ static class TestEmitter
         if (typeStr == "bool")
             return val == "true" ? "true" : "false";
         if (typeStr == "string")
+        {
+            // If val is already a Dafny string literal (from string-set universe), return it directly
+            if (val.StartsWith("\"") && val.EndsWith("\""))
+                return val;
             return "\"\""; // string constructor params: use empty string
+        }
         return val;
     }
 

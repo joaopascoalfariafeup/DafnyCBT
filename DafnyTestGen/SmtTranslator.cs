@@ -96,7 +96,9 @@ static class SmtTranslator
 
         // Set operation macros (sets encoded as (Array Int Bool))
         var hasSetParam = inputs.Concat(outputs).Any(v => TypeUtils.IsSetType(v.Type));
-        if (hasSetParam)
+        var hasIntSet = inputs.Concat(outputs).Any(v => TypeUtils.IsSetType(v.Type) && !TypeUtils.IsStringElementSet(v.Type));
+        var hasStringSet = inputs.Concat(outputs).Any(v => TypeUtils.IsStringElementSet(v.Type));
+        if (hasIntSet)
         {
             sb.AppendLine();
             sb.AppendLine("; Set operations over (Array Int Bool) encoding");
@@ -110,6 +112,30 @@ static class SmtTranslator
             sb.AppendLine($"  ((_ map and) a b))");
             sb.AppendLine("(define-fun SetDifference ((a (Array Int Bool)) (b (Array Int Bool))) (Array Int Bool)");
             sb.AppendLine($"  ((_ map and) a ((_ map not) b)))");
+        }
+        if (hasStringSet)
+        {
+            sb.AppendLine();
+            sb.AppendLine("; String set operations over (Array (Seq Int) Bool) encoding");
+            sb.AppendLine("(define-fun EmptySetStr () (Array (Seq Int) Bool) ((as const (Array (Seq Int) Bool)) false))");
+            sb.AppendLine("(define-fun SubsetOfStr ((a (Array (Seq Int) Bool)) (b (Array (Seq Int) Bool))) Bool");
+            sb.AppendLine($"  (forall ((x (Seq Int))) (=> (select a x) (select b x))))");
+            sb.AppendLine("(define-fun SetUnionStr ((a (Array (Seq Int) Bool)) (b (Array (Seq Int) Bool))) (Array (Seq Int) Bool)");
+            sb.AppendLine($"  ((_ map or) a b))");
+            sb.AppendLine("(define-fun SetIntersectionStr ((a (Array (Seq Int) Bool)) (b (Array (Seq Int) Bool))) (Array (Seq Int) Bool)");
+            sb.AppendLine($"  ((_ map and) a b))");
+            sb.AppendLine("(define-fun SetDifferenceStr ((a (Array (Seq Int) Bool)) (b (Array (Seq Int) Bool))) (Array (Seq Int) Bool)");
+            sb.AppendLine($"  ((_ map and) a ((_ map not) b)))");
+            // String universe constants
+            sb.AppendLine("; String universe constants for set<string>");
+            sb.AppendLine("(declare-const _str_u0 (Seq Int)) (assert (= _str_u0 (as seq.empty (Seq Int))))"); // ""
+            sb.AppendLine("(declare-const _str_u1 (Seq Int)) (assert (= _str_u1 (seq.unit 97)))");  // "a"
+            sb.AppendLine("(declare-const _str_u2 (Seq Int)) (assert (= _str_u2 (seq.unit 98)))");  // "b"
+            sb.AppendLine("(declare-const _str_u3 (Seq Int)) (assert (= _str_u3 (seq.unit 99)))");  // "c"
+            sb.AppendLine("(declare-const _str_u4 (Seq Int)) (assert (= _str_u4 (seq.unit 100)))"); // "d"
+            sb.AppendLine("(declare-const _str_u5 (Seq Int)) (assert (= _str_u5 (seq.unit 101)))"); // "e"
+            sb.AppendLine("(declare-const _str_u6 (Seq Int)) (assert (= _str_u6 (seq.unit 102)))"); // "f"
+            sb.AppendLine("(declare-const _str_u7 (Seq Int)) (assert (= _str_u7 (seq.unit 103)))"); // "g"
         }
 
         // Multiset operation macros (multisets encoded as (Array Int Int) — counts)
@@ -519,22 +545,43 @@ static class SmtTranslator
             if (TypeUtils.IsSetType(type))
             {
                 var elemType = TypeUtils.GetSetElementType(type);
-                var universe = TypeUtils.GetElementUniverse(elemType);
                 var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
-                // Closed-world: membership implies element in universe
-                var universeDisjuncts = string.Join(" ", universe.Select(v => $"(= x {v})"));
-                sb.AppendLine($"(assert (forall ((x Int)) (=> (select {smtName} x) (or {universeDisjuncts}))))");
-                // Cardinality helper: sum of (ite (select S i) 1 0) for each universe element
-                var cardTerms = string.Join(" ", universe.Select(v => $"(ite (select {smtName} {v}) 1 0)"));
-                sb.AppendLine($"(define-fun {smtName}_card () Int (+ {cardTerms}))");
 
-                // If mutable, also bound post-state set and define its cardinality
-                if (mutableNames.Contains(name))
+                if (TypeUtils.IsStringElementSet(type))
                 {
-                    var postName = $"{name}_post";
-                    sb.AppendLine($"(assert (forall ((x Int)) (=> (select {postName} x) (or {universeDisjuncts}))))");
-                    var postCardTerms = string.Join(" ", universe.Select(v => $"(ite (select {postName} {v}) 1 0)"));
-                    sb.AppendLine($"(define-fun {postName}_card () Int (+ {postCardTerms}))");
+                    // String set: use named string universe constants
+                    var smtUniverse = TypeUtils.GetElementUniverseSmt("string");
+                    var universeDisjuncts = string.Join(" ", smtUniverse.Select(v => $"(= x {v})"));
+                    sb.AppendLine($"(assert (forall ((x (Seq Int))) (=> (select {smtName} x) (or {universeDisjuncts}))))");
+                    var cardTerms = string.Join(" ", smtUniverse.Select(v => $"(ite (select {smtName} {v}) 1 0)"));
+                    sb.AppendLine($"(define-fun {smtName}_card () Int (+ {cardTerms}))");
+
+                    if (mutableNames.Contains(name))
+                    {
+                        var postName = $"{name}_post";
+                        sb.AppendLine($"(assert (forall ((x (Seq Int))) (=> (select {postName} x) (or {universeDisjuncts}))))");
+                        var postCardTerms = string.Join(" ", smtUniverse.Select(v => $"(ite (select {postName} {v}) 1 0)"));
+                        sb.AppendLine($"(define-fun {postName}_card () Int (+ {postCardTerms}))");
+                    }
+                }
+                else
+                {
+                    var universe = TypeUtils.GetElementUniverse(elemType);
+                    // Closed-world: membership implies element in universe
+                    var universeDisjuncts = string.Join(" ", universe.Select(v => $"(= x {v})"));
+                    sb.AppendLine($"(assert (forall ((x Int)) (=> (select {smtName} x) (or {universeDisjuncts}))))");
+                    // Cardinality helper: sum of (ite (select S i) 1 0) for each universe element
+                    var cardTerms = string.Join(" ", universe.Select(v => $"(ite (select {smtName} {v}) 1 0)"));
+                    sb.AppendLine($"(define-fun {smtName}_card () Int (+ {cardTerms}))");
+
+                    // If mutable, also bound post-state set and define its cardinality
+                    if (mutableNames.Contains(name))
+                    {
+                        var postName = $"{name}_post";
+                        sb.AppendLine($"(assert (forall ((x Int)) (=> (select {postName} x) (or {universeDisjuncts}))))");
+                        var postCardTerms = string.Join(" ", universe.Select(v => $"(ite (select {postName} {v}) 1 0)"));
+                        sb.AppendLine($"(define-fun {postName}_card () Int (+ {postCardTerms}))");
+                    }
                 }
             }
         }
@@ -585,6 +632,27 @@ static class SmtTranslator
                 var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
                 var cardTerms = string.Join(" ", Enumerable.Range(0, keyUniverse.Length).Select(i => $"(ite {smtName}_p{i} 1 0)"));
                 sb.AppendLine($"(define-fun {smtName}_card () Int (+ {cardTerms}))");
+            }
+        }
+
+        // Constrain string parameters to the string universe when set<string> is present,
+        // so Z3 picks from the bounded universe rather than arbitrary strings.
+        if (hasStringSet)
+        {
+            var smtUniverse = TypeUtils.GetElementUniverseSmt("string");
+            foreach (var (name, type) in inputs.Concat(outputs).ToList())
+            {
+                if (type == "string")
+                {
+                    var varNames = mutableNames.Contains(name)
+                        ? new[] { $"{name}_pre", $"{name}_post" }
+                        : new[] { name };
+                    foreach (var vn in varNames)
+                    {
+                        var disjuncts = string.Join(" ", smtUniverse.Select(v => $"(= {vn} {v})"));
+                        sb.AppendLine($"(assert (or {disjuncts}))");
+                    }
+                }
             }
         }
 
@@ -874,9 +942,18 @@ static class SmtTranslator
             {
                 var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
                 var elemType = TypeUtils.GetSetElementType(type);
-                var universe = TypeUtils.GetElementUniverse(elemType);
-                foreach (var v in universe)
-                    sb.AppendLine($"(get-value ((select {smtName} {v})))");
+                if (TypeUtils.IsStringElementSet(type))
+                {
+                    var smtUniverse = TypeUtils.GetElementUniverseSmt("string");
+                    foreach (var v in smtUniverse)
+                        sb.AppendLine($"(get-value ((select {smtName} {v})))");
+                }
+                else
+                {
+                    var universe = TypeUtils.GetElementUniverse(elemType);
+                    foreach (var v in universe)
+                        sb.AppendLine($"(get-value ((select {smtName} {v})))");
+                }
             }
             else if (TypeUtils.IsMultisetType(type))
             {
@@ -1082,31 +1159,45 @@ static class SmtTranslator
                 BinaryExpr.Opcode.Neq => $"(not (= {left} {right}))",
                 BinaryExpr.Opcode.Lt => IsMultisetExprAst(bin.E0, inputs)
                     ? $"(and (SubsetOfMultiset {left} {right}) (not (= {left} {right})))"
+                    : IsStringSetExprAst(bin.E0, inputs)
+                    ? $"(and (SubsetOfStr {left} {right}) (not (= {left} {right})))"
                     : IsSetExprAst(bin.E0, inputs)
                     ? $"(and (SubsetOf {left} {right}) (not (= {left} {right})))" : $"(< {left} {right})",
                 BinaryExpr.Opcode.Le => IsMultisetExprAst(bin.E0, inputs)
                     ? $"(SubsetOfMultiset {left} {right})"
+                    : IsStringSetExprAst(bin.E0, inputs)
+                    ? $"(SubsetOfStr {left} {right})"
                     : IsSetExprAst(bin.E0, inputs)
                     ? $"(SubsetOf {left} {right})" : $"(<= {left} {right})",
                 BinaryExpr.Opcode.Gt => IsMultisetExprAst(bin.E0, inputs)
                     ? $"(and (SubsetOfMultiset {right} {left}) (not (= {left} {right})))"
+                    : IsStringSetExprAst(bin.E0, inputs)
+                    ? $"(and (SubsetOfStr {right} {left}) (not (= {left} {right})))"
                     : IsSetExprAst(bin.E0, inputs)
                     ? $"(and (SubsetOf {right} {left}) (not (= {left} {right})))" : $"(> {left} {right})",
                 BinaryExpr.Opcode.Ge => IsMultisetExprAst(bin.E0, inputs)
                     ? $"(SubsetOfMultiset {right} {left})"
+                    : IsStringSetExprAst(bin.E0, inputs)
+                    ? $"(SubsetOfStr {right} {left})"
                     : IsSetExprAst(bin.E0, inputs)
                     ? $"(SubsetOf {right} {left})" : $"(>= {left} {right})",
                 BinaryExpr.Opcode.Add => IsMultisetExprAst(bin.E0, inputs)
                     ? $"(MultisetUnion {left} {right})"
+                    : IsStringSetExprAst(bin.E0, inputs)
+                    ? $"(SetUnionStr {left} {right})"
                     : IsSetExprAst(bin.E0, inputs)
                     ? $"(SetUnion {left} {right})" : IsSeqExprAst(bin.E0, inputs)
                     ? $"(seq.++ {left} {right})" : $"(+ {left} {right})",
                 BinaryExpr.Opcode.Sub => IsMultisetExprAst(bin.E0, inputs)
                     ? $"(MultisetDifference {left} {right})"
+                    : IsStringSetExprAst(bin.E0, inputs)
+                    ? $"(SetDifferenceStr {left} {right})"
                     : IsSetExprAst(bin.E0, inputs)
                     ? $"(SetDifference {left} {right})" : $"(- {left} {right})",
                 BinaryExpr.Opcode.Mul => IsMultisetExprAst(bin.E0, inputs)
                     ? $"(MultisetIntersection {left} {right})"
+                    : IsStringSetExprAst(bin.E0, inputs)
+                    ? $"(SetIntersectionStr {left} {right})"
                     : IsSetExprAst(bin.E0, inputs)
                     ? $"(SetIntersection {left} {right})" : $"(* {left} {right})",
                 BinaryExpr.Opcode.Div => $"(div {left} {right})",
@@ -1535,10 +1626,13 @@ static class SmtTranslator
         // SetDisplayExpr: {e1, e2, ...} — set literal
         if (expr is SetDisplayExpr setDisplay)
         {
+            var setType = setDisplay.Type?.ToString() ?? "";
+            var isStrSet = TypeUtils.IsStringElementSet(setType);
+            var emptyName = isStrSet ? "EmptySetStr" : "EmptySet";
             if (setDisplay.Elements.Count == 0)
-                return "EmptySet";
+                return emptyName;
             // Build a set from elements: (store (store EmptySet e1 true) e2 true) ...
-            var result = "EmptySet";
+            var result = emptyName;
             foreach (var elem in setDisplay.Elements)
             {
                 var elemSmt = ExprToSmt(elem, inputs, mutableNames, isPostContext, insideOld);
@@ -1838,6 +1932,20 @@ static class SmtTranslator
                 return true;
         }
         if (expr is OldExpr oldE) return IsSetExprAst(oldE.Expr, inputs);
+        return false;
+    }
+
+    static bool IsStringSetExprAst(Expression expr, List<(string Name, string Type)> inputs)
+    {
+        expr = UnwrapExpr(expr);
+        var name = GetOriginalName(expr);
+        if (name != null)
+        {
+            var match = inputs.FirstOrDefault(v => v.Name == name);
+            if (match != default && TypeUtils.IsStringElementSet(match.Type))
+                return true;
+        }
+        if (expr is OldExpr oldE2) return IsStringSetExprAst(oldE2.Expr, inputs);
         return false;
     }
 

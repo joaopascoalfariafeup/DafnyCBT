@@ -305,21 +305,21 @@ class Program
             .Select(f => f.Name)
             .ToHashSet();
 
-        // File-level check: skip entire program if it contains any bodyless method.
-        // Such programs cannot be compiled (dafny build fails), so generated tests
-        // that include the source would produce build errors.
+        // Detect bodyless methods — these will be skipped individually during test generation,
+        // and the -c (check) option is not supported for programs containing them
+        // (dafny build fails on bodyless methods).
         var allProgramMethods = DafnyParser.AllTopLevelDecls(program)
             .OfType<TopLevelDeclWithMembers>()
             .SelectMany(cls => cls.Members)
             .OfType<Method>()
             .ToList();
         var bodylessMethods = allProgramMethods.Where(m => m.Body == null && !m.IsGhost).ToList();
-        if (bodylessMethods.Count > 0)
+        bool hasBodylessMethods = bodylessMethods.Count > 0;
+        if (hasBodylessMethods)
         {
             var names = string.Join(", ", bodylessMethods.Select(m => $"'{m.Name}'"));
-            Console.WriteLine($"[DafnyTestGen] Skipping {file.Name}: program contains bodyless method(s) {names} (cannot be compiled)");
+            Console.WriteLine($"[DafnyTestGen] Note: program contains bodyless method(s) {names} (will be skipped; -c not supported)");
             Console.WriteLine();
-            return;
         }
 
         Console.WriteLine($"[DafnyTestGen] Input:  {file.FullName}");
@@ -576,7 +576,12 @@ class Program
         if (dir != null && !Directory.Exists(dir))
             Directory.CreateDirectory(dir);
 
-        if (check)
+        if (check && hasBodylessMethods)
+        {
+            Console.WriteLine("[DafnyTestGen] Warning: -c (check) is not supported for programs with bodyless methods (dafny build would fail). Writing unchecked tests.");
+            File.WriteAllText(outputPath, allTestCode.ToString());
+        }
+        else if (check)
         {
             // Validate each test case by running Dafny, then split into Passing/Failing
             var checkedCode = await TestValidator.CheckAndSplitTests(allTestCode.ToString(), source, outputPath);

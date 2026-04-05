@@ -93,6 +93,8 @@ static class TypeUtils
         }
         // seq<seq<T>> and seq<string> are supported
         if (IsSupportedNestedSeqType(type)) return false;
+        // set<string> is supported
+        if (IsSetType(type) && GetSetElementType(type) == "string") return false;
         return IsSeqType(elemType) || IsArrayType(elemType) || IsSetType(elemType) || IsMultisetType(elemType) || IsMapType(elemType) || IsTupleType(elemType);
     }
 
@@ -167,6 +169,35 @@ static class TypeUtils
         // int, T, fallback: include some negatives for better coverage
         return new[] { -2, -1, 0, 1, 2, 3, 4, 5 };
     }
+
+    /// <summary>
+    /// Returns SMT expressions for universe elements. For scalar types wraps GetElementUniverse;
+    /// for "string" returns 8 short string constants as SMT (Seq Int) expressions.
+    /// </summary>
+    internal static string[] GetElementUniverseSmt(string elementType)
+    {
+        if (elementType == "string")
+            return new[]
+            {
+                "_str_u0", "_str_u1", "_str_u2", "_str_u3",
+                "_str_u4", "_str_u5", "_str_u6", "_str_u7"
+            };
+        return GetElementUniverse(elementType).Select(v => v.ToString()).ToArray();
+    }
+
+    /// <summary>
+    /// Dafny string literals for each string universe element (maps index to display value).
+    /// </summary>
+    internal static string[] StringUniverseDafny => new[]
+    {
+        "\"\"", "\"a\"", "\"b\"", "\"c\"", "\"d\"", "\"e\"", "\"f\"", "\"g\""
+    };
+
+    /// <summary>
+    /// Returns true if the type is set&lt;string&gt;.
+    /// </summary>
+    internal static bool IsStringElementSet(string type)
+        => IsSetType(type) && GetSetElementType(type) == "string";
 
     /// <summary>
     /// Returns the SMT name used for a sequence variable.
@@ -269,16 +300,33 @@ static class TypeUtils
                 // Parse set membership from get-value responses: ((select setName v) true/false)
                 var members = new List<string>();
                 var setElemType = GetSetElementType(type);
-                var universe = GetElementUniverse(setElemType);
-                foreach (var v in universe)
+                if (IsStringElementSet(type))
                 {
-                    // Z3 get-value returns negative indices as -2 (not (- 2))
-                    var escapedV = v < 0 ? $"(?:\\(- {-v}\\)|{v})" : v.ToString();
-                    var memberPattern = new Regex(@$"\(\(select\s+{Regex.Escape(name)}\s+{escapedV}\)\s+(true|false)\)");
-                    var memberMatch = memberPattern.Match(fullText);
-                    if (memberMatch.Success && memberMatch.Groups[1].Value == "true")
+                    // String set: query used named constants _str_u0.._str_u7
+                    var smtUniverse = GetElementUniverseSmt("string");
+                    for (int i = 0; i < smtUniverse.Length; i++)
                     {
-                        members.Add(v.ToString());
+                        var memberPattern = new Regex(@$"\(\(select\s+{Regex.Escape(name)}\s+{Regex.Escape(smtUniverse[i])}\)\s+(true|false)\)");
+                        var memberMatch = memberPattern.Match(fullText);
+                        if (memberMatch.Success && memberMatch.Groups[1].Value == "true")
+                        {
+                            members.Add(StringUniverseDafny[i]); // store as Dafny string literal
+                        }
+                    }
+                }
+                else
+                {
+                    var universe = GetElementUniverse(setElemType);
+                    foreach (var v in universe)
+                    {
+                        // Z3 get-value returns negative indices as -2 (not (- 2))
+                        var escapedV = v < 0 ? $"(?:\\(- {-v}\\)|{v})" : v.ToString();
+                        var memberPattern = new Regex(@$"\(\(select\s+{Regex.Escape(name)}\s+{escapedV}\)\s+(true|false)\)");
+                        var memberMatch = memberPattern.Match(fullText);
+                        if (memberMatch.Success && memberMatch.Groups[1].Value == "true")
+                        {
+                            members.Add(v.ToString());
+                        }
                     }
                 }
                 result[name + "_card"] = members.Count.ToString();
