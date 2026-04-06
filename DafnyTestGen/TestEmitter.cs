@@ -985,9 +985,14 @@ static class TestEmitter
                 if (emittedVarNames.Contains(varName))
                     continue;
                 // Skip old() captures for mutable fields/inputs that are covered by concrete
-                // Z3 values (e.g., old_count is unnecessary when we emit "expect obj.count == 3")
-                if (trustZ3Values && coveredOutputs.Contains(oldExpr))
-                    continue;
+                // Z3 values (e.g., old_count is unnecessary when we emit "expect obj.count == 3",
+                // old_a/old_a_0 unnecessary when we emit "expect a[..] == [3, 4]")
+                if (trustZ3Values)
+                {
+                    var oldBase = oldExpr.Contains('[') ? oldExpr.Substring(0, oldExpr.IndexOf('[')) : oldExpr;
+                    if (coveredOutputs.Contains(oldExpr) || coveredOutputs.Contains(oldBase))
+                        continue;
+                }
                 var captureExpr = oldExpr;
                 if (classInfo != null)
                 {
