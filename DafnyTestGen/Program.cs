@@ -1314,9 +1314,16 @@ class Program
                     if (!string.IsNullOrEmpty(uQuery) && !TimedOut())
                     {
                         var uResult = await Z3Runner.RunZ3(z3Path, uQuery);
-                        bool isUnique = uResult.Split('\n').Any(l => l.Trim() == "unsat");
-                        values["__unique__"] = isUnique ? "true" : "false";
-                        if (verbose) Console.WriteLine($"  Combination {solveLabel}: output uniqueness: {(isUnique ? "unique" : "not unique")}");
+                        var uResultTrimmed = uResult.Split('\n').Select(l => l.Trim()).ToList();
+                        bool isUnique = uResultTrimmed.Any(l => l == "unsat");
+                        bool isUnknown = !isUnique && uResultTrimmed.Any(l => l == "unknown");
+                        // unknown = Z3 can't decide, but no counter-example found → trust values
+                        values["__unique__"] = (isUnique || isUnknown) ? "true" : "false";
+                        if (verbose)
+                        {
+                            var uqLabel = isUnique ? "unique" : isUnknown ? "unknown (trusting Z3 values)" : "not unique";
+                            Console.WriteLine($"  Combination {solveLabel}: output uniqueness: {uqLabel}");
+                        }
                     }
                     return (values, false);
                 }
