@@ -80,6 +80,19 @@ static class DnfEngine
         return new UnaryOpExpr(Token.NoToken, UnaryOpExpr.Opcode.Not, expr);
     }
 
+    /// <summary>
+    /// Unwraps parentheses and concrete syntax wrappers to reveal the underlying expression.
+    /// </summary>
+    static Expression UnwrapExpr(Expression expr)
+    {
+        while (true)
+        {
+            if (expr is ParensExpression p) { expr = p.E; continue; }
+            if (expr is ConcreteSyntaxExpression c && c.ResolvedExpression != null) { expr = c.ResolvedExpression; continue; }
+            return expr;
+        }
+    }
+
     // ───────────────── core recursive decomposition ──────────────────
 
     static List<List<Expression>> ExprToDnfInner(Expression expr, bool negated)
@@ -181,6 +194,34 @@ static class DnfEngine
                         ExprToDnfInner(bin.E1, false));
                     var result = new List<List<Expression>>(aNotB);
                     result.AddRange(notAB);
+                    return result;
+                }
+            }
+
+            // x == if C then A else B  →  (C && x == A) || (!C && x == B)
+            // x != if C then A else B  →  (C && x != A) || (!C && x != B)
+            if (op == BinaryExpr.Opcode.Eq || op == BinaryExpr.Opcode.Neq)
+            {
+                var lhs = UnwrapExpr(bin.E0);
+                var rhs = UnwrapExpr(bin.E1);
+                ITEExpr? eqIte = null;
+                Expression? eqOther = null;
+                if (rhs is ITEExpr rIte) { eqIte = rIte; eqOther = bin.E0; }
+                else if (lhs is ITEExpr lIte) { eqIte = lIte; eqOther = bin.E1; }
+                if (eqIte != null && eqOther != null)
+                {
+                    // Build synthetic "other == thenBranch" and "other == elseBranch"
+                    var cmpOp = op == BinaryExpr.Opcode.Eq ? "==" : "!=";
+                    var thenEq = new LeafExpression($"{ExprToString(eqOther)} {cmpOp} {ExprToString(eqIte.Thn)}");
+                    var elseEq = new LeafExpression($"{ExprToString(eqOther)} {cmpOp} {ExprToString(eqIte.Els)}");
+                    var thenBranch = CrossProduct(
+                        ExprToDnfInner(eqIte.Test, false),
+                        new List<List<Expression>> { new() { negated ? Negate(thenEq) : thenEq } });
+                    var elseBranch = CrossProduct(
+                        ExprToDnfInner(eqIte.Test, true),
+                        new List<List<Expression>> { new() { negated ? Negate(elseEq) : elseEq } });
+                    var result = new List<List<Expression>>(thenBranch);
+                    result.AddRange(elseBranch);
                     return result;
                 }
             }

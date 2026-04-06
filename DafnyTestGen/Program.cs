@@ -764,25 +764,16 @@ class Program
         List<List<Expression>> dnfExprs;
         List<Expression> backgroundPostconditions;
 
-        if (hasNonInlinableFuncs)
-        {
-            // Skip postcondition DNF decomposition — we can't target specific branches
-            // since recursive/ghost functions become uninterpreted in SMT.
-            // Use a single empty clause so the schedule generates inputs from preconditions only.
-            dnfExprs = new List<List<Expression>> { new List<Expression>() };
-            backgroundPostconditions = new List<Expression>();
-        }
-        else
-        {
-            dnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
-            for (int i = 1; i < ensuresClauses.Count; i++)
-                dnfExprs = DnfEngine.CrossProduct(dnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
+        dnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
+        for (int i = 1; i < ensuresClauses.Count; i++)
+            dnfExprs = DnfEngine.CrossProduct(dnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
 
-            // Build background postconditions: full (un-decomposed) ensures expressions.
-            // These are asserted as background constraints to catch cases where DNF decomposition
-            // loses quantifier range guards (e.g., forall vacuously true at boundary values).
-            backgroundPostconditions = new List<Expression>(ensuresClauses);
-        }
+        // Build background postconditions: full (un-decomposed) ensures expressions.
+        // These are asserted as background constraints to catch cases where DNF decomposition
+        // loses quantifier range guards (e.g., forall vacuously true at boundary values).
+        backgroundPostconditions = hasNonInlinableFuncs
+            ? new List<Expression>()
+            : new List<Expression>(ensuresClauses);
 
         // Keep original DNF for expect emission, create inlined version for SMT translation.
         // Skip predicates with built-in SMT handlers (e.g., IsSorted) to preserve patterns
@@ -1162,6 +1153,7 @@ class Program
 
         // Build boundary tiers per precondition combination (always compute when progressive or boundary)
         var boundaryTiersPerPre = new Dictionary<int, List<(string tierLabel, List<string> tierConstraints)>>();
+        var outputTiers = new List<(string tierLabel, List<string> tierConstraints)>();
         if (boundary || progressive)
         {
             for (int pi = 0; pi < preCombinations.Count; pi++)
@@ -1171,6 +1163,9 @@ class Program
             }
             if (boundary)
                 Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
+            // Build output boundary tiers for scalar outputs and mutable scalar fields
+            var mutableFieldsList = classInfo?.Fields?.Where(f => mutableNames.Contains(f.Name)).ToList();
+            outputTiers = BoundaryAnalysis.BuildOutputTiers(outputs, mutableNames, mutableFieldsList, verbose);
         }
 
         // Helper: build schedule entries for a given mode (all-comb or simple, with or without boundary).
@@ -1680,6 +1675,57 @@ class Program
                     testCases, baseConditionExclusions, knownUnsatLiteralMasks, minTests);
                 if (!verbose) Console.Write("\r                          \r");
                 Console.WriteLine($"  Phase 2 complete: {testCases.Count} test(s)");
+            }
+
+            if (outputTiers.Count > 0
+                && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
+            {
+                // --- Phase 2b: output boundary tiers ---
+                int phase2bStart = testSchedule.Count;
+                // Add output tier entries for each singleton postcondition combination
+                for (int pi = 0; pi < preCombinations.Count; pi++)
+                {
+                    var (preLabel, preLits, preExclusions) = preCombinations[pi];
+                    var fullPreLits = new List<Expression>(preLits);
+                    foreach (var excl in preExclusions)
+                        fullPreLits.Add(DnfEngine.Negate(excl));
+                    var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
+
+                    for (int ci = 0; ci < dnfExprs.Count; ci++)
+                    {
+                        var clause = dnfExprs[ci];
+                        int simpleMask = 1 << ci;
+                        var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}";
+
+                        // Build exclusions for non-selected clauses
+                        var clauseKeys = new HashSet<string>(clause.Select(EKey));
+                        var exclusions = new List<Expression>();
+                        for (int oi = 0; oi < dnfExprs.Count; oi++)
+                        {
+                            if (oi == ci) continue;
+                            var otherLits = dnfExprs[oi]
+                                .Where(lit => !commonLiteralKeys.Contains(EKey(lit)) && !clauseKeys.Contains(EKey(lit)))
+                                .ToList();
+                            if (otherLits.Count == 1) exclusions.Add(otherLits[0]);
+                            else if (otherLits.Count > 1) exclusions.Add(ConjoinExprs(otherLits));
+                        }
+
+                        foreach (var (tierLabel, tierConstraints) in outputTiers)
+                        {
+                            testSchedule.Add(($"{clauseLabel}/O{tierLabel}",
+                                clause, fullPreLits, exclusions, tierConstraints, simpleMask, pi));
+                        }
+                    }
+                }
+                int phase2bEntries = testSchedule.Count - phase2bStart;
+                if (phase2bEntries > 0)
+                {
+                    Console.WriteLine($"  Phase 2b: adding output boundary ({phase2bEntries} new entries)");
+                    await SolveRange(testSchedule, phase2bStart, testSchedule.Count, testSchedule.Count,
+                        testCases, baseConditionExclusions, knownUnsatLiteralMasks, 0);
+                    if (!verbose) Console.Write("\r                          \r");
+                    Console.WriteLine($"  Phase 2b complete: {testCases.Count} test(s)");
+                }
             }
 
             if (testCases.Count < minTests && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))

@@ -578,7 +578,7 @@ static class DafnyParser
                     Console.WriteLine($"    PRE:  {pre}");
             }
             foreach (var literal in dnfClauses[i])
-                Console.WriteLine($"    POST: {literal}");
+                Console.WriteLine($"    POST: {DnfEngine.ExprToString(literal)}");
             Console.WriteLine();
         }
     }

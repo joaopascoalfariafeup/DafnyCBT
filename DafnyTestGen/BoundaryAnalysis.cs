@@ -296,6 +296,87 @@ static class BoundaryAnalysis
         return result;
     }
 
+    /// <summary>
+    /// Generates lightweight output boundary tiers for scalar output variables.
+    /// These are NOT cross-producted with input tiers — each tier is an independent entry.
+    /// </summary>
+    internal static List<(string tierLabel, List<string> tierConstraints)> BuildOutputTiers(
+        List<(string Name, string Type)> outputs,
+        HashSet<string> mutableNames,
+        List<(string Name, string Type)>? mutableFields,
+        bool verbose)
+    {
+        var result = new List<(string tierLabel, List<string> tierConstraints)>();
+
+        void AddScalarTiers(string name, string type, string smtName)
+        {
+            // Order non-trivial tiers first (Z3 naturally gravitates to 0/minimal values)
+            if (type == "nat" || type == "T")
+            {
+                result.Add(($"{name}>=2", new List<string> { $"(>= {smtName} 2)" }));
+                result.Add(($"{name}=1", new List<string> { $"(= {smtName} 1)" }));
+                result.Add(($"{name}=0", new List<string> { $"(= {smtName} 0)" }));
+            }
+            else if (type == "int")
+            {
+                result.Add(($"{name}>0", new List<string> { $"(> {smtName} 0)" }));
+                result.Add(($"{name}<0", new List<string> { $"(< {smtName} 0)" }));
+                result.Add(($"{name}=0", new List<string> { $"(= {smtName} 0)" }));
+            }
+            else if (type == "bool")
+            {
+                result.Add(($"{name}=true", new List<string> { $"(= {smtName} true)" }));
+                result.Add(($"{name}=false", new List<string> { $"(= {smtName} false)" }));
+            }
+            else if (type == "real")
+            {
+                result.Add(($"{name}>0", new List<string> { $"(> {smtName} 0.0)" }));
+                result.Add(($"{name}<0", new List<string> { $"(< {smtName} 0.0)" }));
+                result.Add(($"{name}=0", new List<string> { $"(= {smtName} 0.0)" }));
+            }
+        }
+
+        // Return-value outputs
+        foreach (var (name, type) in outputs)
+        {
+            if (TypeUtils.IsTupleType(type))
+            {
+                var components = TypeUtils.GetTupleComponentTypes(type);
+                for (int i = 0; i < components.Count; i++)
+                    AddScalarTiers($"{name}.{i}", components[i], $"{name}_{i}");
+            }
+            else if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type)
+                     && !TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type)
+                     && !TypeUtils.IsMapType(type))
+            {
+                AddScalarTiers(name, type, name);
+            }
+        }
+
+        // Mutable scalar class fields (their post-state is effectively an output)
+        if (mutableFields != null)
+        {
+            foreach (var (fieldName, fieldType) in mutableFields)
+            {
+                if (!mutableNames.Contains(fieldName)) continue;
+                if (TypeUtils.IsArrayType(fieldType) || TypeUtils.IsSeqType(fieldType)
+                    || TypeUtils.IsSetType(fieldType) || TypeUtils.IsMultisetType(fieldType)
+                    || TypeUtils.IsMapType(fieldType))
+                    continue;
+                AddScalarTiers(fieldName, fieldType, $"{fieldName}_post");
+            }
+        }
+
+        if (verbose && result.Count > 0)
+        {
+            Console.WriteLine($"  Output boundary tiers ({result.Count} total):");
+            foreach (var (label, constraints) in result)
+                Console.WriteLine($"    {label}: {string.Join(" & ", constraints)}");
+        }
+
+        return result;
+    }
+
     internal static void CrossProductTiers(
         List<(string paramName, List<(string label, string smtConstraint)> tiers)> paramTiers,
         int idx,

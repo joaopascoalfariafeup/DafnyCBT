@@ -900,6 +900,65 @@ static class TestEmitter
                 sb.AppendLine(EmitVarDecl(inp.Name, typeStr, emitValues, enumDatatypes));
             }
 
+            // Determine which outputs have concrete Z3 values (before emitting old captures).
+            // Non-unique outputs (where spec allows other valid answers) are NOT covered here;
+            // they get a commented hint and fall through to the literal-based mechanism.
+            // When uniqueness is proven (isUnique), Z3's values are trusted even with
+            // uninterpreted functions: if no other output satisfies the spec (even with
+            // the functions free to take any value), then Z3's answer must be the real one.
+            var coveredOutputs = new HashSet<string>();
+            bool isUnique = values.TryGetValue("__unique__", out var uqFlag) && uqFlag == "true";
+            bool trustZ3Values = isUnique;
+            foreach (var outp in method.Outs)
+            {
+                var outPattern = @"\b" + Regex.Escape(outp.Name) + @"\b";
+                if (!literals.Any(lit => Regex.IsMatch(lit, outPattern)))
+                    continue;
+                var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
+                if (trustZ3Values && TypeUtils.IsTupleType(typeStr) && values.ContainsKey($"{outp.Name}_0"))
+                    coveredOutputs.Add(outp.Name);
+                else if (trustZ3Values && values.TryGetValue(outp.Name, out _) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
+                    coveredOutputs.Add(outp.Name);
+                else if (trustZ3Values && TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr2) && int.TryParse(lenStr2, out var seqLen2) && seqLen2 >= 0)
+                    coveredOutputs.Add(outp.Name);
+                else if (trustZ3Values && (TypeUtils.IsSetType(typeStr) || TypeUtils.IsMultisetType(typeStr)) && (values.ContainsKey(outp.Name + "_members") || values.ContainsKey(outp.Name + "_card")))
+                    coveredOutputs.Add(outp.Name);
+            }
+            // Also check mutable inputs (arrays and scalar fields) — their post-state
+            // values are stored as {name}_post / {name}_post_len / {name}_post_elems.
+            if (trustZ3Values && mutableNames != null)
+            {
+                // Mutable method parameters (e.g., BubbleSort's 'a')
+                foreach (var inp in method.Ins)
+                {
+                    if (!mutableNames.Contains(inp.Name)) continue;
+                    if (!literals.Any(lit => Regex.IsMatch(lit, @"\b" + Regex.Escape(inp.Name) + @"\b")))
+                        continue;
+                    var typeStr = SubstTypeParams(inp.Type.ToString(), typeParamMap);
+                    if (TypeUtils.IsArrayType(typeStr) && values.TryGetValue($"{inp.Name}_post_len", out var postLenStr)
+                        && int.TryParse(postLenStr, out var postLen) && postLen >= 0)
+                        coveredOutputs.Add(inp.Name);
+                }
+                // Mutable class fields (e.g., Counter's 'count')
+                if (classInfo != null)
+                {
+                    foreach (var (fieldName, fieldType) in classInfo.Fields)
+                    {
+                        if (!mutableNames.Contains(fieldName)) continue;
+                        if (!literals.Any(lit => Regex.IsMatch(lit, @"\b" + Regex.Escape(fieldName) + @"\b")))
+                            continue;
+                        var typeStr = SubstTypeParams(fieldType, typeParamMap);
+                        if (TypeUtils.IsArrayType(typeStr) && values.TryGetValue($"{fieldName}_post_len", out var fPostLenStr)
+                            && int.TryParse(fPostLenStr, out var fPostLen) && fPostLen >= 0)
+                            coveredOutputs.Add(fieldName);
+                        else if (!TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSeqType(typeStr)
+                            && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr)
+                            && values.TryGetValue($"{fieldName}_post", out _))
+                            coveredOutputs.Add(fieldName);
+                    }
+                }
+            }
+
             // Capture old() expressions before the method call.
             // Build known identifiers: all names that are in scope before the call.
             var knownIdentifiers = new HashSet<string>(method.Ins.Select(i => i.Name));
@@ -924,6 +983,10 @@ static class TestEmitter
                 // so we don't also emit old_nums := nums[..] — the array capture is only
                 // needed for ReplaceOldReferences to know to substitute old(nums[i]) -> old_nums[i]).
                 if (emittedVarNames.Contains(varName))
+                    continue;
+                // Skip old() captures for mutable fields/inputs that are covered by concrete
+                // Z3 values (e.g., old_count is unnecessary when we emit "expect obj.count == 3")
+                if (trustZ3Values && coveredOutputs.Contains(oldExpr))
                     continue;
                 var captureExpr = oldExpr;
                 if (classInfo != null)
@@ -1003,31 +1066,6 @@ static class TestEmitter
                         "obj.Valid");
                     return result;
                 }).ToList();
-            }
-
-            // Determine which outputs have concrete Z3 values (before emitting any code).
-            // Non-unique outputs (where spec allows other valid answers) are NOT covered here;
-            // they get a commented hint and fall through to the literal-based mechanism.
-            // When uniqueness is proven (isUnique), Z3's values are trusted even with
-            // uninterpreted functions: if no other output satisfies the spec (even with
-            // the functions free to take any value), then Z3's answer must be the real one.
-            var coveredOutputs = new HashSet<string>();
-            bool isUnique = values.TryGetValue("__unique__", out var uqFlag) && uqFlag == "true";
-            bool trustZ3Values = isUnique;
-            foreach (var outp in method.Outs)
-            {
-                var outPattern = @"\b" + Regex.Escape(outp.Name) + @"\b";
-                if (!literals.Any(lit => Regex.IsMatch(lit, outPattern)))
-                    continue;
-                var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
-                if (trustZ3Values && TypeUtils.IsTupleType(typeStr) && values.ContainsKey($"{outp.Name}_0"))
-                    coveredOutputs.Add(outp.Name);
-                else if (trustZ3Values && values.TryGetValue(outp.Name, out _) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
-                    coveredOutputs.Add(outp.Name);
-                else if (trustZ3Values && TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr2) && int.TryParse(lenStr2, out var seqLen2) && seqLen2 >= 0)
-                    coveredOutputs.Add(outp.Name);
-                else if (trustZ3Values && (TypeUtils.IsSetType(typeStr) || TypeUtils.IsMultisetType(typeStr)) && (values.ContainsKey(outp.Name + "_members") || values.ContainsKey(outp.Name + "_card")))
-                    coveredOutputs.Add(outp.Name);
             }
 
             // For postconditions of the form "outName == <expr>" where <expr> only references
@@ -1327,6 +1365,90 @@ static class TestEmitter
                     }
                 }
             }
+            // Emit concrete values for mutable inputs/fields when uniqueness is proven.
+            if (trustZ3Values && mutableNames != null)
+            {
+                // Mutable array parameters: emit "expect a[..] == [-38, 7681];"
+                foreach (var inp in method.Ins)
+                {
+                    if (!mutableNames.Contains(inp.Name)) continue;
+                    var typeStr = SubstTypeParams(inp.Type.ToString(), typeParamMap);
+                    if (!TypeUtils.IsArrayType(typeStr)) continue;
+                    if (!coveredOutputs.Contains(inp.Name)) continue;
+                    if (values.TryGetValue($"{inp.Name}_post_len", out var postLenStr)
+                        && int.TryParse(postLenStr, out var postLen) && postLen >= 0)
+                    {
+                        var elemType = TypeUtils.GetSeqElementType(typeStr);
+                        string[] elems;
+                        if (values.TryGetValue($"{inp.Name}_post_elems", out var postElemsStr))
+                            elems = postElemsStr.Split(',');
+                        else
+                            elems = Enumerable.Range(0, postLen).Select(_ => "0").ToArray();
+
+                        string arrayLiteral;
+                        if (elemType == "char")
+                        {
+                            var charElems = elems.Take(postLen).Select(e =>
+                            {
+                                if (int.TryParse(e, out var code) && code >= 32 && code < 127 && code != '\'' && code != '\\')
+                                    return $"'{(char)code}'";
+                                return $"'\\U{{{(int.TryParse(e, out var c) ? c : 0):X4}}}'";
+                            });
+                            arrayLiteral = $"[{string.Join(", ", charElems)}]";
+                        }
+                        else
+                        {
+                            arrayLiteral = $"[{string.Join(", ", elems.Take(postLen))}]";
+                        }
+                        if (isUnique)
+                            sb.AppendLine($"    expect {inp.Name}[..] == {arrayLiteral};");
+                        else
+                            sb.AppendLine($"    // expect {inp.Name}[..] == {arrayLiteral}; // (one valid value — not uniquely determined by spec)");
+                    }
+                }
+                // Mutable scalar class fields: emit "expect obj.count == 3;"
+                if (classInfo != null)
+                {
+                    foreach (var (fieldName, fieldType) in classInfo.Fields)
+                    {
+                        if (!mutableNames.Contains(fieldName)) continue;
+                        if (!coveredOutputs.Contains(fieldName)) continue;
+                        var typeStr = SubstTypeParams(fieldType, typeParamMap);
+                        if (TypeUtils.IsArrayType(typeStr))
+                        {
+                            // Mutable array field: emit "expect obj.field[..] == [...];"
+                            if (values.TryGetValue($"{fieldName}_post_len", out var fPostLenStr)
+                                && int.TryParse(fPostLenStr, out var fPostLen) && fPostLen >= 0)
+                            {
+                                var elemType = TypeUtils.GetSeqElementType(typeStr);
+                                string[] elems;
+                                if (values.TryGetValue($"{fieldName}_post_elems", out var fPostElemsStr))
+                                    elems = fPostElemsStr.Split(',');
+                                else
+                                    elems = Enumerable.Range(0, fPostLen).Select(_ => "0").ToArray();
+                                var arrayLiteral = $"[{string.Join(", ", elems.Take(fPostLen))}]";
+                                if (isUnique)
+                                    sb.AppendLine($"    expect obj.{fieldName}[..] == {arrayLiteral};");
+                                else
+                                    sb.AppendLine($"    // expect obj.{fieldName}[..] == {arrayLiteral}; // (one valid value — not uniquely determined by spec)");
+                            }
+                        }
+                        else if (!TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
+                        {
+                            // Scalar mutable field
+                            if (values.TryGetValue($"{fieldName}_post", out var postVal))
+                            {
+                                if (typeStr == "real" && !postVal.Contains('.'))
+                                    postVal += ".0";
+                                if (isUnique)
+                                    sb.AppendLine($"    expect obj.{fieldName} == {postVal};");
+                                else
+                                    sb.AppendLine($"    // expect obj.{fieldName} == {postVal}; // (one valid value — not uniquely determined by spec)");
+                            }
+                        }
+                    }
+                }
+            }
             // Emit postcondition literals for outputs not covered by concrete values,
             // plus any literals that don't reference output variables at all.
             // For "outName == <expr>" literals with a pre-call RHS capture, use check_outName;
@@ -1357,7 +1479,8 @@ static class TestEmitter
                         {
                             mentionsMutable = true;
                             mentionsAnyOutput = true;
-                            mentionsOnlyCoveredOutputs = false;
+                            if (!coveredOutputs.Contains(mn))
+                                mentionsOnlyCoveredOutputs = false;
                             break;
                         }
                     }

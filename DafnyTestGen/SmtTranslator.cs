@@ -190,6 +190,19 @@ static class SmtTranslator
             }
         }
 
+        // Multiset-forming count helper for permutation constraints:
+        // multiset(a[..]) == multiset(old(a[..])) → count equality over bounded indices
+        var hasMutableArray = inputs.Concat(outputs).Any(v => TypeUtils.IsArrayType(v.Type) && mutableNames.Contains(v.Name));
+        if (hasMutableArray)
+        {
+            // _mset_count(v, s, n): count occurrences of v in first n elements of seq s
+            var countTerms = string.Join("\n     ",
+                Enumerable.Range(0, MAX_SEQ_LEN).Select(i =>
+                    $"(ite (and (> n {i}) (= (seq.nth s {i}) v)) 1 0)"));
+            sb.AppendLine($"(define-fun _mset_count ((v Int) (s (Seq Int)) (n Int)) Int");
+            sb.AppendLine($"  (+ {countTerms}))");
+        }
+
         // Map operation macros (maps encoded as domain (Array Int Bool) + values (Array Int V))
         var hasMapParam = inputs.Concat(outputs).Any(v => TypeUtils.IsMapType(v.Type));
         if (hasMapParam)
@@ -1130,6 +1143,20 @@ static class SmtTranslator
                         var conjunction = eqs.Count == 1 ? eqs[0] : $"(and {string.Join(" ", eqs)})";
                         return bin.Op == BinaryExpr.Opcode.Neq ? $"(not {conjunction})" : conjunction;
                     }
+                }
+            }
+
+            // multiset(s1) == multiset(s2) → permutation constraint via element counting
+            if ((bin.Op == BinaryExpr.Opcode.Eq || bin.Op == BinaryExpr.Opcode.Neq)
+                && UnwrapExpr(bin.E0) is MultiSetFormingExpr mf0
+                && UnwrapExpr(bin.E1) is MultiSetFormingExpr mf1)
+            {
+                var seq0 = ExprToSmt(mf0.E, inputs, mutableNames, isPostContext, insideOld);
+                var seq1 = ExprToSmt(mf1.E, inputs, mutableNames, isPostContext, insideOld);
+                if (seq0 != null && seq1 != null)
+                {
+                    var perm = $"(forall ((v Int)) (= (_mset_count v {seq0} (seq.len {seq0})) (_mset_count v {seq1} (seq.len {seq1}))))";
+                    return bin.Op == BinaryExpr.Opcode.Neq ? $"(not {perm})" : perm;
                 }
             }
 
@@ -2123,6 +2150,16 @@ static class SmtTranslator
                 expr = expr.Substring(1, expr.Length - 2).Trim();
             else
                 break;
+        }
+
+        // multiset(s1) == multiset(s2) → permutation constraint via element counting
+        var msetEqMatch = Regex.Match(expr, @"^multiset\((.+?)\)\s*==\s*multiset\((.+?)\)$");
+        if (msetEqMatch.Success)
+        {
+            var lhs = DafnyExprToSmt(msetEqMatch.Groups[1].Value, inputs);
+            var rhs = DafnyExprToSmt(msetEqMatch.Groups[2].Value, inputs);
+            if (lhs != null && rhs != null)
+                return $"(forall ((v Int)) (= (_mset_count v {lhs} (seq.len {lhs})) (_mset_count v {rhs} (seq.len {rhs}))))";
         }
 
         // Handle empty set literal: {}
@@ -3646,6 +3683,26 @@ static class SmtTranslator
                     }
                 }
             }
+            else if ((TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type)) && TypeUtils.IsTupleType(TypeUtils.GetSeqElementType(type)))
+            {
+                // Tuple-element array/seq: pin each component sequence separately
+                var tupleComponents = TypeUtils.GetTupleComponentTypes(TypeUtils.GetSeqElementType(type));
+                if (values.TryGetValue(smtBase + "_len", out var lenStr) && int.TryParse(lenStr, out var len))
+                {
+                    var firstCompSeq = TypeUtils.IsArrayType(type) ? $"{smtBase}_seq_0" : $"{smtBase}_0";
+                    sb.AppendLine($"(assert (= (seq.len {firstCompSeq}) {len}))");
+                    for (int ci = 0; ci < tupleComponents.Count; ci++)
+                    {
+                        var compSeqName = TypeUtils.IsArrayType(type) ? $"{smtBase}_seq_{ci}" : $"{smtBase}_{ci}";
+                        if (values.TryGetValue($"{smtBase}_elems_{ci}", out var compElemsStr))
+                        {
+                            var compElems = compElemsStr.Split(',');
+                            for (int i = 0; i < Math.Min(len, compElems.Length); i++)
+                                sb.AppendLine($"(assert (= (seq.nth {compSeqName} {i}) {compElems[i]}))");
+                        }
+                    }
+                }
+            }
             else if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
             {
                 var seqName = TypeUtils.SeqSmtName(smtBase, type);
@@ -3710,6 +3767,12 @@ static class SmtTranslator
                             eqParts.Add($"(= (seq.nth {seqName} {i}) {elems[i]})");
                     }
                 }
+            }
+            else if (!TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type) && !TypeUtils.IsMapType(type))
+            {
+                // Scalar mutable field (e.g., count_post)
+                if (values.TryGetValue(postBase, out var val))
+                    eqParts.Add($"(= {postBase} {val})");
             }
         }
 
