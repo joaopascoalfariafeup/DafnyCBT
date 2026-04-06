@@ -7,6 +7,8 @@ namespace DafnyTestGen;
 
 class Program
 {
+    static bool TrustUnknownUniqueness = true;
+
     static async Task<int> Main(string[] args)
     {
         var inputArg = new Argument<string>("input", "Path to a .dfy file, a folder, or a glob pattern (e.g. *.dfy)");
@@ -34,10 +36,11 @@ class Program
         var maxTestsOpt = new Option<int>("--max-tests", () => 0, "Maximum number of generated tests per method (0 = unlimited)");
         maxTestsOpt.AddAlias("-x");
         var timeoutOpt = new Option<int>("--timeout", () => 60, "Timeout in seconds for test generation per method (0 = unlimited, default: 60)");
+        var trustUnknownOpt = new Option<bool>("--trust-unknown", () => true, "Trust Z3 output values when uniqueness check returns 'unknown' (default: true)");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -56,6 +59,7 @@ class Program
             var z3PathCli = ctx.ParseResult.GetValueForOption(z3PathOpt);
             var maxTests = ctx.ParseResult.GetValueForOption(maxTestsOpt);
             var timeout = ctx.ParseResult.GetValueForOption(timeoutOpt);
+            TrustUnknownUniqueness = ctx.ParseResult.GetValueForOption(trustUnknownOpt);
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
             var z3Path = Z3Runner.FindZ3Path(z3PathCli);
@@ -1318,10 +1322,10 @@ class Program
                         bool isUnique = uResultTrimmed.Any(l => l == "unsat");
                         bool isUnknown = !isUnique && uResultTrimmed.Any(l => l == "unknown");
                         // unknown = Z3 can't decide, but no counter-example found → trust values
-                        values["__unique__"] = (isUnique || isUnknown) ? "true" : "false";
+                        values["__unique__"] = (isUnique || (isUnknown && TrustUnknownUniqueness)) ? "true" : "false";
                         if (verbose)
                         {
-                            var uqLabel = isUnique ? "unique" : isUnknown ? "unknown (trusting Z3 values)" : "not unique";
+                            var uqLabel = isUnique ? "unique" : isUnknown ? (TrustUnknownUniqueness ? "unknown (trusting Z3 values)" : "unknown (not trusted)") : "not unique";
                             Console.WriteLine($"  Combination {solveLabel}: output uniqueness: {uqLabel}");
                         }
                     }
