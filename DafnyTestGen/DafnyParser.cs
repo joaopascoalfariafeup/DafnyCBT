@@ -244,19 +244,100 @@ static class DafnyParser
                 }
             }
         }
-        // Remove predicates whose body calls another inlinable predicate.
-        // Transitive inlining of nested predicates with quantifiers causes
-        // exponential SMT expansion (e.g., 8^3 = 512 instances for 3 levels).
-        var names = new HashSet<string>(result.Select(r => r.name));
-        result = result.Where(r =>
+        // For predicates whose body calls another inlinable predicate (1-level nesting),
+        // substitute the callee's body inline to produce a self-contained predicate.
+        // This handles cases like AllPrime(f) calling IsPrime(f[i]).
+        // After substitution, the caller no longer references other predicates.
+        var nameSet = new HashSet<string>(result.Select(r => r.name));
+        var byName = result.ToDictionary(r => r.name, r => r);
+        var substituted = new List<(string name, List<string> paramNames, string body, bool isClassMember)>();
+        foreach (var r in result)
         {
-            var callsOther = names.Any(n => n != r.name && r.body.Contains(n + "("));
-            if (callsOther)
-                Console.WriteLine($"  Note: predicate '{r.name}' calls other predicates — not inlining (would cause SMT explosion)");
-            return !callsOther;
-        }).ToList();
+            var calledPredicates = result.Where(o => o.name != r.name && r.body.Contains(o.name + "(")).ToList();
+            if (calledPredicates.Count == 0)
+            {
+                substituted.Add(r);
+                continue;
+            }
+            // Check that callees themselves don't call other predicates (limit to 2 levels)
+            bool calleeCallsOther = calledPredicates.Any(c =>
+                result.Any(o => o.name != c.name && c.body.Contains(o.name + "(")));
+            if (calleeCallsOther)
+            {
+                Console.WriteLine($"  Note: predicate '{r.name}' has >2-level nesting — not inlining");
+                continue;
+            }
+            // Substitute each callee's body into this predicate's body
+            var newBody = r.body;
+            foreach (var callee in calledPredicates)
+            {
+                // Replace calls like IsPrime(expr) with (expr > 1 && forall k :: ...)
+                // Use regex to find call sites and substitute parameter
+                var pattern = callee.name + @"\(";
+                int searchFrom = 0;
+                while (searchFrom < newBody.Length)
+                {
+                    var callIdx = newBody.IndexOf(callee.name + "(", searchFrom);
+                    if (callIdx < 0) break;
+                    // Extract the argument list by matching parentheses
+                    int parenStart = callIdx + callee.name.Length;
+                    int depth = 0;
+                    int parenEnd = parenStart;
+                    for (int ci = parenStart; ci < newBody.Length; ci++)
+                    {
+                        if (newBody[ci] == '(') depth++;
+                        else if (newBody[ci] == ')') { depth--; if (depth == 0) { parenEnd = ci; break; } }
+                    }
+                    var argsStr = newBody.Substring(parenStart + 1, parenEnd - parenStart - 1);
+                    // Split arguments (respecting nested parens/brackets)
+                    var args = SplitArgs(argsStr);
+                    if (args.Count == callee.paramNames.Count)
+                    {
+                        var inlinedBody = callee.body;
+                        for (int pi = 0; pi < args.Count; pi++)
+                        {
+                            // Replace parameter name with argument, using word boundaries
+                            inlinedBody = System.Text.RegularExpressions.Regex.Replace(
+                                inlinedBody, @"\b" + System.Text.RegularExpressions.Regex.Escape(callee.paramNames[pi]) + @"\b", args[pi]);
+                        }
+                        var replacement = $"({inlinedBody})";
+                        newBody = newBody.Substring(0, callIdx) + replacement + newBody.Substring(parenEnd + 1);
+                        searchFrom = callIdx + replacement.Length;
+                    }
+                    else
+                    {
+                        searchFrom = parenEnd + 1;
+                    }
+                }
+            }
+            substituted.Add((r.name, r.paramNames, newBody, r.isClassMember));
+        }
+        result = substituted;
 
         return result;
+    }
+
+    /// <summary>
+    /// Splits a comma-separated argument string, respecting nested parentheses and brackets.
+    /// </summary>
+    static List<string> SplitArgs(string argsStr)
+    {
+        var args = new List<string>();
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < argsStr.Length; i++)
+        {
+            char c = argsStr[i];
+            if (c == '(' || c == '[') depth++;
+            else if (c == ')' || c == ']') depth--;
+            else if (c == ',' && depth == 0)
+            {
+                args.Add(argsStr.Substring(start, i - start).Trim());
+                start = i + 1;
+            }
+        }
+        args.Add(argsStr.Substring(start).Trim());
+        return args;
     }
 
     /// <summary>

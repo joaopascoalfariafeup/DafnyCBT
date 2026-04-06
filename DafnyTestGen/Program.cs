@@ -788,7 +788,7 @@ class Program
             predsToInline = inlinablePredicates
                 .Where(p => !smtBuiltins.Contains(p.name))
                 .ToList();
-            if (!hasNonInlinableFuncs && predsToInline.Count > 0)
+            if (predsToInline.Count > 0)
             {
                 backgroundPostconditions = backgroundPostconditions
                     .Select(e => InlineExpr(e, predsToInline)).ToList();

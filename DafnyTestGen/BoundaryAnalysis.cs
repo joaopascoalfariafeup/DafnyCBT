@@ -345,7 +345,15 @@ static class BoundaryAnalysis
                 for (int i = 0; i < components.Count; i++)
                     AddScalarTiers($"{name}.{i}", components[i], $"{name}_{i}");
             }
-            else if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type)
+            else if (TypeUtils.IsSeqType(type))
+            {
+                // Seq output length tiers: |f|=1, |f|>=2, |f|>=3
+                var seqName = TypeUtils.SeqSmtName(name, type);
+                result.Add(($"|{name}|>=3", new List<string> { $"(>= (seq.len {seqName}) 3)" }));
+                result.Add(($"|{name}|>=2", new List<string> { $"(>= (seq.len {seqName}) 2)" }));
+                result.Add(($"|{name}|=1", new List<string> { $"(= (seq.len {seqName}) 1)" }));
+            }
+            else if (!TypeUtils.IsArrayType(type)
                      && !TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type)
                      && !TypeUtils.IsMapType(type))
             {
