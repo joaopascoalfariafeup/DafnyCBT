@@ -744,6 +744,9 @@ static class SmtTranslator
                     assertions.AppendLine($"; Could not translate precondition: {litStr}");
                 }
             }
+            // Also mark original preconditions as translated (they're guaranteed by their DNF literals)
+            foreach (var pre in preClauses)
+                _translatedPreConditions.Add(DnfEngine.ExprToString(pre));
         }
         else
         {
