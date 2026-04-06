@@ -304,7 +304,8 @@ static class BoundaryAnalysis
         List<(string Name, string Type)> outputs,
         HashSet<string> mutableNames,
         List<(string Name, string Type)>? mutableFields,
-        bool verbose)
+        bool verbose,
+        List<string>? postLiterals = null)
     {
         var result = new List<(string tierLabel, List<string> tierConstraints)>();
 
@@ -353,15 +354,23 @@ static class BoundaryAnalysis
                 result.Add(($"|{name}|>=2", new List<string> { $"(>= (seq.len {seqName}) 2)" }));
                 result.Add(($"|{name}|=1", new List<string> { $"(= (seq.len {seqName}) 1)" }));
             }
-            else if (!TypeUtils.IsArrayType(type)
-                     && !TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type)
-                     && !TypeUtils.IsMapType(type))
+            else if (TypeUtils.IsSetType(type) || TypeUtils.IsMultisetType(type) || TypeUtils.IsMapType(type))
+            {
+                // Set/multiset/map output cardinality tiers
+                result.Add(($"|{name}|>=3", new List<string> { $"(>= {name}_card 3)" }));
+                result.Add(($"|{name}|>=2", new List<string> { $"(>= {name}_card 2)" }));
+                result.Add(($"|{name}|>=1", new List<string> { $"(>= {name}_card 1)" }));
+            }
+            else if (!TypeUtils.IsArrayType(type))
             {
                 AddScalarTiers(name, type, name);
             }
         }
 
         // Mutable scalar class fields (their post-state is effectively an output)
+        // Only include fields that are actually mentioned in postconditions —
+        // fields that are merely allowed to change (modifies this) but not
+        // constrained by ensures clauses have unconstrained post-state in Z3.
         if (mutableFields != null)
         {
             foreach (var (fieldName, fieldType) in mutableFields)
@@ -370,6 +379,10 @@ static class BoundaryAnalysis
                 if (TypeUtils.IsArrayType(fieldType) || TypeUtils.IsSeqType(fieldType)
                     || TypeUtils.IsSetType(fieldType) || TypeUtils.IsMultisetType(fieldType)
                     || TypeUtils.IsMapType(fieldType))
+                    continue;
+                // Skip fields whose post-state is not mentioned in any postcondition
+                // (fields that only appear inside old() wrappers are pre-state only)
+                if (postLiterals != null && !AppearsInPostState(fieldName, postLiterals))
                     continue;
                 AddScalarTiers(fieldName, fieldType, $"{fieldName}_post");
             }
@@ -382,6 +395,52 @@ static class BoundaryAnalysis
                 Console.WriteLine($"    {label}: {string.Join(" & ", constraints)}");
         }
 
+        return result;
+    }
+
+    /// <summary>
+    /// Checks whether a field name appears outside of old() wrappers in any literal.
+    /// </summary>
+    static bool AppearsInPostState(string fieldName, IEnumerable<string> literals)
+    {
+        var escapedName = Regex.Escape(fieldName);
+        var fieldPattern = @"\b" + escapedName + @"\b";
+        foreach (var lit in literals)
+        {
+            var stripped = StripOldWrappers(lit);
+            if (Regex.IsMatch(stripped, fieldPattern))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Removes all old(...) substrings from an expression, handling nested parentheses.
+    /// </summary>
+    static string StripOldWrappers(string expr)
+    {
+        var result = expr;
+        while (true)
+        {
+            var idx = result.IndexOf("old(");
+            if (idx < 0) break;
+            if (idx > 0 && char.IsLetterOrDigit(result[idx - 1]))
+            {
+                var next = result.IndexOf("old(", idx + 1);
+                if (next < 0) break;
+                idx = next;
+                if (idx > 0 && char.IsLetterOrDigit(result[idx - 1])) break;
+            }
+            int depth = 0;
+            int start = idx + 3;
+            int end = start;
+            for (int i = start; i < result.Length; i++)
+            {
+                if (result[i] == '(') depth++;
+                else if (result[i] == ')') { depth--; if (depth == 0) { end = i; break; } }
+            }
+            result = result.Substring(0, idx) + result.Substring(end + 1);
+        }
         return result;
     }
 

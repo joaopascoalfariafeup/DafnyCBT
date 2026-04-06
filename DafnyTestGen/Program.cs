@@ -860,14 +860,22 @@ class Program
                 var exprStr = DnfEngine.ExprToString(fe.E);
                 if (exprStr == "this" && classInfo != null)
                 {
-                    // modifies this: all non-ghost var fields are mutable
-                    foreach (var (fieldName, _) in classInfo.Fields)
-                        mutableNames.Add(fieldName);
-                    // For autocontracts: const array fields have mutable contents
-                    if (classInfo.IsAutoContracts && classInfo.ConstFields != null)
-                        foreach (var (cfName, cfType) in classInfo.ConstFields)
-                            if (TypeUtils.IsArrayType(cfType))
-                                mutableNames.Add(cfName);
+                    if (fe.FieldName != null)
+                    {
+                        // modifies this`fieldName: only that specific field is mutable
+                        mutableNames.Add(fe.FieldName);
+                    }
+                    else
+                    {
+                        // modifies this: all non-ghost var fields are mutable
+                        foreach (var (fieldName, _) in classInfo.Fields)
+                            mutableNames.Add(fieldName);
+                        // For autocontracts: const array fields have mutable contents
+                        if (classInfo.IsAutoContracts && classInfo.ConstFields != null)
+                            foreach (var (cfName, cfType) in classInfo.ConstFields)
+                                if (TypeUtils.IsArrayType(cfType))
+                                    mutableNames.Add(cfName);
+                    }
                 }
                 else if (exprStr == "Repr" && classInfo != null && !classInfo.IsAutoContracts)
                 {
@@ -1036,9 +1044,13 @@ class Program
                         // Post-state Valid() constraint (autocontracts ensures Valid())
                         var leftPost = leMatch.Groups[1].Value;
                         var rightPost = leMatch.Groups[2].Value;
-                        // Post-state: mutable fields use bare names, array lengths use _len
-                        leftPost = Regex.Replace(leftPost, @"(\w+)\.Length", "$1_len");
-                        rightPost = Regex.Replace(rightPost, @"(\w+)\.Length", "$1_len");
+                        // Post-state: mutable fields → _post, array lengths → _post_len or _len
+                        if (mutableNames.Contains(leftPost)) leftPost = $"{leftPost}_post";
+                        if (mutableNames.Contains(rightPost)) rightPost = $"{rightPost}_post";
+                        leftPost = Regex.Replace(leftPost, @"(\w+)\.Length", m =>
+                            mutableNames.Contains(m.Groups[1].Value) ? $"{m.Groups[1].Value}_post_len" : $"{m.Groups[1].Value}_len");
+                        rightPost = Regex.Replace(rightPost, @"(\w+)\.Length", m =>
+                            mutableNames.Contains(m.Groups[1].Value) ? $"{m.Groups[1].Value}_post_len" : $"{m.Groups[1].Value}_len");
                         globalExtraConstraints.Add($"(<= {leftPost} {rightPost})");
                         if (verbose) Console.WriteLine($"  Valid() post-state constraint: (<= {leftPost} {rightPost})");
                     }
@@ -1169,7 +1181,8 @@ class Program
                 Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
             // Build output boundary tiers for scalar outputs and mutable scalar fields
             var mutableFieldsList = classInfo?.Fields?.Where(f => mutableNames.Contains(f.Name)).ToList();
-            outputTiers = BoundaryAnalysis.BuildOutputTiers(outputs, mutableNames, mutableFieldsList, verbose);
+            var postLitStrings = method.Ens.Select(e => DnfEngine.ExprToString(e.E)).ToList();
+            outputTiers = BoundaryAnalysis.BuildOutputTiers(outputs, mutableNames, mutableFieldsList, verbose, postLitStrings);
         }
 
         // Helper: build schedule entries for a given mode (all-comb or simple, with or without boundary).

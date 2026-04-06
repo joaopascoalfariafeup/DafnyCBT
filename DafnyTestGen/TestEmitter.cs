@@ -25,6 +25,60 @@ static class TestEmitter
     }
 
     /// <summary>
+    /// Checks whether a field name appears in post-state context in any of the given literals.
+    /// A field in post-state context means it appears outside of old() wrappers.
+    /// For example, "count == old(count) + 1" has 'count' in post-state (the first occurrence).
+    /// But "g == old(secret)" has 'secret' only inside old() — not in post-state.
+    /// </summary>
+    static bool AppearsInPostState(string fieldName, IEnumerable<string> literals)
+    {
+        var escapedName = Regex.Escape(fieldName);
+        var fieldPattern = @"\b" + escapedName + @"\b";
+        foreach (var lit in literals)
+        {
+            // Strip all old(...) occurrences (handling nested parens)
+            var stripped = StripOldWrappers(lit);
+            if (Regex.IsMatch(stripped, fieldPattern))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Removes all old(...) substrings from an expression, handling nested parentheses.
+    /// E.g., "count == old(count) + 1" → "count ==  + 1"
+    ///        "g == old(secret)" → "g == "
+    /// </summary>
+    static string StripOldWrappers(string expr)
+    {
+        var result = expr;
+        while (true)
+        {
+            var idx = result.IndexOf("old(");
+            if (idx < 0) break;
+            // Make sure 'old' is a word boundary (not part of a longer identifier)
+            if (idx > 0 && char.IsLetterOrDigit(result[idx - 1]))
+            {
+                // Not actually the 'old' keyword — skip past it
+                var next = result.IndexOf("old(", idx + 1);
+                if (next < 0) break;
+                idx = next;
+                if (idx > 0 && char.IsLetterOrDigit(result[idx - 1])) break;
+            }
+            int depth = 0;
+            int start = idx + 3; // position of '('
+            int end = start;
+            for (int i = start; i < result.Length; i++)
+            {
+                if (result[i] == '(') depth++;
+                else if (result[i] == ')') { depth--; if (depth == 0) { end = i; break; } }
+            }
+            result = result.Substring(0, idx) + result.Substring(end + 1);
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Extracts all old(expr) occurrences from postcondition literals and returns
     /// a list of (innerExpr, captureVarName, isArrayCapture) triples for pre-call capture.
     /// When all free variables in the inner expression are known (method params, fields, etc.),
@@ -919,6 +973,8 @@ static class TestEmitter
                     coveredOutputs.Add(outp.Name);
                 else if (trustZ3Values && values.TryGetValue(outp.Name, out _) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
                     coveredOutputs.Add(outp.Name);
+                else if (trustZ3Values && TypeUtils.IsArrayType(typeStr) && values.TryGetValue(outp.Name + "_len", out var arrLen2) && int.TryParse(arrLen2, out var arrLenVal2) && arrLenVal2 >= 0)
+                    coveredOutputs.Add(outp.Name);
                 else if (trustZ3Values && TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr2) && int.TryParse(lenStr2, out var seqLen2) && seqLen2 >= 0)
                     coveredOutputs.Add(outp.Name);
                 else if (trustZ3Values && (TypeUtils.IsSetType(typeStr) || TypeUtils.IsMultisetType(typeStr)) && (values.ContainsKey(outp.Name + "_members") || values.ContainsKey(outp.Name + "_card")))
@@ -945,7 +1001,7 @@ static class TestEmitter
                     foreach (var (fieldName, fieldType) in classInfo.Fields)
                     {
                         if (!mutableNames.Contains(fieldName)) continue;
-                        if (!literals.Any(lit => Regex.IsMatch(lit, @"\b" + Regex.Escape(fieldName) + @"\b")))
+                        if (!AppearsInPostState(fieldName, literals))
                             continue;
                         var typeStr = SubstTypeParams(fieldType, typeParamMap);
                         if (TypeUtils.IsArrayType(typeStr) && values.TryGetValue($"{fieldName}_post_len", out var fPostLenStr)
@@ -991,6 +1047,15 @@ static class TestEmitter
                 {
                     var oldBase = oldExpr.Contains('[') ? oldExpr.Substring(0, oldExpr.IndexOf('[')) : oldExpr;
                     if (coveredOutputs.Contains(oldExpr) || coveredOutputs.Contains(oldBase))
+                        continue;
+                }
+                // Skip old() captures for non-mutable class fields: old(f) == f when f doesn't change
+                if (classInfo != null && mutableNames != null)
+                {
+                    var oldFieldBase = oldExpr.Contains('[') ? oldExpr.Substring(0, oldExpr.IndexOf('[')) : oldExpr;
+                    if (fieldNames.Contains(oldFieldBase) && !mutableNames.Contains(oldFieldBase))
+                        continue;
+                    if (constFieldNames.Contains(oldFieldBase) && !mutableNames.Contains(oldFieldBase))
                         continue;
                 }
                 var captureExpr = oldExpr;
@@ -1100,11 +1165,15 @@ static class TestEmitter
                     { rhsRefsOutput = true; break; }
                 }
                 if (rhsRefsOutput) continue;
-                // Pre-capture only if RHS references a mutable input (needs pre-call snapshot).
-                // Otherwise, inline the RHS directly in the post-call expect.
-                bool rhsRefsMutable = mutableNames != null &&
-                    mutableNames.Any(mn => Regex.IsMatch(rhs, @"\b" + Regex.Escape(mn) + @"\b"));
-                if (rhsRefsMutable)
+                // Pre-capture only if RHS references a mutable input via old() (pre-call snapshot).
+                // Bare mutable field references in postconditions (without old()) refer to the
+                // post-state and should be read AFTER the call, not pre-captured.
+                // At this point, old() references have been replaced with old_X variables,
+                // so check for old_X references or array slice expressions (a[..]).
+                bool rhsRefsOldMutable = mutableNames != null &&
+                    mutableNames.Any(mn => Regex.IsMatch(rhs, @"\bold_" + Regex.Escape(mn) + @"\b")
+                                        || Regex.IsMatch(rhs, @"\b" + Regex.Escape(mn) + @"\s*\["));
+                if (rhsRefsOldMutable)
                 {
                     rhsCaptures[lhs] = "check_" + lhs;
                     sb.AppendLine($"    var check_{lhs} := {rhs};");
@@ -1232,6 +1301,44 @@ static class TestEmitter
                         // Spec allows other valid values — emit as a hint comment only.
                         // The active expect below is derived from the postcondition.
                         sb.AppendLine($"    // expect {outp.Name} == {val}; // (one valid value — not uniquely determined by spec)");
+                    }
+                }
+                else if (trustZ3Values && TypeUtils.IsArrayType(typeStr) && values.TryGetValue(outp.Name + "_len", out var arrLenStr)
+                         && int.TryParse(arrLenStr, out var arrLen) && arrLen >= 0)
+                {
+                    // Emit concrete array output as: expect squared[..] == [4, 1, 0];
+                    var rawElemType = typeStr.StartsWith("array<")
+                        ? typeStr.Substring(6, typeStr.Length - 7)
+                        : "int";
+                    string[] elems;
+                    if (values.TryGetValue(outp.Name + "_elems", out var arrElemsStr))
+                        elems = arrElemsStr.Split(',');
+                    else
+                        elems = Enumerable.Range(0, arrLen).Select(_ => "0").ToArray();
+
+                    string seqLiteral;
+                    if (rawElemType == "char")
+                    {
+                        var charElems = elems.Take(arrLen).Select(e =>
+                        {
+                            if (int.TryParse(e, out var code) && code >= 32 && code < 127 && code != '\'' && code != '\\')
+                                return $"'{(char)code}'";
+                            return $"'\\U{{{(int.TryParse(e, out var c) ? c : 0):X4}}}'";
+                        });
+                        seqLiteral = $"[{string.Join(", ", charElems)}]";
+                    }
+                    else
+                    {
+                        seqLiteral = $"[{string.Join(", ", elems.Take(arrLen).Select(e => FormatScalarValue(e.Trim(), rawElemType, enumDatatypes)))}]";
+                    }
+                    if (isUnique)
+                    {
+                        sb.AppendLine($"    expect {outp.Name}[..] == {seqLiteral};");
+                        coveredOutputs.Add(outp.Name);
+                    }
+                    else
+                    {
+                        sb.AppendLine($"    // expect {outp.Name}[..] == {seqLiteral}; // (one valid value — not uniquely determined by spec)");
                     }
                 }
                 else if (trustZ3Values && TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr)
@@ -1486,7 +1593,6 @@ static class TestEmitter
                             mentionsAnyOutput = true;
                             if (!coveredOutputs.Contains(mn))
                                 mentionsOnlyCoveredOutputs = false;
-                            break;
                         }
                     }
                 }

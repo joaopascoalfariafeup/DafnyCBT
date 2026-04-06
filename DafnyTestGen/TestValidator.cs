@@ -73,6 +73,19 @@ static class TestValidator
 
         Console.WriteLine($"[DafnyTestGen] Checking {testBlocks.Count} test case(s)...");
 
+        // Detect array-typed output names from method signatures (needed for [..] in expects)
+        var arrayOutputNames = new HashSet<string>();
+        foreach (Match rm in Regex.Matches(sourceHeader,
+            @"returns\s*\(([^)]+)\)", RegexOptions.Singleline))
+        {
+            foreach (var part in rm.Groups[1].Value.Split(','))
+            {
+                var tm = Regex.Match(part.Trim(), @"^(\w+)\s*:\s*array<");
+                if (tm.Success)
+                    arrayOutputNames.Add(tm.Groups[1].Value);
+            }
+        }
+
         // ── Generate single check file and build ─────────────────────────────────
         var tempDir = Path.Combine(Path.GetTempPath(),
             "DafnyTestGen_" + Path.GetRandomFileName().Replace(".", ""));
@@ -83,7 +96,7 @@ static class TestValidator
             var testFile = Path.Combine(tempDir, "check_all.dfy");
             var runnerBase = Path.Combine(tempDir, "runner");
 
-            WriteCheckFile(testFile, sourceHeader, testBlocks);
+            WriteCheckFile(testFile, sourceHeader, testBlocks, arrayOutputNames);
 
             // ── Phase 1: compile once ────────────────────────────────────────────
             var (buildExited, buildCode, buildOut, buildErr) = await RunProcess(
@@ -117,6 +130,8 @@ static class TestValidator
             var completedIds = ParseDoneMarkers(batchOut);
             var skippedIds = ParseSkipMarkers(batchOut);
             var capturedVals = ParseValMarkers(batchOut);
+            var wrongValIds = new HashSet<int>();
+            ParseWrongValMarkers(batchOut, wrongValIds);
 
             // ── Phase 3: re-check incomplete tests individually ─────────────────
             var incompleteIds = new HashSet<int>();
@@ -152,7 +167,7 @@ static class TestValidator
                         if (reFailed.Count > 0 || reCode != 0)
                             failedIds.Add(idx);
 
-                        // Merge captured values from individual run
+                        // Merge captured values and WRONGVAL markers from individual run
                         var reVals = ParseValMarkers(reOut);
                         foreach (var (id, vars) in reVals)
                         {
@@ -161,6 +176,7 @@ static class TestValidator
                             foreach (var (k, v) in vars)
                                 capturedVals[id][k] = v;
                         }
+                        ParseWrongValMarkers(reOut, wrongValIds);
                     }
                 }
             }
@@ -179,13 +195,25 @@ static class TestValidator
                 }
                 else if (failedIds.Contains(i))
                 {
+                    // Check if this is a rescued test: Z3's value was wrong (WRONGVAL)
+                    // but postconditions passed (no FAIL from postcondition checks).
+                    // Wait — if FAIL is set, postconditions actually failed. No rescue.
                     failingBlocks.Add(testBlocks[i]);
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: FAIL");
+                }
+                else if (wrongValIds.Contains(i))
+                {
+                    // Z3's concrete value was wrong but postconditions passed → rescue
+                    // Inject the actual runtime value captured via VAL markers (forceReplace
+                    // overrides the Z3 literal even though it looks like a simple scalar)
+                    passingBlocks.Add((testBlocks[i].comment,
+                        InjectCapturedValues(testBlocks[i].body, i, capturedVals, arrayOutputNames, forceReplace: true)));
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS (rescued — Z3 value corrected by runtime)");
                 }
                 else
                 {
                     passingBlocks.Add((testBlocks[i].comment,
-                        InjectCapturedValues(testBlocks[i].body, i, capturedVals)));
+                        InjectCapturedValues(testBlocks[i].body, i, capturedVals, arrayOutputNames)));
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS");
                 }
             }
@@ -214,10 +242,39 @@ static class TestValidator
     ///   - Main(args) that runs all tests, or a specific test by index arg
     /// </summary>
     static void WriteCheckFile(string path, string sourceHeader,
-        List<(string comment, string body)> testBlocks)
+        List<(string comment, string body)> testBlocks,
+        HashSet<string>? arrayOutputNames = null)
     {
         var sb = new StringBuilder();
         sb.Append(sourceHeader);
+
+        // Detect string/seq<char>-typed output names from method signatures in the source.
+        // These need special printing because Dafny prints seq<char> as raw text.
+        var stringOutputNames = new HashSet<string>();
+        foreach (Match rm in Regex.Matches(sourceHeader,
+            @"returns\s*\(([^)]+)\)", RegexOptions.Singleline))
+        {
+            foreach (var part in rm.Groups[1].Value.Split(','))
+            {
+                var tm = Regex.Match(part.Trim(), @"^(\w+)\s*:\s*(string|seq<char>)\s*$");
+                if (tm.Success)
+                    stringOutputNames.Add(tm.Groups[1].Value);
+            }
+        }
+
+        // Also detect array-typed output names (need to print as arr[..] for sequence format)
+        if (arrayOutputNames == null)
+            arrayOutputNames = new HashSet<string>();
+        foreach (Match rm in Regex.Matches(sourceHeader,
+            @"returns\s*\(([^)]+)\)", RegexOptions.Singleline))
+        {
+            foreach (var part in rm.Groups[1].Value.Split(','))
+            {
+                var tm = Regex.Match(part.Trim(), @"^(\w+)\s*:\s*array<");
+                if (tm.Success)
+                    arrayOutputNames.Add(tm.Groups[1].Value);
+            }
+        }
 
         // CheckExpect helper
         sb.AppendLine("method CheckExpect(condition: bool, testId: int)");
@@ -227,6 +284,32 @@ static class TestValidator
         sb.AppendLine("  }");
         sb.AppendLine("}");
         sb.AppendLine();
+
+        // CheckZ3Value: like CheckExpect but prints WRONGVAL instead of FAIL.
+        // Used for Z3 concrete value checks — if Z3's value is wrong but the
+        // postconditions pass, the test can be rescued with the actual runtime value.
+        sb.AppendLine("method CheckZ3Value(condition: bool, testId: int)");
+        sb.AppendLine("{");
+        sb.AppendLine("  if !condition {");
+        sb.AppendLine("    print \"WRONGVAL:\", testId, \"\\n\";");
+        sb.AppendLine("  }");
+        sb.AppendLine("}");
+        sb.AppendLine();
+
+        // Helper to print seq<char> in parseable literal format: ['a', 'b', 'c']
+        if (stringOutputNames.Count > 0)
+        {
+            sb.AppendLine("method PrintCharSeqVal(testId: nat, name: string, v: seq<char>)");
+            sb.AppendLine("{");
+            sb.AppendLine("  print \"VAL:\", testId, \":\", name, \"=[\";");
+            sb.AppendLine("  for i := 0 to |v| {");
+            sb.AppendLine("    if i > 0 { print \", \"; }");
+            sb.AppendLine("    print \"'\", [v[i]], \"'\";");
+            sb.AppendLine("  }");
+            sb.AppendLine("  print \"]\\n\";");
+            sb.AppendLine("}");
+            sb.AppendLine();
+        }
 
         // Individual test methods
         for (int i = 0; i < testBlocks.Count; i++)
@@ -240,7 +323,16 @@ static class TestValidator
                 outputNames = new HashSet<string>(
                     callMatch.Groups[1].Value.Split(',').Select(n => n.Trim()).Where(n => n.Length > 0));
             }
-            var body = ReplaceExpectsWithChecks(testBlocks[i].body, i, outputNames);
+
+            // Extract POST expressions from test comments for postcondition fallback checks.
+            // When Z3's concrete value is wrong, postcondition checks determine if the
+            // implementation's actual output is valid — enabling "rescue" of the test.
+            var postExprs = new List<string>();
+            foreach (Match pm in Regex.Matches(testBlocks[i].comment, @"//\s+POST:\s*(.+)"))
+                postExprs.Add(pm.Groups[1].Value.Trim());
+
+            var body = ReplaceExpectsWithChecks(testBlocks[i].body, i, outputNames,
+                stringOutputNames, arrayOutputNames, postExprs);
             sb.AppendLine($"method TestCase_{i}()");
             sb.AppendLine("{");
             sb.Append(body);
@@ -272,11 +364,20 @@ static class TestValidator
     /// Replaces `expect expr;` with `CheckExpect(expr, testId);` in a test body.
     /// For expects of the form `expect var == FuncCall(...);`, also adds a
     /// print statement to capture the actual value: `print "VAL:testId:var=", var, "\n";`
+    /// When postExprs are provided (from POST: comments), postcondition fallback checks
+    /// are added so tests where Z3's concrete value is wrong can be "rescued" if the
+    /// implementation's actual output satisfies the postconditions.
     /// </summary>
-    static string ReplaceExpectsWithChecks(string body, int testId, HashSet<string>? outputNames = null)
+    static string ReplaceExpectsWithChecks(string body, int testId,
+        HashSet<string>? outputNames = null,
+        HashSet<string>? stringOutputNames = null,
+        HashSet<string>? arrayOutputNames = null,
+        List<string>? postExprs = null)
     {
         // Track which outputs already have VAL prints from "var == expr" patterns
         var capturedOutputs = new HashSet<string>();
+        // Track if any expects use Z3 concrete values (simple literals) for output variables
+        bool hasConcreteOutputExpects = false;
         var result = Regex.Replace(body,
             @"^(\s*)expect (.+);(?: // PRE-CHECK)?",
             m =>
@@ -297,13 +398,53 @@ static class TestValidator
                 var checkLine = $"{indent}CheckExpect({expr}, {testId});";
 
                 // Detect `var == ExprWithFuncCall` and emit VAL print for the variable
-                var valPrint = TryMakeValPrint(expr, testId, indent);
+                var valPrint = TryMakeValPrint(expr, testId, indent, stringOutputNames, arrayOutputNames);
                 if (valPrint != null)
                 {
                     var eqMatch = Regex.Match(expr, @"^(\w+)\s*==");
                     if (eqMatch.Success) capturedOutputs.Add(eqMatch.Groups[1].Value);
                     return valPrint + "\n" + checkLine;
                 }
+
+                // For output == simple_literal (Z3 concrete value), always capture VAL
+                // so the test can be rescued if Z3's value is wrong but postconditions pass.
+                // Use CheckZ3Value (prints WRONGVAL, not FAIL) so we can distinguish
+                // "Z3 value wrong" from "postcondition wrong".
+                var eqLitMatch = Regex.Match(expr, @"^(\w+)\s*==\s*(.+)$");
+                if (eqLitMatch.Success && outputNames != null &&
+                    outputNames.Contains(eqLitMatch.Groups[1].Value) &&
+                    IsSimpleScalarLiteral(eqLitMatch.Groups[2].Value.Trim()) &&
+                    postExprs != null && postExprs.Count > 0)
+                {
+                    var outName = eqLitMatch.Groups[1].Value;
+                    capturedOutputs.Add(outName);
+                    hasConcreteOutputExpects = true;
+                    string valLine;
+                    if (stringOutputNames != null && stringOutputNames.Contains(outName))
+                        valLine = $"{indent}PrintCharSeqVal({testId}, \"{outName}\", {outName});";
+                    else if (arrayOutputNames != null && arrayOutputNames.Contains(outName))
+                        valLine = $"{indent}print \"VAL:{testId}:{outName}=\", {outName}[..], \"\\n\";";
+                    else
+                        valLine = $"{indent}print \"VAL:{testId}:{outName}=\", {outName}, \"\\n\";";
+                    // Use CheckZ3Value (WRONGVAL) instead of CheckExpect (FAIL)
+                    var z3CheckLine = $"{indent}CheckZ3Value({expr}, {testId});";
+                    return valLine + "\n" + z3CheckLine;
+                }
+
+                // For mutable array post-state: name[..] == literal or name[..N] == literal
+                // These are also Z3 concrete values that may be wrong (uninterpreted functions).
+                var arrEqMatch = Regex.Match(expr, @"^(\w+)\[\.\.(\w*)\]\s*==\s*(.+)$");
+                if (arrEqMatch.Success &&
+                    IsValidDafnyLiteral(arrEqMatch.Groups[3].Value.Trim()) &&
+                    postExprs != null && postExprs.Count > 0)
+                {
+                    hasConcreteOutputExpects = true;
+                    var arrName = arrEqMatch.Groups[1].Value;
+                    var valLine = $"{indent}print \"VAL:{testId}:{arrName}=\", {arrName}[..], \"\\n\";";
+                    var z3CheckLine = $"{indent}CheckZ3Value({expr}, {testId});";
+                    return valLine + "\n" + z3CheckLine;
+                }
+
                 return checkLine;
             },
             RegexOptions.Multiline);
@@ -322,13 +463,94 @@ static class TestValidator
                     {
                         var sb2 = new System.Text.StringBuilder(m2.Value);
                         foreach (var name in uncaptured)
-                            sb2.AppendLine($"\n    print \"VAL:{testId}:{name}=\", {name}, \"\\n\";");
+                        {
+                            if (stringOutputNames != null && stringOutputNames.Contains(name))
+                                sb2.AppendLine($"\n    PrintCharSeqVal({testId}, \"{name}\", {name});");
+                            else if (arrayOutputNames != null && arrayOutputNames.Contains(name))
+                                sb2.AppendLine($"\n    print \"VAL:{testId}:{name}=\", {name}[..], \"\\n\";");
+                            else
+                                sb2.AppendLine($"\n    print \"VAL:{testId}:{name}=\", {name}, \"\\n\";");
+                        }
                         return sb2.ToString();
                     },
                     RegexOptions.Multiline);
             }
         }
 
+        // When tests use Z3 concrete values for outputs (which may be wrong due to
+        // uninterpreted operators), add postcondition fallback checks from POST: comments.
+        // If Z3's value fails but postconditions pass → test can be rescued with actual value.
+        if (hasConcreteOutputExpects && postExprs != null && postExprs.Count > 0)
+        {
+            // Collect old() captures needed by postconditions, and insert
+            // declarations (var old_X := X[..];) before the method call if missing.
+            // Track which names need slice ([..]) vs plain capture.
+            var neededOldVars = new Dictionary<string, bool>(); // name → needsSlice
+            foreach (var post in postExprs)
+            {
+                // old(name[..]) → needs slice
+                foreach (Match om in Regex.Matches(post, @"\bold\((\w+)\[\.\.\]\)"))
+                    neededOldVars[om.Groups[1].Value] = true;
+                // old(name) → plain capture (don't override if already marked as slice)
+                foreach (Match om in Regex.Matches(post, @"\bold\((\w+)\)"))
+                    if (!neededOldVars.ContainsKey(om.Groups[1].Value))
+                        neededOldVars[om.Groups[1].Value] = false;
+            }
+
+            foreach (var (varName, needsSlice) in neededOldVars)
+            {
+                var oldVarName = "old_" + varName;
+                if (!result.Contains($"var {oldVarName} :="))
+                {
+                    // Insert "var old_X := X[..];" or "var old_X := X;" before the method call.
+                    // Match both "var x := Method(...);" and plain "Method(...);" (no return).
+                    var captureExpr = needsSlice ? $"{varName}[..]" : varName;
+                    var inserted = false;
+                    // Try "var ... := Method(...);" first
+                    var newResult = Regex.Replace(result,
+                        @"(^[ \t]*)(var\s+\w+\s*:=\s*\w+\([^)]*\);)",
+                        m2 => { if (!inserted) { inserted = true; return $"{m2.Groups[1].Value}var {oldVarName} := {captureExpr};\n{m2.Value}"; } return m2.Value; },
+                        RegexOptions.Multiline);
+                    if (!inserted)
+                    {
+                        // Try plain "MethodName(...);" (no var assignment)
+                        newResult = Regex.Replace(result,
+                            @"(^[ \t]+)(\w+\([^)]*\);)",
+                            m2 => { if (!inserted) { inserted = true; return $"{m2.Groups[1].Value}var {oldVarName} := {captureExpr};\n{m2.Value}"; } return m2.Value; },
+                            RegexOptions.Multiline);
+                    }
+                    result = newResult;
+                }
+            }
+
+            var sb2 = new StringBuilder(result);
+            sb2.AppendLine($"    // Postcondition fallback: if Z3 value was wrong, check actual postconditions");
+            foreach (var post in postExprs)
+            {
+                // Replace old(expr) with old_name variables that are already declared
+                // in the test body (e.g., old(a[..]) → old_a, old(count) → old_count).
+                var fixedPost = ReplaceOldExprs(post);
+                sb2.AppendLine($"    CheckExpect({fixedPost}, {testId});");
+            }
+            result = sb2.ToString();
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Replaces old(expr) subexpressions in a postcondition string with corresponding
+    /// old_name variables (which are already declared in the test body by TestEmitter).
+    /// Handles: old(a[..]) → old_a, old(count) → old_count, old(a[i]) → old_a[i].
+    /// </summary>
+    static string ReplaceOldExprs(string expr)
+    {
+        // Handle old(name[..]) → old_name  (array snapshot)
+        var result = Regex.Replace(expr, @"\bold\((\w+)\[\.\.\]\)", "old_$1");
+        // Handle old(name[indexExpr]) → old_name[indexExpr]  (array element access)
+        result = Regex.Replace(result, @"\bold\((\w+)\[([^\]]+)\]\)", "old_$1[$2]");
+        // Handle old(name) → old_name  (simple variable)
+        result = Regex.Replace(result, @"\bold\((\w+)\)", "old_$1");
         return result;
     }
 
@@ -337,7 +559,9 @@ static class TestValidator
     /// that captures the actual runtime value: print "VAL:testId:var=", var, "\n";
     /// Returns null if the RHS is already a simple literal (int/bool/char) — nothing to capture.
     /// </summary>
-    static string? TryMakeValPrint(string expr, int testId, string indent)
+    static string? TryMakeValPrint(string expr, int testId, string indent,
+        HashSet<string>? stringOutputNames = null,
+        HashSet<string>? arrayOutputNames = null)
     {
         // Match: varName == <expr>
         var m = Regex.Match(expr, @"^(\w+)\s*==\s*(.+)$");
@@ -348,6 +572,14 @@ static class TestValidator
 
         // Don't emit VAL for simple scalar literals — the expect is already concrete
         if (IsSimpleScalarLiteral(rhs)) return null;
+
+        // For string/seq<char> outputs, use helper that prints parseable ['a', 'b'] format
+        if (stringOutputNames != null && stringOutputNames.Contains(varName))
+            return $"{indent}PrintCharSeqVal({testId}, \"{varName}\", {varName});";
+
+        // For array outputs, print as arr[..] to get sequence format
+        if (arrayOutputNames != null && arrayOutputNames.Contains(varName))
+            return $"{indent}print \"VAL:{testId}:{varName}=\", {varName}[..], \"\\n\";";
 
         return $"{indent}print \"VAL:{testId}:{varName}=\", {varName}, \"\\n\";";
     }
@@ -375,6 +607,13 @@ static class TestValidator
         foreach (Match m in Regex.Matches(output, @"FAIL:(\d+)"))
             if (int.TryParse(m.Groups[1].Value, out var id))
                 failedIds.Add(id);
+    }
+
+    static void ParseWrongValMarkers(string output, HashSet<int> wrongValIds)
+    {
+        foreach (Match m in Regex.Matches(output, @"WRONGVAL:(\d+)"))
+            if (int.TryParse(m.Groups[1].Value, out var id))
+                wrongValIds.Add(id);
     }
 
     static HashSet<int> ParseDoneMarkers(string output)
@@ -425,7 +664,9 @@ static class TestValidator
     /// and removes the now-unused `var check_var := ...;` line.
     /// </summary>
     static string InjectCapturedValues(string body, int testId,
-        Dictionary<int, Dictionary<string, string>> capturedVals)
+        Dictionary<int, Dictionary<string, string>> capturedVals,
+        HashSet<string>? arrayOutputNames = null,
+        bool forceReplace = false)
     {
         if (!capturedVals.TryGetValue(testId, out var vars) || vars.Count == 0)
             return body;
@@ -441,12 +682,36 @@ static class TestValidator
                 var semi = m.Groups[5].Value;
 
                 // Replace if we captured the runtime value AND it's a valid injectable literal.
-                // Don't replace if RHS is already the same simple literal (nothing to gain).
+                // Don't replace if RHS is already the same simple literal (nothing to gain)
+                // — UNLESS forceReplace is set (rescued tests where Z3 value is wrong).
                 if (vars.TryGetValue(varName, out var value) &&
                     IsValidDafnyLiteral(value) &&
-                    !IsSimpleScalarLiteral(rhs.Trim()))
+                    (forceReplace || !IsSimpleScalarLiteral(rhs.Trim())))
                 {
-                    return $"{indent}{varName}{eq}{value}{semi}";
+                    // Array outputs need [..] to convert to sequence for comparison
+                    var lhs = (arrayOutputNames != null && arrayOutputNames.Contains(varName))
+                        ? $"{varName}[..]" : varName;
+                    return $"{indent}{lhs}{eq}{value}{semi}";
+                }
+                return m.Value;
+            },
+            RegexOptions.Multiline);
+
+        // Also handle mutable array post-state expects: "expect name[..] == literal"
+        result = Regex.Replace(result,
+            @"^(\s*expect\s+)(\w+)\[\.\.\]\s*==\s*(.+)(;)",
+            m =>
+            {
+                var indent = m.Groups[1].Value;
+                var arrName = m.Groups[2].Value;
+                var rhs = m.Groups[3].Value;
+                var semi = m.Groups[4].Value;
+
+                if (vars.TryGetValue(arrName, out var value) &&
+                    IsValidDafnyLiteral(value) &&
+                    (forceReplace || !IsValidDafnyLiteral(rhs.Trim())))
+                {
+                    return $"{indent}{arrName}[..] == {value}{semi}";
                 }
                 return m.Value;
             },
@@ -466,20 +731,34 @@ static class TestValidator
         }
 
         // For outputs with captured runtime values but no "expect var == <expr>" to replace
-        // (e.g., Mode's "expect m in a[..]"), insert a commented hint after the method call.
+        // (e.g., postcondition expects like "expect |result| == |a|" or "expect forall i :: ..."):
+        // Insert a concrete value expect before the first postcondition expect mentioning
+        // this variable, while preserving all postcondition expects.
         foreach (var (varName, value) in vars)
         {
             if (!IsValidDafnyLiteral(value)) continue;
-            // Check if this variable already has an "expect var ==" line (already handled above)
-            if (Regex.IsMatch(result, @"^\s*expect\s+" + Regex.Escape(varName) + @"\s*==\s*", RegexOptions.Multiline))
+            // Check if this variable already has an "expect var ==" or "expect var[..] ==" line (already handled above)
+            if (Regex.IsMatch(result, @"^\s*expect\s+" + Regex.Escape(varName) + @"(\[\.\.\])?\s*==\s*", RegexOptions.Multiline))
                 continue;
-            // Check if this variable appears in non-== expects (e.g., "expect m in a[..]")
+            // Check if this variable appears in non-== expects (e.g., "expect forall i :: ... result[i] ...")
             if (!Regex.IsMatch(result, @"^\s*expect\s+.*\b" + Regex.Escape(varName) + @"\b", RegexOptions.Multiline))
                 continue;
-            // Insert commented hint right after the method call
+
+            // Insert concrete expect before the first postcondition expect mentioning this variable
+            bool inserted = false;
             result = Regex.Replace(result,
-                @"(^[ \t]*var\s+" + Regex.Escape(varName) + @"\s*:=\s*\w+\([^)]*\);\s*)$",
-                m2 => m2.Value + $"\n    // expect {varName} == {value}; // (actual runtime value — not uniquely determined by spec)",
+                @"^([ \t]*)(expect\s+.+\b" + Regex.Escape(varName) + @"\b.+;)",
+                m2 =>
+                {
+                    if (!inserted)
+                    {
+                        inserted = true;
+                        var lhs = (arrayOutputNames != null && arrayOutputNames.Contains(varName))
+                            ? $"{varName}[..]" : varName;
+                        return $"{m2.Groups[1].Value}expect {lhs} == {value};\n{m2.Value}";
+                    }
+                    return m2.Value;
+                },
                 RegexOptions.Multiline);
         }
 
@@ -501,8 +780,10 @@ static class TestValidator
         if (Regex.IsMatch(value, @"^\{(\s*-?\d+\s*(,\s*-?\d+\s*)*)?\}$")) return true;
         // Multiset literal: multiset{} or multiset{n1, n2, ...}
         if (Regex.IsMatch(value, @"^multiset\{(\s*-?\d+\s*(,\s*-?\d+\s*)*)?\}$")) return true;
-        // Sequence literal: [] or [n1, n2, ...]
+        // Sequence literal: [] or [n1, n2, ...] (integer elements)
         if (Regex.IsMatch(value, @"^\[(\s*-?\d+\s*(,\s*-?\d+\s*)*)?\]$")) return true;
+        // Char sequence literal: [] or ['a', 'b', ...] (from PrintCharSeqVal)
+        if (Regex.IsMatch(value, @"^\[(\s*'.'(\s*,\s*'.')*\s*)?\]$")) return true;
         return false;
     }
 

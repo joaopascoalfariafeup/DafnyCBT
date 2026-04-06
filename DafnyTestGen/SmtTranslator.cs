@@ -409,8 +409,8 @@ static class SmtTranslator
             }
         }
 
-        // For array params, declare companion sequence(s) and length alias(es)
-        foreach (var (name, type) in inputs)
+        // For array params (inputs and outputs), declare companion sequence(s) and length alias(es)
+        foreach (var (name, type) in inputs.Concat(outputs))
         {
             if (TypeUtils.IsArrayType(type))
             {
@@ -530,6 +530,8 @@ static class SmtTranslator
                     {
                         sb.AppendLine($"(assert (>= (seq.len {smtName}) 0))");
                         sb.AppendLine($"(assert (<= (seq.len {smtName}) {MAX_SEQ_LEN}))");
+                        if (elemTypeStr == "nat")
+                            sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (>= (seq.nth {smtName} i) 0))))");
                         if (elemTypeStr == "char")
                             sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
                         if (_enumDatatypes.TryGetValue(elemTypeStr, out var enumElemCtors))
@@ -542,6 +544,8 @@ static class SmtTranslator
                     var smtName = TypeUtils.SeqSmtName(name, type);
                     sb.AppendLine($"(assert (>= (seq.len {smtName}) 0))");
                     sb.AppendLine($"(assert (<= (seq.len {smtName}) {MAX_SEQ_LEN}))");
+                    if (elemTypeStr == "nat")
+                        sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (>= (seq.nth {smtName} i) 0))))");
                     if (elemTypeStr == "char")
                         sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
                     if (_enumDatatypes.TryGetValue(elemTypeStr, out var enumElemCtors2))
@@ -1324,6 +1328,21 @@ static class SmtTranslator
                 if (boundVars.Count == 1)
                 {
                     var bv0 = boundVars[0];
+
+                    // First check: if bound var is a VALUE (appears in set select AND compared to seq.nth)
+                    // then skip ALL finite expansions — keep as real forall/exists.
+                    // Example: "forall x :: x in result ==> x in a[..]" — x ranges over all values,
+                    // not just array indices. Finite expansion would miss values outside arrays.
+                    {
+                        var bvPatEarly = Regex.Escape(bv0.Name);
+                        bool bvInSelectEarly = Regex.IsMatch(bodySmt, @"\(select \S+ " + bvPatEarly + @"\b");
+                        bool bvComparedEarly = Regex.IsMatch(bodySmt,
+                            @"\(= " + bvPatEarly + @" \(seq\.nth ") ||
+                            Regex.IsMatch(bodySmt, @"\(= \(seq\.nth [^)]+\) " + bvPatEarly + @"\b");
+                        if (bvInSelectEarly && bvComparedEarly)
+                            goto skipFiniteExpansion;
+                    }
+
                     // If the body contains (= varName (seq.nth SEQNAME K)), the bound variable
                     // is seq-typed (e.g., "forall x :: x in outerSeq ==> body"). Substitute
                     // (seq.nth outerSeq k) for each k instead of an integer index.
@@ -1357,18 +1376,28 @@ static class SmtTranslator
                             : $"(or {string.Join(" ", instances)})";
                     }
 
-                    var varName = bv0.Name;
-                    var intInstances = new List<string>();
-                    for (int idx = 0; idx < MAX_SEQ_LEN; idx++)
+                    // Check if bound var is a value (appears in set select AND compared to seq.nth)
+                    // — if so, skip finite expansion and keep as real forall
+                    var bvPat = Regex.Escape(bv0.Name);
+                    bool bvInSelect = Regex.IsMatch(bodySmt, @"\(select \S+ " + bvPat + @"\b");
+                    bool bvComparedToSeqNth = Regex.IsMatch(bodySmt,
+                        @"\(= " + bvPat + @" \(seq\.nth ") ||
+                        Regex.IsMatch(bodySmt, @"\(= \(seq\.nth [^)]+\) " + bvPat + @"\b");
+                    if (!(bvInSelect && bvComparedToSeqNth))
                     {
-                        var instance = Regex.Replace(bodySmt,
-                            @"(?<![a-zA-Z_])" + Regex.Escape(varName) + @"(?![a-zA-Z_0-9])",
-                            idx.ToString());
-                        intInstances.Add(instance);
+                        var varName = bv0.Name;
+                        var intInstances = new List<string>();
+                        for (int idx = 0; idx < MAX_SEQ_LEN; idx++)
+                        {
+                            var instance = Regex.Replace(bodySmt,
+                                @"(?<![a-zA-Z_])" + Regex.Escape(varName) + @"(?![a-zA-Z_0-9])",
+                                idx.ToString());
+                            intInstances.Add(instance);
+                        }
+                        return quantifier == "forall"
+                            ? $"(and {string.Join(" ", intInstances)})"
+                            : $"(or {string.Join(" ", intInstances)})";
                     }
-                    return quantifier == "forall"
-                        ? $"(and {string.Join(" ", intInstances)})"
-                        : $"(or {string.Join(" ", intInstances)})";
                 }
                 else // boundVars.Count == 2
                 {
@@ -1394,6 +1423,7 @@ static class SmtTranslator
                 }
             }
 
+        skipFiniteExpansion:
             return $"({quantifier} ({bindings}) {bodySmt})";
         }
 
@@ -1456,8 +1486,26 @@ static class SmtTranslator
                 var toSmt = seqSel.E1 != null
                     ? ExprToSmt(seqSel.E1, inputs, mutableNames, isPostContext, insideOld) : $"(seq.len {smtSeq})";
                 if (fromSmt == null || toSmt == null) goto fallback;
-                return $"(seq.extract {smtSeq} {fromSmt} (- {toSmt} {fromSmt}))";
+                // Optimize: when from=0, length is just toSmt
+                var lenExpr = fromSmt == "0" ? toSmt : $"(- {toSmt} {fromSmt})";
+                return $"(seq.extract {smtSeq} {fromSmt} {lenExpr})";
             }
+        }
+
+        // SeqDisplayExpr: [x] → (seq.unit x), [x, y] → (seq.++ (seq.unit x) (seq.unit y)), [] → empty
+        if (expr is SeqDisplayExpr seqDisp)
+        {
+            if (seqDisp.Elements.Count == 0)
+                return "(as seq.empty (Seq Int))";
+            var elemSmts = new List<string>();
+            foreach (var elem in seqDisp.Elements)
+            {
+                var elemSmt = ExprToSmt(elem, inputs, mutableNames, isPostContext, insideOld);
+                if (elemSmt == null) goto fallback;
+                elemSmts.Add($"(seq.unit {elemSmt})");
+            }
+            if (elemSmts.Count == 1) return elemSmts[0];
+            return $"(seq.++ {string.Join(" ", elemSmts)})";
         }
 
         // MemberSelectExpr: a.Length → a_len, this.field → field (with renaming)
@@ -1947,6 +1995,7 @@ static class SmtTranslator
                 return true;
         }
         if (expr is SeqSelectExpr sel && !sel.SelectOne) return true;
+        if (expr is SeqDisplayExpr) return true;
         if (expr is OldExpr oldE) return IsSeqExprAst(oldE.Expr, inputs);
         return false;
     }
@@ -2312,9 +2361,29 @@ static class SmtTranslator
                             : $"(or {string.Join(" ", seqInstances)})";
                     }
                 }
+                // Skip finite expansion when the bound variable is a VALUE (not an index):
+                // if it appears in both (select set x) and (seq.nth seq x) patterns,
+                // the variable ranges over element values, not array indices.
+                // Finite expansion over 0..MAX_SEQ_LEN-1 would be unsound for value-domain quantifiers.
+                bool boundVarIsValue = false;
+                if (boundVars.Count == 1)
+                {
+                    var bvName = boundVars[0].name;
+                    var bvPattern = Regex.Escape(bvName);
+                    // Check if bound var appears as a set/multiset membership argument
+                    bool inSelect = Regex.IsMatch(bodySmt, @"\(select \S+ " + bvPattern + @"\b");
+                    // Check if bound var appears as the VALUE being searched in seq.nth comparisons
+                    // (i.e., compared against seq.nth, not used as the index argument of seq.nth)
+                    bool comparedToSeqNth = Regex.IsMatch(bodySmt,
+                        @"\(= " + bvPattern + @" \(seq\.nth ") ||
+                        Regex.IsMatch(bodySmt, @"\(= \(seq\.nth [^)]+\) " + bvPattern + @"\b");
+                    if (inSelect && comparedToSeqNth)
+                        boundVarIsValue = true;
+                }
                 if (boundVars.Count >= 1 && boundVars.Count <= 2
                     && boundVars.All(v => v.smtType == "Int")
-                    && bodySmt.Contains("seq.nth"))
+                    && bodySmt.Contains("seq.nth")
+                    && !boundVarIsValue)
                 {
                     if (boundVars.Count == 1)
                     {
@@ -2746,6 +2815,52 @@ static class SmtTranslator
         if (arrToSeqMatch.Success)
         {
             return $"{arrToSeqMatch.Groups[1].Value}_seq";
+        }
+
+        // Handle a[..expr] (left-slice: first expr elements)
+        var leftSliceMatch = Regex.Match(expr, @"^(\w+)\[\.\.(.+)\]$");
+        if (leftSliceMatch.Success)
+        {
+            var seqVarName = leftSliceMatch.Groups[1].Value;
+            var toExpr = DafnyExprToSmt(leftSliceMatch.Groups[2].Value, inputs);
+            if (toExpr != null)
+            {
+                var isArray = inputs.Any(v => v.Name == seqVarName && TypeUtils.IsArrayType(v.Type));
+                var smtSeq = isArray ? $"{seqVarName}_seq" : seqVarName;
+                return $"(seq.extract {smtSeq} 0 {toExpr})";
+            }
+        }
+
+        // Handle a[expr..] (right-slice: elements from expr to end)
+        var rightSliceMatch = Regex.Match(expr, @"^(\w+)\[(.+)\.\.\]$");
+        if (rightSliceMatch.Success)
+        {
+            var seqVarName = rightSliceMatch.Groups[1].Value;
+            var fromExpr = DafnyExprToSmt(rightSliceMatch.Groups[2].Value, inputs);
+            if (fromExpr != null)
+            {
+                var isArray = inputs.Any(v => v.Name == seqVarName && TypeUtils.IsArrayType(v.Type));
+                var smtSeq = isArray ? $"{seqVarName}_seq" : seqVarName;
+                return $"(seq.extract {smtSeq} {fromExpr} (- (seq.len {smtSeq}) {fromExpr}))";
+            }
+        }
+
+        // Handle sequence display literals: [x], [x, y, z], []
+        if (expr.StartsWith("[") && expr.EndsWith("]"))
+        {
+            var inner = expr.Substring(1, expr.Length - 2).Trim();
+            if (inner.Length == 0)
+                return "(as seq.empty (Seq Int))";
+            var elems = SplitArgs(inner);
+            var elemSmts = new List<string>();
+            foreach (var elem in elems)
+            {
+                var elemSmt = DafnyExprToSmt(elem.Trim(), inputs);
+                if (elemSmt == null) return null;
+                elemSmts.Add($"(seq.unit {elemSmt})");
+            }
+            if (elemSmts.Count == 1) return elemSmts[0];
+            return $"(seq.++ {string.Join(" ", elemSmts)})";
         }
 
         // Handle arithmetic operators with correct left-associativity.
@@ -3826,7 +3941,19 @@ static class SmtTranslator
                     }
                 }
             }
-            else if (!TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type) && !TypeUtils.IsMapType(type))
+            else if (TypeUtils.IsSetType(type) || TypeUtils.IsMultisetType(type))
+            {
+                // Block on set/multiset membership: each known member must be in the set
+                if (values.TryGetValue($"{name}_members", out var membersStr))
+                {
+                    var members = membersStr.Split(',');
+                    foreach (var member in members)
+                        eqParts.Add($"(select {name} {member.Trim()})");
+                }
+                if (values.TryGetValue($"{name}_card", out var cardStr))
+                    eqParts.Add($"(= {name}_card {cardStr})");
+            }
+            else if (!TypeUtils.IsMapType(type))
             {
                 if (values.TryGetValue(name, out var val))
                     eqParts.Add($"(= {name} {val})");
