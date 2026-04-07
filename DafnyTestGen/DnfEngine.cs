@@ -311,6 +311,46 @@ static class DnfEngine
             }
         }
 
+        // LeafExpression with "X == (if C then A else B)": split equality over if-then-else.
+        // This handles fuel-1 inlining of recursive functions that produce if-then-else bodies.
+        if (expr is LeafExpression leafEqIte)
+        {
+            var eqSplit = TrySplitEqIte(leafEqIte.DafnyText);
+            if (eqSplit != null)
+            {
+                var (lhs, op, cond, thenBranch, elseBranch) = eqSplit.Value;
+                var condLeaf = new LeafExpression(cond);
+                var negCond = new LeafExpression($"!({cond})");
+                if (!negated)
+                {
+                    // X == (if C then A else B) → (C && X == A) || (!C && X == B)
+                    var thenClauses = CrossProduct(
+                        new List<List<Expression>> { new() { condLeaf } },
+                        ExprToDnfInner(new LeafExpression($"{lhs} {op} {thenBranch}"), false));
+                    var elseClauses = CrossProduct(
+                        new List<List<Expression>> { new() { negCond } },
+                        ExprToDnfInner(new LeafExpression($"{lhs} {op} {elseBranch}"), false));
+                    var result = new List<List<Expression>>(thenClauses);
+                    result.AddRange(elseClauses);
+                    return result;
+                }
+                else
+                {
+                    // !(X == (if C then A else B)) → (C && X != A) || (!C && X != B)
+                    var negOp = op == "==" ? "!=" : "==";
+                    var thenClauses = CrossProduct(
+                        new List<List<Expression>> { new() { condLeaf } },
+                        ExprToDnfInner(new LeafExpression($"{lhs} {negOp} {thenBranch}"), false));
+                    var elseClauses = CrossProduct(
+                        new List<List<Expression>> { new() { negCond } },
+                        ExprToDnfInner(new LeafExpression($"{lhs} {negOp} {elseBranch}"), false));
+                    var result = new List<List<Expression>>(thenClauses);
+                    result.AddRange(elseClauses);
+                    return result;
+                }
+            }
+        }
+
         // Leaf: atomic expression (return as-is, or wrapped in negation)
         var leaf = negated ? Negate(expr) : expr;
         return new List<List<Expression>> { new List<Expression> { leaf } };
@@ -354,6 +394,45 @@ static class DnfEngine
         var elseBranch = afterThen.Substring(elseIdx + 4).Trim();
 
         return (cond, thenBranch, elseBranch);
+    }
+
+    /// <summary>
+    /// Tries to split "LHS == (if C then A else B)" or "LHS != (if C then A else B)"
+    /// into its components. Returns null if the expression doesn't match.
+    /// </summary>
+    static (string lhs, string op, string cond, string thenBranch, string elseBranch)? TrySplitEqIte(string text)
+    {
+        text = text.Trim();
+        // Find == or != at depth 0
+        int depth = 0;
+        int eqIdx = -1;
+        string? op = null;
+        for (int i = 0; i < text.Length - 1; i++)
+        {
+            if (text[i] == '(' || text[i] == '[') { depth++; continue; }
+            if (text[i] == ')' || text[i] == ']') { depth--; continue; }
+            if (depth == 0)
+            {
+                if (i + 2 <= text.Length && text.Substring(i, 2) == "==" && (i == 0 || text[i-1] != '!' && text[i-1] != '<' && text[i-1] != '>'))
+                {
+                    eqIdx = i; op = "=="; break;
+                }
+                if (i + 2 <= text.Length && text.Substring(i, 2) == "!=")
+                {
+                    eqIdx = i; op = "!="; break;
+                }
+            }
+        }
+        if (eqIdx < 0 || op == null) return null;
+
+        var lhs = text[..eqIdx].Trim();
+        var rhs = text[(eqIdx + 2)..].Trim();
+
+        // Check if RHS is an if-then-else (possibly wrapped in parens)
+        var iteSplit = TrySplitStringIte(rhs);
+        if (iteSplit == null) return null;
+
+        return (lhs, op, iteSplit.Value.cond, iteSplit.Value.thenBranch, iteSplit.Value.elseBranch);
     }
 
     /// <summary>

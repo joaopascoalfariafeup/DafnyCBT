@@ -65,6 +65,8 @@ static class SmtTranslator
     internal static Dictionary<string, string> _definedFuncs = new();
     // Names of functions with define-fun (used to prevent adding to _uninterpFuncs)
     internal static HashSet<string> _definedFuncNames = new();
+    // Names of recursive functions that were fuel-1 inlined — calls should be treated as opaque (return null)
+    internal static HashSet<string> _fuelInlinedFuncs = new();
     // Parameter info for defined functions (used to fix array→seq arg substitution at call sites)
     internal static Dictionary<string, List<(string pName, string pType)>> _definedFuncParamInfo = new();
     // True if any postcondition literal could not be translated to SMT
@@ -1109,10 +1111,17 @@ static class SmtTranslator
                 // Sequence/array in
                 var seqInfo = ResolveSeqForContains(bin.E1, inputs, mutableNames, isPostContext, insideOld);
                 if (seqInfo == null) goto fallback;
-                var (smtSeq, boundSmt) = seqInfo.Value;
-                var containsExpr = boundSmt != null
-                    ? ExpandSeqContainsBounded(smtSeq, valSmt, boundSmt)
-                    : ExpandSeqContains(smtSeq, valSmt);
+                var (smtSeq, upperBound, lowerBound) = seqInfo.Value;
+                string containsExpr;
+                if (lowerBound != null && upperBound != null)
+                    // a[lo..hi] — combine both bounds
+                    containsExpr = ExpandSeqContainsBounded(smtSeq, valSmt, upperBound, lowerBound);
+                else if (lowerBound != null)
+                    containsExpr = ExpandSeqContainsFromIndex(smtSeq, valSmt, lowerBound);
+                else if (upperBound != null)
+                    containsExpr = ExpandSeqContainsBounded(smtSeq, valSmt, upperBound);
+                else
+                    containsExpr = ExpandSeqContains(smtSeq, valSmt);
                 return bin.Op == BinaryExpr.Opcode.NotIn ? $"(not {containsExpr})" : containsExpr;
             }
 
@@ -1659,6 +1668,9 @@ static class SmtTranslator
                     return BuildIsSortedSmt(seqSmt);
                 }
             }
+            // Fuel-1 inlined recursive functions are opaque — can't be expressed in SMT
+            if (_fuelInlinedFuncs.Contains(funcCall.Name))
+                return null;
             // Generic: defined function (finitely unrolled) or uninterpreted function
             var smtArgs = funcCall.Args.Select(a => ExprToSmt(a, inputs, mutableNames, isPostContext, insideOld)).ToList();
             if (smtArgs.All(a => a != null))
@@ -2058,15 +2070,15 @@ static class SmtTranslator
 
     /// <summary>
     /// Resolves the sequence expression for 'in' / 'not in' operators.
-    /// Returns (smtSeqName, optionalBound) or null if unresolvable.
+    /// Returns (smtSeqName, optionalUpperBound, optionalLowerBound) or null if unresolvable.
     /// </summary>
-    static (string smtSeq, string? bound)? ResolveSeqForContains(Expression expr,
+    static (string smtSeq, string? upperBound, string? lowerBound)? ResolveSeqForContains(Expression expr,
         List<(string Name, string Type)> inputs, HashSet<string> mutableNames,
         bool isPostContext, bool insideOld)
     {
         expr = UnwrapExpr(expr);
 
-        // a[..] or a[..len]
+        // a[..], a[..len], or a[lo..]
         if (expr is SeqSelectExpr sel && !sel.SelectOne)
         {
             var origName = GetOriginalName(sel.Seq);
@@ -2075,12 +2087,13 @@ static class SmtTranslator
             if (baseSmt == null) return null;
             var smtSeq = isArray ? $"{baseSmt}_seq" : baseSmt;
 
+            string? upperBound = null;
+            string? lowerBound = null;
             if (sel.E1 != null)
-            {
-                var boundSmt = ExprToSmt(sel.E1, inputs, mutableNames, isPostContext, insideOld);
-                return (smtSeq, boundSmt);
-            }
-            return (smtSeq, null);
+                upperBound = ExprToSmt(sel.E1, inputs, mutableNames, isPostContext, insideOld);
+            if (sel.E0 != null)
+                lowerBound = ExprToSmt(sel.E0, inputs, mutableNames, isPostContext, insideOld);
+            return (smtSeq, upperBound, lowerBound);
         }
 
         // Bare variable: s or a
@@ -2090,12 +2103,12 @@ static class SmtTranslator
             var isArray = inputs.Any(v => v.Name == name && TypeUtils.IsArrayType(v.Type));
             var renamed = RenameMutable(name, mutableNames, isPostContext, insideOld);
             var smtSeq = isArray ? $"{renamed}_seq" : renamed;
-            return (smtSeq, null);
+            return (smtSeq, null, null);
         }
 
         // Fallback: try full translation
         var smt = ExprToSmt(expr, inputs, mutableNames, isPostContext, insideOld);
-        return smt != null ? (smt, (string?)null) : null;
+        return smt != null ? (smt, (string?)null, (string?)null) : null;
     }
 
     /// <summary>
@@ -2586,15 +2599,16 @@ static class SmtTranslator
             return $"(= (seq.nth {arrName}_seq {idxName}) {valName})";
         }
 
-        // Handle !in pattern: x !in S (set) or x !in a[..] or x !in a[..len] or x !in s
-        var notInMatch = Regex.Match(expr, @"^(.+?)\s+!in\s+(\w+)(\[\.\.(\w+)?\])?$");
+        // Handle !in pattern: x !in S (set) or x !in a[..] or x !in a[..len] or x !in a[lo..] or x !in s
+        var notInMatch = Regex.Match(expr, @"^(.+?)\s+!in\s+(\w+)(\[(\.\.(\w+)?|(.+?)\.\.)\])?$");
         if (notInMatch.Success)
         {
             var seqName = notInMatch.Groups[2].Value;
             if (seqName == "Repr") return null; // heap ownership constraint
             var valExpr = DafnyExprToSmt(notInMatch.Groups[1].Value.Trim(), inputs);
             var hasSlice = notInMatch.Groups[3].Success;
-            var sliceBound = notInMatch.Groups[4].Success ? notInMatch.Groups[4].Value : null;
+            var sliceUpperBound = notInMatch.Groups[5].Success ? notInMatch.Groups[5].Value : null;
+            var sliceLowerBound = notInMatch.Groups[6].Success ? notInMatch.Groups[6].Value : null;
             if (valExpr != null)
             {
                 // Check if RHS is a set
@@ -2609,9 +2623,17 @@ static class SmtTranslator
 
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
-                if (sliceBound != null)
+                // Suffix slice: a[lo..] — elem not in elements from index lo onward
+                if (sliceLowerBound != null)
                 {
-                    var boundSmt = DafnyExprToSmt(sliceBound, inputs);
+                    var lowerSmt = DafnyExprToSmt(sliceLowerBound, inputs);
+                    if (lowerSmt != null)
+                        return $"(not {ExpandSeqContainsFromIndex(smtSeq, valExpr, lowerSmt)})";
+                }
+                // Prefix slice: a[..hi] — elem not in first hi elements
+                if (sliceUpperBound != null)
+                {
+                    var boundSmt = DafnyExprToSmt(sliceUpperBound, inputs);
                     if (boundSmt != null)
                         return $"(not {ExpandSeqContainsBounded(smtSeq, valExpr, boundSmt)})";
                 }
@@ -2619,16 +2641,16 @@ static class SmtTranslator
             }
         }
 
-        // Handle 'in' pattern: x in a[..] or x in a[..len] or x in s
-        // Handle 'in' pattern: x in S (set) or x in a[..] or x in a[..len] or x in s
-        var inMatch = Regex.Match(expr, @"^(.+?)\s+in\s+(\w+)(\[\.\.(\w+)?\])?$");
+        // Handle 'in' pattern: x in S (set) or x in a[..] or x in a[..len] or x in a[lo..] or x in s
+        var inMatch = Regex.Match(expr, @"^(.+?)\s+in\s+(\w+)(\[(\.\.(\w+)?|(.+?)\.\.)\])?$");
         if (inMatch.Success)
         {
             var seqName = inMatch.Groups[2].Value;
             if (seqName == "Repr") return null; // heap ownership constraint
             var valExpr = DafnyExprToSmt(inMatch.Groups[1].Value.Trim(), inputs);
             var hasSlice = inMatch.Groups[3].Success;
-            var sliceBound = inMatch.Groups[4].Success ? inMatch.Groups[4].Value : null;
+            var sliceUpperBound = inMatch.Groups[5].Success ? inMatch.Groups[5].Value : null;
+            var sliceLowerBound = inMatch.Groups[6].Success ? inMatch.Groups[6].Value : null;
             if (valExpr != null)
             {
                 // Check if RHS is a set
@@ -2648,9 +2670,17 @@ static class SmtTranslator
 
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
-                if (sliceBound != null)
+                // Suffix slice: a[lo..] — elem in elements from index lo onward
+                if (sliceLowerBound != null)
                 {
-                    var boundSmt = DafnyExprToSmt(sliceBound, inputs);
+                    var lowerSmt = DafnyExprToSmt(sliceLowerBound, inputs);
+                    if (lowerSmt != null)
+                        return ExpandSeqContainsFromIndex(smtSeq, valExpr, lowerSmt);
+                }
+                // Prefix slice: a[..hi] — elem in first hi elements
+                if (sliceUpperBound != null)
+                {
+                    var boundSmt = DafnyExprToSmt(sliceUpperBound, inputs);
                     if (boundSmt != null)
                         return ExpandSeqContainsBounded(smtSeq, valExpr, boundSmt);
                 }
@@ -2973,6 +3003,9 @@ static class SmtTranslator
         if (funcMatch.Success)
         {
             var funcName = funcMatch.Groups[1].Value;
+            // Fuel-1 inlined recursive functions are opaque — can't be expressed in SMT
+            if (_fuelInlinedFuncs.Contains(funcName))
+                return null;
             var argsStr = funcMatch.Groups[2].Value;
             // Split arguments on commas (respecting parentheses)
             var args = SplitArgs(argsStr);
@@ -3992,6 +4025,29 @@ static class SmtTranslator
         var disjuncts = new List<string>();
         for (int i = 0; i < MAX_SEQ_LEN; i++)
             disjuncts.Add($"(and (>= {boundSmt} {i + 1}) (>= (seq.len {smtSeq}) {i + 1}) (= {valExpr} (seq.nth {smtSeq} {i})))");
+        return $"(or {string.Join(" ", disjuncts)})";
+    }
+
+    /// <summary>
+    /// Like ExpandSeqContainsBounded but with both lower and upper bounds (a[lo..hi]).
+    /// </summary>
+    static string ExpandSeqContainsBounded(string smtSeq, string valExpr, string upperSmt, string lowerSmt)
+    {
+        var disjuncts = new List<string>();
+        for (int i = 0; i < MAX_SEQ_LEN; i++)
+            disjuncts.Add($"(and (>= {i} {lowerSmt}) (>= {upperSmt} {i + 1}) (>= (seq.len {smtSeq}) {i + 1}) (= {valExpr} (seq.nth {smtSeq} {i})))");
+        return $"(or {string.Join(" ", disjuncts)})";
+    }
+
+    /// <summary>
+    /// Like ExpandSeqContains but with a symbolic lower bound (suffix slice a[lo..]).
+    /// For "x in a[lo..]": generates disjunctions guarded by (>= i lowerSmt) and (< i seq.len).
+    /// </summary>
+    static string ExpandSeqContainsFromIndex(string smtSeq, string valExpr, string lowerSmt)
+    {
+        var disjuncts = new List<string>();
+        for (int i = 0; i < MAX_SEQ_LEN; i++)
+            disjuncts.Add($"(and (>= {i} {lowerSmt}) (>= (seq.len {smtSeq}) {i + 1}) (= {valExpr} (seq.nth {smtSeq} {i})))");
         return $"(or {string.Join(" ", disjuncts)})";
     }
 

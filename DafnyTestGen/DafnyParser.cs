@@ -318,6 +318,74 @@ static class DafnyParser
     }
 
     /// <summary>
+    /// Finds recursive functions (self-referencing body) in the program for fuel-1 inlining.
+    /// Returns the same tuple format as FindInlinablePredicates, but only includes
+    /// recursive functions (which FindInlinablePredicates skips).
+    /// </summary>
+    internal static List<(string name, List<string> paramNames, string body, bool isClassMember)> FindRecursiveFunctionsForFuel(
+        Microsoft.Dafny.Program program)
+    {
+        var result = new List<(string name, List<string> paramNames, string body, bool isClassMember)>();
+        foreach (var topDecl in AllTopLevelDecls(program))
+        {
+            if (topDecl is TopLevelDeclWithMembers cls)
+            {
+                bool isClassMember = cls is not DefaultClassDecl;
+                foreach (var member in cls.Members)
+                {
+                    if (member is Function func && func.Body != null)
+                    {
+                        var bodyStr = DnfEngine.ExprToString(func.Body);
+                        // Only collect recursive functions (body references the function name)
+                        if (!bodyStr.Contains(func.Name + "(")) continue;
+                        var paramNames = func.Ins.Select(p => p.Name).ToList();
+                        result.Add((func.Name, paramNames, bodyStr, isClassMember));
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Inlines recursive function calls exactly once (fuel=1).
+    /// Replaces each top-level call to a recursive function with its body,
+    /// but does NOT recurse into the replacement — inner recursive calls stay opaque.
+    /// </summary>
+    internal static string InlineRecursiveOnce(string literal,
+        List<(string name, List<string> paramNames, string body, bool isClassMember)> funcs)
+    {
+        var result = literal;
+        foreach (var (name, paramNames, body, _) in funcs)
+        {
+            var pattern = @"\b" + Regex.Escape(name) + @"\s*\(";
+            var match = Regex.Match(result, pattern);
+            if (!match.Success) continue;
+
+            int argsStart = match.Index + match.Length;
+            int depth = 1, pos = argsStart;
+            while (pos < result.Length && depth > 0)
+            {
+                if (result[pos] == '(') depth++;
+                else if (result[pos] == ')') depth--;
+                pos++;
+            }
+            if (depth != 0) continue;
+
+            var argsStr = result.Substring(argsStart, pos - 1 - argsStart);
+            var args = SplitArgs(argsStr);
+            if (args.Count != paramNames.Count) continue;
+
+            var inlined = body;
+            for (int p = 0; p < paramNames.Count; p++)
+                inlined = Regex.Replace(inlined, @"\b" + Regex.Escape(paramNames[p]) + @"\b", args[p].Trim());
+
+            result = result[..match.Index] + "(" + inlined + ")" + result[pos..];
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Splits a comma-separated argument string, respecting nested parentheses and brackets.
     /// </summary>
     static List<string> SplitArgs(string argsStr)

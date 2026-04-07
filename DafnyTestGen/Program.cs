@@ -270,6 +270,9 @@ class Program
         if (inlinablePredicates.Count > 0 && verbose)
             Console.WriteLine($"[DafnyTestGen] Found {inlinablePredicates.Count} inlinable predicate(s): {string.Join(", ", inlinablePredicates.Select(p => p.name))}");
 
+        // Find recursive functions for fuel-1 inlining (DNF decomposition)
+        var recursiveFuncsForFuel = DafnyParser.FindRecursiveFunctionsForFuel(program);
+
         // Find recursive functions that can be finitely unrolled into SMT define-fun
         var recursiveFunctions = DafnyParser.FindRecursiveFunctions(program);
         if (recursiveFunctions.Count > 0 && verbose)
@@ -526,7 +529,7 @@ class Program
 
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program);
+            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program, recursiveFuncsForFuel);
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -747,7 +750,8 @@ class Program
     static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
         List<(string name, List<string> paramNames, string body, bool isClassMember)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool hasNonInlinableFuncs = false,
         Dictionary<string, List<string>>? enumDatatypes = null, Dictionary<string, (string dtName, int ordinal)>? enumConstructors = null,
-        ClassInfo? classInfo = null, Microsoft.Dafny.Program? program = null)
+        ClassInfo? classInfo = null, Microsoft.Dafny.Program? program = null,
+        List<(string name, List<string> paramNames, string body, bool isClassMember)>? recursiveFunctions = null)
     {
         z3Path ??= Z3Runner.FindZ3Path();
         enumDatatypes ??= new Dictionary<string, List<string>>();
@@ -784,6 +788,35 @@ class Program
                 dnfEnsures = dnfEnsures
                     .Select(e => InlineExpr(e, predsToInline)).ToList();
             }
+        }
+
+        // Fuel-1 inlining: unroll recursive functions one level to expose
+        // if-then-else branch structure for DNF decomposition.
+        // This produces clauses like (|a|==0 && diff==a) vs (|a|>0 && a[last] in b && ...)
+        // even though inner recursive calls remain opaque.
+        var postFuncCalls = new HashSet<string>();
+        foreach (var ens in method.Ens)
+            foreach (var name in FindFunctionCalls(ens.E))
+                postFuncCalls.Add(name);
+        var recursiveFuncsInPost = (recursiveFunctions ?? new())
+            .Where(f => postFuncCalls.Contains(f.name))
+            .ToList();
+        if (recursiveFuncsInPost.Count > 0)
+        {
+            dnfEnsures = dnfEnsures.Select(e =>
+            {
+                var s = DnfEngine.ExprToString(e);
+                var unrolled = DafnyParser.InlineRecursiveOnce(s, recursiveFuncsInPost);
+                return unrolled != s ? (Expression)new LeafExpression(unrolled) : e;
+            }).ToList();
+            // Mark these functions as opaque so the SMT translator drops their calls
+            SmtTranslator._fuelInlinedFuncs = new HashSet<string>(recursiveFuncsInPost.Select(f => f.name));
+            if (verbose)
+                Console.WriteLine($"  Fuel-1 inlining of recursive function(s): {string.Join(", ", recursiveFuncsInPost.Select(f => f.name))}");
+        }
+        else
+        {
+            SmtTranslator._fuelInlinedFuncs.Clear();
         }
 
         // Compute DNF on un-inlined ensures for expect emission (preserves predicate names).
