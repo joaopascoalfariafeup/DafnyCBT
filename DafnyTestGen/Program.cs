@@ -843,7 +843,7 @@ class Program
         {
             dnfExprs = DnfEngine.ExprToDnf(dnfEnsures[0]);
             for (int i = 1; i < dnfEnsures.Count; i++)
-                dnfExprs = DnfEngine.CrossProduct(dnfExprs, DnfEngine.ExprToDnf(dnfEnsures[i]));
+                dnfExprs = DnfEngine.CrossProductPruned(dnfExprs, DnfEngine.ExprToDnf(dnfEnsures[i]));
         }
 
         // Build background postconditions: full (un-decomposed) ensures expressions.
