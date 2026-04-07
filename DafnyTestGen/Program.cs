@@ -835,7 +835,7 @@ class Program
             for (int i = 1; i < dnfEnsures.Count; i++)
             {
                 var next = DnfEngine.ExprToFdnf(dnfEnsures[i]);
-                fdnfExprs = DnfEngine.CrossProduct(fdnfExprs, next.pos);
+                fdnfExprs = DnfEngine.CrossProductPruned(fdnfExprs, next.pos);
             }
             dnfExprs = fdnfExprs;
         }
@@ -886,6 +886,18 @@ class Program
         bool hasDisjunctivePre = preDnfExprs.Count > 1;
         if (hasDisjunctivePre)
             Console.WriteLine($"  Disjunctive precondition: {preDnfExprs.Count} branches");
+
+        // Prune FDNF clauses that contradict preconditions (post-post contradictions
+        // are already caught by CrossProductPruned; this catches pre-post contradictions).
+        if ((allCombinations || progressive) && preDnfExprs.Count == 1 && preDnfExprs[0].Count > 0)
+        {
+            int before = dnfExprs.Count;
+            dnfExprs = dnfExprs.Where(clause =>
+                DnfEngine.FindContradiction(clause.Concat(preDnfExprs[0]).ToList()) == null
+            ).ToList();
+            if (dnfExprs.Count < before && verbose)
+                Console.WriteLine($"  Pre-post pruning: {before} -> {dnfExprs.Count} FDNF clauses");
+        }
 
         // Check for unsolvable patterns after predicate inlining.
         var allInlinedLiterals = dnfExprs.SelectMany(c => c).Select(e => DnfEngine.ExprToString(e))

@@ -47,6 +47,31 @@ static class DnfEngine
     }
 
     /// <summary>
+    /// Cross-product with incremental pruning: merged clauses are checked for syntactic
+    /// contradictions and discarded immediately. Optional extraLits (e.g., precondition
+    /// literals) are included in the contradiction check but not in the output clauses.
+    /// </summary>
+    internal static List<List<Expression>> CrossProductPruned(
+        List<List<Expression>> a, List<List<Expression>> b,
+        List<Expression>? extraLits = null)
+    {
+        var result = new List<List<Expression>>();
+        foreach (var clauseA in a)
+        {
+            foreach (var clauseB in b)
+            {
+                var merged = new List<Expression>(clauseA);
+                merged.AddRange(clauseB);
+                var checkLits = extraLits != null
+                    ? merged.Concat(extraLits).ToList() : merged;
+                if (FindContradiction(checkLits) == null)
+                    result.Add(merged);
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Converts an Expression AST node to its Dafny source string representation.
     /// </summary>
     internal static string ExprToString(Expression expr)
