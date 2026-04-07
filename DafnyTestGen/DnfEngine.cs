@@ -17,6 +17,18 @@ static class DnfEngine
     }
 
     /// <summary>
+    /// Decomposes a Dafny expression into Full Disjunctive Normal Form (FDNF).
+    /// Returns both the FDNF of the expression (pos) and the FDNF of its negation (neg),
+    /// computed bottom-up. Each clause is a complete conjunction including negated literals
+    /// for branches not taken, so cross-product across independent expressions directly
+    /// produces all meaningful truth combinations.
+    /// </summary>
+    internal static (List<List<Expression>> pos, List<List<Expression>> neg) ExprToFdnf(Expression expr)
+    {
+        return ExprToFdnfInner(expr);
+    }
+
+    /// <summary>
     /// Cross-product of two DNF clause lists: each clause from A is merged with each clause from B.
     /// </summary>
     internal static List<List<Expression>> CrossProduct(List<List<Expression>> a, List<List<Expression>> b)
@@ -91,6 +103,205 @@ static class DnfEngine
             if (expr is ConcreteSyntaxExpression c && c.ResolvedExpression != null) { expr = c.ResolvedExpression; continue; }
             return expr;
         }
+    }
+
+    // ───────────────── FDNF: Full DNF with dual returns ──────────────────
+
+    /// <summary>
+    /// Helper: builds the 3-way union for FDNF disjunction.
+    /// For A || B: pos = CP(A.pos, B.pos) ∪ CP(A.pos, B.neg) ∪ CP(A.neg, B.pos)
+    /// Also used (with swapped pos/neg) for negated conjunction: !(A && B) = !A || !B
+    /// </summary>
+    static List<List<Expression>> FdnfDisjunction(
+        (List<List<Expression>> pos, List<List<Expression>> neg) a,
+        (List<List<Expression>> pos, List<List<Expression>> neg) b)
+    {
+        var result = new List<List<Expression>>();
+        result.AddRange(CrossProduct(a.pos, b.pos));
+        result.AddRange(CrossProduct(a.pos, b.neg));
+        result.AddRange(CrossProduct(a.neg, b.pos));
+        return result;
+    }
+
+    /// <summary>
+    /// Core FDNF recursive decomposition. Returns (pos, neg) where pos is the FDNF
+    /// of the expression and neg is the FDNF of its negation.
+    /// </summary>
+    static (List<List<Expression>> pos, List<List<Expression>> neg) ExprToFdnfInner(Expression expr)
+    {
+        // Unwrap parentheses / concrete syntax wrappers
+        expr = UnwrapExpr(expr);
+
+        // Negation: swap pos/neg
+        if (expr is UnaryOpExpr unaryF && unaryF.Op == UnaryOpExpr.Opcode.Not)
+        {
+            var inner = ExprToFdnfInner(unaryF.E);
+            return (inner.neg, inner.pos);
+        }
+
+        if (expr is BinaryExpr binF)
+        {
+            var op = binF.Op;
+
+            // A ==> B  is  !A || B
+            if (op == BinaryExpr.Opcode.Imp)
+            {
+                var a = ExprToFdnfInner(binF.E0);
+                var b = ExprToFdnfInner(binF.E1);
+                // !A || B: use disjunction rule with (a.neg, a.pos) as first operand
+                var negA = (pos: a.neg, neg: a.pos);
+                var pos = FdnfDisjunction(negA, b);
+                var neg = CrossProduct(a.pos, b.neg); // !(A ==> B) = A && !B
+                return (pos, neg);
+            }
+
+            // A && B
+            if (op == BinaryExpr.Opcode.And)
+            {
+                var a = ExprToFdnfInner(binF.E0);
+                var b = ExprToFdnfInner(binF.E1);
+                var pos = CrossProduct(a.pos, b.pos);
+                // !(A && B) = !A || !B: disjunction of negations
+                var negA = (pos: a.neg, neg: a.pos);
+                var negB = (pos: b.neg, neg: b.pos);
+                var neg = FdnfDisjunction(negA, negB);
+                return (pos, neg);
+            }
+
+            // A || B
+            if (op == BinaryExpr.Opcode.Or)
+            {
+                var a = ExprToFdnfInner(binF.E0);
+                var b = ExprToFdnfInner(binF.E1);
+                var pos = FdnfDisjunction(a, b);
+                var neg = CrossProduct(a.neg, b.neg); // !(A || B) = !A && !B
+                return (pos, neg);
+            }
+
+            // A <==> B: pos = (A && B) || (!A && !B), neg = (A && !B) || (!A && B)
+            if (op == BinaryExpr.Opcode.Iff)
+            {
+                var a = ExprToFdnfInner(binF.E0);
+                var b = ExprToFdnfInner(binF.E1);
+                var pos = new List<List<Expression>>();
+                pos.AddRange(CrossProduct(a.pos, b.pos));
+                pos.AddRange(CrossProduct(a.neg, b.neg));
+                var neg = new List<List<Expression>>();
+                neg.AddRange(CrossProduct(a.pos, b.neg));
+                neg.AddRange(CrossProduct(a.neg, b.pos));
+                return (pos, neg);
+            }
+
+            // x == if C then A else B  →  (C && x == A) || (!C && x == B)
+            if (op == BinaryExpr.Opcode.Eq || op == BinaryExpr.Opcode.Neq)
+            {
+                var lhs = UnwrapExpr(binF.E0);
+                var rhs = UnwrapExpr(binF.E1);
+                ITEExpr? eqIte = null;
+                Expression? eqOther = null;
+                if (rhs is ITEExpr rIte) { eqIte = rIte; eqOther = binF.E0; }
+                else if (lhs is ITEExpr lIte) { eqIte = lIte; eqOther = binF.E1; }
+                if (eqIte != null && eqOther != null)
+                {
+                    var cmpOp = op == BinaryExpr.Opcode.Eq ? "==" : "!=";
+                    var negCmpOp = op == BinaryExpr.Opcode.Eq ? "!=" : "==";
+                    var thenEq = new LeafExpression($"{ExprToString(eqOther)} {cmpOp} {ExprToString(eqIte.Thn)}");
+                    var elseEq = new LeafExpression($"{ExprToString(eqOther)} {cmpOp} {ExprToString(eqIte.Els)}");
+                    var negThenEq = new LeafExpression($"{ExprToString(eqOther)} {negCmpOp} {ExprToString(eqIte.Thn)}");
+                    var negElseEq = new LeafExpression($"{ExprToString(eqOther)} {negCmpOp} {ExprToString(eqIte.Els)}");
+                    var condFdnf = ExprToFdnfInner(eqIte.Test);
+                    // ITE branches are mutually exclusive (C and !C), so skip "both true" case.
+                    var thenArmPos = CrossProduct(condFdnf.pos, new List<List<Expression>> { new() { thenEq } });
+                    var elseArmPos = CrossProduct(condFdnf.neg, new List<List<Expression>> { new() { elseEq } });
+                    var thenArmNeg = CrossProduct(condFdnf.pos, new List<List<Expression>> { new() { negThenEq } });
+                    var elseArmNeg = CrossProduct(condFdnf.neg, new List<List<Expression>> { new() { negElseEq } });
+                    var pos = new List<List<Expression>>(thenArmPos);
+                    pos.AddRange(elseArmPos);
+                    var neg = new List<List<Expression>>(thenArmNeg);
+                    neg.AddRange(elseArmNeg);
+                    return (pos, neg);
+                }
+            }
+        }
+
+        // ITEExpr: if T then A else B  is  (T && A) || (!T && B)
+        // Branches are mutually exclusive (T and !T), so skip "both true" case.
+        if (expr is ITEExpr iteF)
+        {
+            var condFdnf = ExprToFdnfInner(iteF.Test);
+            var thenFdnf = ExprToFdnfInner(iteF.Thn);
+            var elseFdnf = ExprToFdnfInner(iteF.Els);
+            var pos = new List<List<Expression>>();
+            pos.AddRange(CrossProduct(condFdnf.pos, thenFdnf.pos));   // C && A
+            pos.AddRange(CrossProduct(condFdnf.neg, elseFdnf.pos));   // !C && B
+            var neg = new List<List<Expression>>();
+            neg.AddRange(CrossProduct(condFdnf.pos, thenFdnf.neg));   // C && !A
+            neg.AddRange(CrossProduct(condFdnf.neg, elseFdnf.neg));   // !C && !B
+            return (pos, neg);
+        }
+
+        // Exists / ForallExpr: treat as leaf (quantifier decomposition is orthogonal)
+        // LeafExpression with string-level ITE
+        if (expr is LeafExpression leafIteF)
+        {
+            var split = TrySplitStringIte(leafIteF.DafnyText);
+            if (split != null)
+            {
+                var (cond, thenBranch, elseBranch) = split.Value;
+                var condLeaf = new LeafExpression(cond);
+                var negCondLeaf = new LeafExpression($"!({cond})");
+                var condFdnf = (
+                    pos: new List<List<Expression>> { new() { condLeaf } },
+                    neg: new List<List<Expression>> { new() { negCondLeaf } }
+                );
+                var thenFdnf = ExprToFdnfInner(new LeafExpression(thenBranch));
+                var elseFdnf = ExprToFdnfInner(new LeafExpression(elseBranch));
+                // ITE branches are mutually exclusive, skip "both true" case.
+                var pos = new List<List<Expression>>();
+                pos.AddRange(CrossProduct(condFdnf.pos, thenFdnf.pos));
+                pos.AddRange(CrossProduct(condFdnf.neg, elseFdnf.pos));
+                var neg = new List<List<Expression>>();
+                neg.AddRange(CrossProduct(condFdnf.pos, thenFdnf.neg));
+                neg.AddRange(CrossProduct(condFdnf.neg, elseFdnf.neg));
+                return (pos, neg);
+            }
+        }
+
+        // LeafExpression with "X == (if C then A else B)": split equality over if-then-else
+        if (expr is LeafExpression leafEqIteF)
+        {
+            var eqSplit = TrySplitEqIte(leafEqIteF.DafnyText);
+            if (eqSplit != null)
+            {
+                var (lhs, eqOp, cond, thenBranch, elseBranch) = eqSplit.Value;
+                var condLeaf = new LeafExpression(cond);
+                var negCondLeaf = new LeafExpression($"!({cond})");
+                var condFdnf = (
+                    pos: new List<List<Expression>> { new() { condLeaf } },
+                    neg: new List<List<Expression>> { new() { negCondLeaf } }
+                );
+                var negEqOp = eqOp == "==" ? "!=" : "==";
+                var thenEq = new LeafExpression($"{lhs} {eqOp} {thenBranch}");
+                var negThenEq = new LeafExpression($"{lhs} {negEqOp} {thenBranch}");
+                var elseEq = new LeafExpression($"{lhs} {eqOp} {elseBranch}");
+                var negElseEq = new LeafExpression($"{lhs} {negEqOp} {elseBranch}");
+                // ITE branches are mutually exclusive, skip "both true" case.
+                var pos = new List<List<Expression>>();
+                pos.AddRange(CrossProduct(condFdnf.pos, new List<List<Expression>> { new() { thenEq } }));
+                pos.AddRange(CrossProduct(condFdnf.neg, new List<List<Expression>> { new() { elseEq } }));
+                var neg = new List<List<Expression>>();
+                neg.AddRange(CrossProduct(condFdnf.pos, new List<List<Expression>> { new() { negThenEq } }));
+                neg.AddRange(CrossProduct(condFdnf.neg, new List<List<Expression>> { new() { negElseEq } }));
+                return (pos, neg);
+            }
+        }
+
+        // Leaf: atomic expression
+        var leafExpr = expr;
+        return (
+            pos: new List<List<Expression>> { new() { leafExpr } },
+            neg: new List<List<Expression>> { new() { Negate(leafExpr) } }
+        );
     }
 
     // ───────────────── core recursive decomposition ──────────────────

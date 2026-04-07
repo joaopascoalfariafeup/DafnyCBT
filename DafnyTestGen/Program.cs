@@ -18,7 +18,7 @@ class Program
         outputOpt.AddAlias("-o");
         var verboseOpt = new Option<bool>("--verbose", "Show debug info (contracts, DNF, test conditions)");
         verboseOpt.AddAlias("-v");
-        var allCombOpt = new Option<bool>("--all-combinations", "Generate tests for all non-empty truth combinations of DNF clauses (2^n-1 tests)");
+        var allCombOpt = new Option<bool>("--all-combinations", "Use FDNF (Full DNF) for all meaningful truth combinations of contract clauses");
         allCombOpt.AddAlias("-a");
         var boundaryOpt = new Option<bool>("--boundary", "Generate additional tests using boundary value analysis on inputs");
         boundaryOpt.AddAlias("-b");
@@ -824,10 +824,27 @@ class Program
         for (int i = 1; i < ensuresClauses.Count; i++)
             originalDnfExprs = DnfEngine.CrossProduct(originalDnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
 
-        // Compute DNF on inlined ensures for SMT translation (decomposes if-then-else).
-        dnfExprs = DnfEngine.ExprToDnf(dnfEnsures[0]);
-        for (int i = 1; i < dnfEnsures.Count; i++)
-            dnfExprs = DnfEngine.CrossProduct(dnfExprs, DnfEngine.ExprToDnf(dnfEnsures[i]));
+        // Compute DNF/FDNF on inlined ensures for SMT translation.
+        // FDNF (Full DNF) used in all-combinations and progressive modes:
+        // each disjunction A || B produces 3 clauses (A&&B, A&&!B, !A&&B) instead of 2,
+        // giving fewer but more meaningful combinations than the 2^N bitmask approach.
+        if (allCombinations || progressive)
+        {
+            var fdnf = DnfEngine.ExprToFdnf(dnfEnsures[0]);
+            var fdnfExprs = fdnf.pos;
+            for (int i = 1; i < dnfEnsures.Count; i++)
+            {
+                var next = DnfEngine.ExprToFdnf(dnfEnsures[i]);
+                fdnfExprs = DnfEngine.CrossProduct(fdnfExprs, next.pos);
+            }
+            dnfExprs = fdnfExprs;
+        }
+        else
+        {
+            dnfExprs = DnfEngine.ExprToDnf(dnfEnsures[0]);
+            for (int i = 1; i < dnfEnsures.Count; i++)
+                dnfExprs = DnfEngine.CrossProduct(dnfExprs, DnfEngine.ExprToDnf(dnfEnsures[i]));
+        }
 
         // Build background postconditions: full (un-decomposed) ensures expressions.
         // These are asserted as background constraints to catch cases where DNF decomposition
@@ -1224,11 +1241,15 @@ class Program
             outputTiers = BoundaryAnalysis.BuildOutputTiers(outputs, mutableNames, mutableFieldsList, verbose, postLitStrings);
         }
 
-        // Helper: build schedule entries for a given mode (all-comb or simple, with or without boundary).
-        // minPopcount/maxPopcount: if > 0, only include combinations with popcount in [minPopcount, maxPopcount].
+        // Track whether FDNF was used (clauses are self-contained, no bitmask/exclusion needed)
+        bool usedFdnf = allCombinations || progressive;
+
+        // Helper: build schedule entries for a given mode.
+        // When usedFdnf is true, each clause is a complete FDNF entry (no exclusions needed).
+        // When usedFdnf is false: simple mode with per-clause exclusions.
         void BuildScheduleEntries(
             List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule,
-            bool useAllComb, bool useBoundary, int minPopcount = 0, int maxPopcount = 0)
+            bool useBoundary)
         {
             for (int pi = 0; pi < preCombinations.Count; pi++)
             {
@@ -1241,70 +1262,18 @@ class Program
                     ? boundaryTiersPerPre[pi]
                     : new List<(string, List<string>)>();
 
-                if (useAllComb)
+                for (int ci = 0; ci < dnfExprs.Count; ci++)
                 {
-                    int n = dnfExprs.Count;
-                    int totalCombinations = (1 << n) - 1;
+                    var clause = dnfExprs[ci];
+                    var label = $"{fullPreLabel}{{{ci + 1}}}";
+                    int simpleMask = 1 << ci;
 
-                    for (int mask = 1; mask <= totalCombinations; mask++)
+                    // In FDNF mode, negated literals are already in the clause — no exclusions.
+                    // In simple DNF mode, exclude other clauses' distinguishing literals.
+                    var exclusions = new List<Expression>();
+                    if (!usedFdnf)
                     {
-                        // Filter by popcount if bounds are set
-                        int pc = BitCount(mask);
-                        if (maxPopcount > 0 && pc > maxPopcount)
-                            continue;
-                        if (minPopcount > 0 && pc < minPopcount)
-                            continue;
-
-                        var included = new List<int>();
-                        for (int bit = 0; bit < n; bit++)
-                            if ((mask & (1 << bit)) != 0)
-                                included.Add(bit);
-
-                        var label = fullPreLabel + "{" + string.Join(",", included.Select(i => (i + 1).ToString())) + "}";
-
-                        var mergedLiterals = new List<Expression>();
-                        var mergedKeys = new HashSet<string>();
-                        foreach (var idx in included)
-                            foreach (var lit in dnfExprs[idx])
-                                if (mergedKeys.Add(EKey(lit)))
-                                    mergedLiterals.Add(lit);
-
-                        // Build per-clause exclusions: negate each non-selected clause as a whole.
-                        var exclusions = new List<Expression>();
-                        for (int bit = 0; bit < n; bit++)
-                        {
-                            if ((mask & (1 << bit)) != 0) continue;
-                            var clauseLits = dnfExprs[bit]
-                                .Where(lit => !commonLiteralKeys.Contains(EKey(lit)) && !mergedKeys.Contains(EKey(lit)))
-                                .ToList();
-                            if (clauseLits.Count == 1)
-                                exclusions.Add(clauseLits[0]);
-                            else if (clauseLits.Count > 1)
-                                exclusions.Add(ConjoinExprs(clauseLits));
-                        }
-
-                        // Always add the base entry (no boundary constraints).
-                        // When boundary is enabled, the base entry is solved first so that
-                        // its UNSAT result can prune all boundary-tier supersets.
-                        schedule.Add((label, mergedLiterals, fullPreLits, exclusions, new List<string>(), mask, pi));
-
-                        if (useBoundary && bTiers.Count > 0)
-                        {
-                            foreach (var (tierLabel, tierConstraints) in bTiers)
-                                schedule.Add(($"{label}/B{tierLabel}", mergedLiterals, fullPreLits, exclusions, tierConstraints, mask, pi));
-                        }
-                    }
-                }
-                else
-                {
-                    for (int ci = 0; ci < dnfExprs.Count; ci++)
-                    {
-                        var clause = dnfExprs[ci];
-                        var label = $"{fullPreLabel}{ci + 1}";
-                        int simpleMask = 1 << ci; // single clause = single bit
                         var clauseKeys = new HashSet<string>(clause.Select(EKey));
-
-                        var exclusions = new List<Expression>();
                         for (int oi = 0; oi < dnfExprs.Count; oi++)
                         {
                             if (oi == ci) continue;
@@ -1316,16 +1285,18 @@ class Program
                             else if (clauseLits.Count > 1)
                                 exclusions.Add(ConjoinExprs(clauseLits));
                         }
+                    }
 
-                        if (useBoundary && bTiers.Count > 0)
-                        {
-                            foreach (var (tierLabel, tierConstraints) in bTiers)
-                                schedule.Add(($"{label}/B{tierLabel}", clause, fullPreLits, exclusions, tierConstraints, simpleMask, pi));
-                        }
-                        else
-                        {
-                            schedule.Add((label, clause, fullPreLits, exclusions, new List<string>(), simpleMask, pi));
-                        }
+                    if (useBoundary && bTiers.Count > 0)
+                    {
+                        // Add base entry first (for UNSAT pruning of boundary tiers)
+                        schedule.Add((label, clause, fullPreLits, exclusions, new List<string>(), simpleMask, pi));
+                        foreach (var (tierLabel, tierConstraints) in bTiers)
+                            schedule.Add(($"{label}/B{tierLabel}", clause, fullPreLits, exclusions, tierConstraints, simpleMask, pi));
+                    }
+                    else
+                    {
+                        schedule.Add((label, clause, fullPreLits, exclusions, new List<string>(), simpleMask, pi));
                     }
                 }
             }
@@ -1667,52 +1638,15 @@ class Program
             int n = dnfExprs.Count;
             var phaseStart = DateTime.UtcNow;
 
-            // --- Phase 1: tier-by-tier escalation ---
-            // Tier 1 (singletons) always runs.
-            // Higher tiers run only if clause count allows and time budget permits.
-            // Thresholds: pairs if n<=10, triples if n<=8, full combos if n<=5.
-            int maxTier = n; // upper bound on popcount
-            if (n > 10) maxTier = 1;      // many clauses: singletons only
-            else if (n > 8) maxTier = 2;  // pairs at most
-            else if (n > 5) maxTier = 3;  // up to triples
-            // else: full combinations (n <= 5)
+            // --- Phase 1: solve all FDNF entries ---
+            // With FDNF, each clause is a complete conjunction (including negated literals),
+            // so we solve them all directly — no tier escalation needed.
+            Console.WriteLine($"  Phase 1: {n} FDNF clauses");
 
-            Console.WriteLine($"  Phase 1: {n} clauses, max tier {maxTier}" +
-                (maxTier < n ? $" (capped from {(1 << n) - 1} combinations)" : $" ({(1 << n) - 1} combinations)"));
+            BuildScheduleEntries(testSchedule, useBoundary: false);
 
-            for (int tier = 1; tier <= maxTier; tier++)
-            {
-                if (TimedOut()) break;
-                if (maxTests > 0 && testCases.Count >= maxTests) break;
-
-                // Time budget check: for tier > 1, check that previous tiers used less than
-                // 50% of remaining time. This prevents slow Z3 queries from wasting time on
-                // higher-order combinations that are even more complex.
-                if (tier > 1)
-                {
-                    var elapsed = DateTime.UtcNow - phaseStart;
-                    var remaining = deadline - DateTime.UtcNow;
-                    if (elapsed > remaining)
-                    {
-                        Console.WriteLine($"  Tier {tier}: skipped (time budget exhausted)");
-                        break;
-                    }
-                }
-
-                int schedStart = testSchedule.Count;
-                BuildScheduleEntries(testSchedule, useAllComb: true, useBoundary: false,
-                    minPopcount: tier, maxPopcount: tier);
-                int tierEntries = testSchedule.Count - schedStart;
-                if (tierEntries == 0) continue;
-
-                SortScheduleByPopcount(testSchedule, schedStart, testSchedule.Count);
-
-                if (verbose || tier == 1 || tierEntries > 0)
-                    Console.WriteLine($"  Tier {tier} ({TierLabel(tier)}): {tierEntries} entries");
-
-                await SolveRange(testSchedule, schedStart, testSchedule.Count, testSchedule.Count,
-                    testCases, baseConditionExclusions, knownUnsatLiteralMasks);
-            }
+            await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count,
+                testCases, baseConditionExclusions, knownUnsatLiteralMasks);
 
             if (!verbose) Console.Write("\r                          \r"); // clear progress line
             Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
@@ -1720,17 +1654,15 @@ class Program
             if (testCases.Count < minTests && boundaryTiersPerPre.Count > 0
                 && n <= 10 && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
             {
-                // --- Phase 2: add boundary tiers (singletons only, for efficiency) ---
+                // --- Phase 2: add boundary tiers ---
                 int phase2Start = testSchedule.Count;
-                BuildScheduleEntries(testSchedule, useAllComb: true, useBoundary: true,
-                    minPopcount: 1, maxPopcount: 1);
+                BuildScheduleEntries(testSchedule, useBoundary: true);
                 // Keep only boundary-tier entries (base entries are already in Phase 1)
                 for (int i = testSchedule.Count - 1; i >= phase2Start; i--)
                 {
                     if (testSchedule[i].extraConstraints.Count == 0)
                         testSchedule.RemoveAt(i);
                 }
-                SortScheduleByPopcount(testSchedule, phase2Start, testSchedule.Count);
                 int newEntries = testSchedule.Count - phase2Start;
                 Console.WriteLine($"  Phase 2: adding boundary analysis ({newEntries} new entries)");
 
@@ -1840,12 +1772,12 @@ class Program
         else
         {
             // Non-progressive: build schedule with the given flags and solve all at once
-            BuildScheduleEntries(testSchedule, allCombinations, boundary);
+            BuildScheduleEntries(testSchedule, useBoundary: boundary);
             SortScheduleByPopcount(testSchedule, 0, testSchedule.Count);
             if (allCombinations)
             {
                 int n = dnfExprs.Count;
-                Console.WriteLine($"  All-combinations mode: {n} post clauses -> {(1 << n) - 1} combinations");
+                Console.WriteLine($"  FDNF mode: {n} clauses");
             }
             if (boundary && boundaryTiersPerPre.Count > 0)
                 Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
