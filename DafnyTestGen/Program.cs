@@ -768,25 +768,12 @@ class Program
         List<List<Expression>> dnfExprs;
         List<Expression> backgroundPostconditions;
 
-        dnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
-        for (int i = 1; i < ensuresClauses.Count; i++)
-            dnfExprs = DnfEngine.CrossProduct(dnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
-
-        // Build background postconditions: full (un-decomposed) ensures expressions.
-        // These are asserted as background constraints to catch cases where DNF decomposition
-        // loses quantifier range guards (e.g., forall vacuously true at boundary values).
-        backgroundPostconditions = hasNonInlinableFuncs
-            ? new List<Expression>()
-            : new List<Expression>(ensuresClauses);
-
-        // Keep original DNF for expect emission, create inlined version for SMT translation.
-        // Skip predicates with built-in SMT handlers (e.g., IsSorted) to preserve patterns
-        // that the SMT translator recognizes.
-        var originalDnfExprs = dnfExprs;
+        // Inline predicates BEFORE DNF conversion so that if-then-else inside
+        // predicate bodies gets decomposed into separate DNF clauses.
+        // Skip predicates with built-in SMT handlers (e.g., IsSorted).
         var smtBuiltins = new HashSet<string> { "IsSorted" };
-        // Always compute predsToInline for preconditions (even when hasNonInlinableFuncs),
-        // but only inline postconditions when there are no non-inlinable functions.
         List<(string name, List<string> paramNames, string body, bool isClassMember)>? predsToInline = null;
+        var dnfEnsures = new List<Expression>(ensuresClauses);
         if (inlinablePredicates != null && inlinablePredicates.Count > 0)
         {
             predsToInline = inlinablePredicates
@@ -794,12 +781,31 @@ class Program
                 .ToList();
             if (predsToInline.Count > 0)
             {
-                backgroundPostconditions = backgroundPostconditions
+                dnfEnsures = dnfEnsures
                     .Select(e => InlineExpr(e, predsToInline)).ToList();
-                dnfExprs = dnfExprs.Select(clause =>
-                    clause.Select(lit => InlineExpr(lit, predsToInline)).ToList()
-                ).ToList();
             }
+        }
+
+        // Compute DNF on un-inlined ensures for expect emission (preserves predicate names).
+        var originalDnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
+        for (int i = 1; i < ensuresClauses.Count; i++)
+            originalDnfExprs = DnfEngine.CrossProduct(originalDnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
+
+        // Compute DNF on inlined ensures for SMT translation (decomposes if-then-else).
+        dnfExprs = DnfEngine.ExprToDnf(dnfEnsures[0]);
+        for (int i = 1; i < dnfEnsures.Count; i++)
+            dnfExprs = DnfEngine.CrossProduct(dnfExprs, DnfEngine.ExprToDnf(dnfEnsures[i]));
+
+        // Build background postconditions: full (un-decomposed) ensures expressions.
+        // These are asserted as background constraints to catch cases where DNF decomposition
+        // loses quantifier range guards (e.g., forall vacuously true at boundary values).
+        backgroundPostconditions = hasNonInlinableFuncs
+            ? new List<Expression>()
+            : new List<Expression>(ensuresClauses);
+        if (predsToInline != null && predsToInline.Count > 0)
+        {
+            backgroundPostconditions = backgroundPostconditions
+                .Select(e => InlineExpr(e, predsToInline)).ToList();
         }
 
         var preClauses = method.Req.Select(r => r.E).ToList();

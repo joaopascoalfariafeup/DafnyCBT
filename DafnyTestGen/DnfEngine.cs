@@ -273,9 +273,146 @@ static class DnfEngine
                 return decomposed;
         }
 
+        // LeafExpression with "if C then A else B": split into DNF at string level.
+        // This handles predicate inlining that produces if-then-else text strings.
+        if (expr is LeafExpression leafIte)
+        {
+            var split = TrySplitStringIte(leafIte.DafnyText);
+            if (split != null)
+            {
+                var (cond, thenBranch, elseBranch) = split.Value;
+                var condLeaf = new LeafExpression(cond);
+                var negCond = new LeafExpression($"!({cond})");
+                if (!negated)
+                {
+                    var thenClauses = CrossProduct(
+                        new List<List<Expression>> { new() { condLeaf } },
+                        ExprToDnfInner(new LeafExpression(thenBranch), false));
+                    var elseClauses = CrossProduct(
+                        new List<List<Expression>> { new() { negCond } },
+                        ExprToDnfInner(new LeafExpression(elseBranch), false));
+                    var result = new List<List<Expression>>(thenClauses);
+                    result.AddRange(elseClauses);
+                    return result;
+                }
+                else
+                {
+                    // !(if C then A else B) = (C && !A) || (!C && !B)
+                    var thenClauses = CrossProduct(
+                        new List<List<Expression>> { new() { condLeaf } },
+                        ExprToDnfInner(new LeafExpression(thenBranch), true));
+                    var elseClauses = CrossProduct(
+                        new List<List<Expression>> { new() { negCond } },
+                        ExprToDnfInner(new LeafExpression(elseBranch), true));
+                    var result = new List<List<Expression>>(thenClauses);
+                    result.AddRange(elseClauses);
+                    return result;
+                }
+            }
+        }
+
         // Leaf: atomic expression (return as-is, or wrapped in negation)
         var leaf = negated ? Negate(expr) : expr;
         return new List<List<Expression>> { new List<Expression> { leaf } };
+    }
+
+    // ───────── string-level if-then-else splitting ─────────
+
+    /// <summary>
+    /// Tries to split a Dafny string expression of the form "if C then A else B"
+    /// into its condition, then-branch, and else-branch, handling nested ifs and
+    /// balanced parentheses. Returns null if the expression doesn't match.
+    /// </summary>
+    static (string cond, string thenBranch, string elseBranch)? TrySplitStringIte(string text)
+    {
+        text = text.Trim();
+        // Strip outer parentheses if present: (if C then A else B) → if C then A else B
+        while (text.StartsWith("(") && text.EndsWith(")"))
+        {
+            var inner = text.Substring(1, text.Length - 2).Trim();
+            if (inner.StartsWith("if "))
+                text = inner;
+            else
+                break;
+        }
+        if (!text.StartsWith("if "))
+            return null;
+
+        // Find the "then" keyword at the top level (not nested in parens/ifs)
+        var thenIdx = FindTopLevelKeyword(text, "then", 3);
+        if (thenIdx < 0) return null;
+
+        var cond = text.Substring(3, thenIdx - 3).Trim();
+        var afterThen = text.Substring(thenIdx + 4).Trim();
+
+        // Find the "else" keyword at the top level of the then-branch.
+        // Must skip nested if-then-else expressions.
+        var elseIdx = FindTopLevelKeyword(afterThen, "else", 0);
+        if (elseIdx < 0) return null;
+
+        var thenBranch = afterThen.Substring(0, elseIdx).Trim();
+        var elseBranch = afterThen.Substring(elseIdx + 4).Trim();
+
+        return (cond, thenBranch, elseBranch);
+    }
+
+    /// <summary>
+    /// Finds the index of a keyword at the top level of a Dafny expression string,
+    /// skipping over parenthesized sub-expressions and nested if-then-else blocks.
+    /// Returns -1 if not found.
+    /// </summary>
+    static int FindTopLevelKeyword(string text, string keyword, int startIdx)
+    {
+        int depth = 0;   // parenthesis depth
+        int ifDepth = 0; // nested if-then-else depth
+        int i = startIdx;
+        while (i <= text.Length - keyword.Length)
+        {
+            var ch = text[i];
+            if (ch == '(') { depth++; i++; continue; }
+            if (ch == ')') { depth--; i++; continue; }
+
+            if (depth == 0)
+            {
+                // Track nested if-then-else (only when not inside parens)
+                if (i + 3 <= text.Length && text.Substring(i, 3) == "if " && ifDepth >= 0)
+                {
+                    if (keyword != "then" || ifDepth > 0)
+                        ifDepth++;
+                    i += 3;
+                    continue;
+                }
+                if (i + 5 <= text.Length && text.Substring(i, 5) == "then ")
+                {
+                    if (keyword == "then" && ifDepth == 0)
+                        return i;
+                    i += 5;
+                    continue;
+                }
+                if (i + 5 <= text.Length && text.Substring(i, 5) == "else ")
+                {
+                    if (ifDepth > 0) { ifDepth--; i += 5; continue; }
+                    if (keyword == "else")
+                        return i;
+                    i += 5;
+                    continue;
+                }
+
+                // Check for exact keyword match at word boundary
+                if (text.Substring(i).StartsWith(keyword) &&
+                    (i + keyword.Length >= text.Length || !char.IsLetterOrDigit(text[i + keyword.Length])) &&
+                    (i == 0 || !char.IsLetterOrDigit(text[i - 1])))
+                {
+                    if (keyword == "then" && ifDepth == 0)
+                        return i;
+                    if (keyword == "else" && ifDepth == 0)
+                        return i;
+                }
+            }
+
+            i++;
+        }
+        return -1;
     }
 
     // ───────── quantifier decomposition (AST-based) ─────────
