@@ -806,22 +806,28 @@ static class DnfEngine
         var loPlus1 = MakeAdd(lo, 1);
         var hiMinus1 = MakeSub(hi, 1);
 
-        // Clause 1 (left boundary): property[k := lo]
+        // Guard: lo < hi ensures the range is non-empty.
+        // Without this, P(lo) or P(hi-1) could be satisfiable even when the
+        // original exists is vacuously false (empty range).
+        var rangeGuard = ParseToLeafExpression($"{ExprToString(lo)} < {ExprToString(hi)}");
+
+        // Clause 1 (left boundary): lo < hi && property[k := lo]
         var leftProp = SubstituteVar(property, boundVar.Name, lo);
 
         // Clause 2 (middle): keep as exists with narrowed range (as string, for now)
         // Build: exists k :: lo+1 <= k < hi-1 && property
+        // (range non-emptiness is implicit: if lo+1 >= hi-1 the exists is vacuously false → UNSAT)
         var middleStr = $"exists {boundVar.Name} :: {ExprToString(loPlus1)} <= {boundVar.Name} < {ExprToString(hiMinus1)} && {ExprToString(property)}";
         var middleExpr = ParseToLeafExpression(middleStr);
 
-        // Clause 3 (right boundary): property[k := hi-1]
+        // Clause 3 (right boundary): lo < hi && property[k := hi-1]
         var rightProp = SubstituteVar(property, boundVar.Name, hiMinus1);
 
         return new List<List<Expression>>
         {
-            new List<Expression> { leftProp },
+            new List<Expression> { rangeGuard, leftProp },
             new List<Expression> { middleExpr },
-            new List<Expression> { rightProp }
+            new List<Expression> { rangeGuard, rightProp }
         };
     }
 
