@@ -832,16 +832,53 @@ class Program
         // FDNF (Full DNF) used in all-combinations and progressive modes:
         // each disjunction A || B produces 3 clauses (A&&B, A&&!B, !A&&B) instead of 2,
         // giving fewer but more meaningful combinations than the 2^N bitmask approach.
+        const int fdnfClauseLimit = 200;
+        bool usedFdnf = false;
         if (allCombinations || progressive)
         {
-            var fdnf = DnfEngine.ExprToFdnf(dnfEnsures[0]);
-            var fdnfExprs = fdnf.pos;
-            for (int i = 1; i < dnfEnsures.Count; i++)
+            // Compute per-ensures FDNF, checking limits at each step
+            var fdnfPerEnsures = new List<List<List<Expression>>>();
+            List<List<Expression>>? fdnfExprs = null;
+            bool fdnfOverflow = false;
+            for (int i = 0; i < dnfEnsures.Count; i++)
             {
-                var next = DnfEngine.ExprToFdnf(dnfEnsures[i]);
-                fdnfExprs = DnfEngine.CrossProductPruned(fdnfExprs, next.pos);
+                var fdnf = DnfEngine.ExprToFdnf(dnfEnsures[i]);
+                fdnfPerEnsures.Add(fdnf.pos);
+                if (progressive && fdnf.pos.Count > fdnfClauseLimit)
+                {
+                    if (verbose) Console.WriteLine($"  FDNF ensures[{i}]: {fdnf.pos.Count} clauses (exceeds limit)");
+                    fdnfOverflow = true;
+                    break;
+                }
             }
-            dnfExprs = fdnfExprs;
+            if (!fdnfOverflow)
+            {
+                fdnfExprs = fdnfPerEnsures[0];
+                for (int i = 1; i < fdnfPerEnsures.Count; i++)
+                {
+                    fdnfExprs = DnfEngine.CrossProductPruned(fdnfExprs, fdnfPerEnsures[i]);
+                    if (progressive && fdnfExprs.Count > fdnfClauseLimit)
+                    {
+                        if (verbose) Console.WriteLine($"  FDNF cross-product after ensures[{i}]: {fdnfExprs.Count} clauses (exceeds limit)");
+                        fdnfOverflow = true;
+                        fdnfExprs = null;
+                        break;
+                    }
+                }
+            }
+            if (fdnfOverflow && verbose)
+                Console.WriteLine($"  FDNF exceeded {fdnfClauseLimit} clauses, falling back to simple DNF");
+            if (fdnfExprs != null)
+            {
+                dnfExprs = fdnfExprs;
+                usedFdnf = true;
+            }
+            else
+            {
+                dnfExprs = DnfEngine.ExprToDnf(dnfEnsures[0]);
+                for (int i = 1; i < dnfEnsures.Count; i++)
+                    dnfExprs = DnfEngine.CrossProductPruned(dnfExprs, DnfEngine.ExprToDnf(dnfEnsures[i]));
+            }
         }
         else
         {
@@ -1271,8 +1308,7 @@ class Program
             outputTiers = BoundaryAnalysis.BuildOutputTiers(outputs, mutableNames, mutableFieldsList, verbose, postLitStrings);
         }
 
-        // Track whether FDNF was used (clauses are self-contained, no bitmask/exclusion needed)
-        bool usedFdnf = allCombinations || progressive;
+        // usedFdnf (set above) tracks whether FDNF was used (clauses are self-contained, no bitmask/exclusion needed)
 
         // Helper: build schedule entries for a given mode.
         // When usedFdnf is true, each clause is a complete FDNF entry (no exclusions needed).
@@ -1671,7 +1707,7 @@ class Program
             // --- Phase 1: solve all FDNF entries ---
             // With FDNF, each clause is a complete conjunction (including negated literals),
             // so we solve them all directly — no tier escalation needed.
-            Console.WriteLine($"  Phase 1: {n} FDNF clauses");
+            Console.WriteLine($"  Phase 1: {n} {(usedFdnf ? "FDNF" : "DNF")} clauses");
 
             BuildScheduleEntries(testSchedule, useBoundary: false);
 
@@ -1703,7 +1739,8 @@ class Program
             }
 
             if (outputTiers.Count > 0
-                && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
+                && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests)
+                && (!progressive || testCases.Count < minTests))
             {
                 // --- Phase 2b: output boundary tiers ---
                 int phase2bStart = testSchedule.Count;
@@ -1887,11 +1924,12 @@ class Program
             }
             else
             {
+                var seen = new HashSet<string>();
                 litStrings = tc.literals.Select(e =>
                 {
                     var s = EKey(e);
                     return inlinedToOriginal.TryGetValue(s, out var orig) ? orig : s;
-                }).ToList();
+                }).Where(s => seen.Add(s)).ToList();
             }
 
             var key = string.Join("|", inputs.Select(inp =>

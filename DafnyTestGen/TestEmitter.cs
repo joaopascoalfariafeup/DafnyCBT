@@ -824,21 +824,22 @@ static class TestEmitter
                     }
                     else if (TypeUtils.IsSeqType(fType) || TypeUtils.IsSetType(fType) || TypeUtils.IsMultisetType(fType) || TypeUtils.IsMapType(fType))
                     {
-                        // Collection field: emit via EmitVarDecl with proper key remapping
+                        // Collection field: assign literal directly (no tmp var needed)
                         var emitValues = new Dictionary<string, string>(values);
                         var isMut = mutableNames != null && mutableNames.Contains(fieldName);
                         var prefix = isMut ? $"{fieldName}_pre" : fieldName;
-                        // Remap collection keys from field prefix to tmp name
                         foreach (var suffix in new[] { "_len", "_elems", "_card", "_members", "_keys", "_vals" })
                         {
                             if (values.TryGetValue(prefix + suffix, out var v))
-                            {
-                                emitValues[$"tmp_{fieldName}" + suffix] = v;
                                 emitValues[fieldName + suffix] = v;
-                            }
                         }
-                        sb.AppendLine(EmitVarDecl($"tmp_{fieldName}", fType, emitValues, enumDatatypes));
-                        sb.AppendLine($"    obj.{fieldName} := tmp_{fieldName};");
+                        // Extract RHS literal from EmitVarDecl output ("    var name: type := RHS;")
+                        var declLine = EmitVarDecl(fieldName, fType, emitValues, enumDatatypes);
+                        var rhsMatch = System.Text.RegularExpressions.Regex.Match(declLine, @":=\s*(.+);$");
+                        if (rhsMatch.Success)
+                            sb.AppendLine($"    obj.{fieldName} := {rhsMatch.Groups[1].Value};");
+                        else
+                            sb.AppendLine($"    obj.{fieldName} := {declLine.Trim()};"); // fallback
                     }
                     else
                     {

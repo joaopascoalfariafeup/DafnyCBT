@@ -65,7 +65,12 @@ static class DnfEngine
                 var checkLits = extraLits != null
                     ? merged.Concat(extraLits).ToList() : merged;
                 if (FindContradiction(checkLits) == null)
+                {
+                    // Deduplicate literals in the merged clause
+                    var seen = new HashSet<string>();
+                    merged = merged.Where(e => seen.Add(ExprToString(e))).ToList();
                     result.Add(merged);
+                }
             }
         }
         return result;
@@ -964,24 +969,16 @@ static class DnfEngine
         // Convert all literals to string keys for complement checking
         var litKeys = literals.Select(ExprToString).ToList();
 
-        // 1. Direct complement detection: L and !(L)
-        var positiveSet = new HashSet<string>();
-        var negativeSet = new HashSet<string>(); // stores the inner expression of !(...)
+        // 1. Direct complement detection
+        // Detects: L ∧ !(L), L ∧ !L, X in Y ∧ X !in Y, X == Y ∧ X != Y, etc.
+        var allLits = new HashSet<string>();
         foreach (var key in litKeys)
         {
-            if (key.StartsWith("!(") && key.EndsWith(")"))
-            {
-                var inner = key.Substring(2, key.Length - 3);
-                negativeSet.Add(inner);
-                if (positiveSet.Contains(inner))
-                    return $"complement: {inner} ∧ !({inner})";
-            }
-            else
-            {
-                positiveSet.Add(key);
-                if (negativeSet.Contains(key))
-                    return $"complement: {key} ∧ !({key})";
-            }
+            // Check if the operator-negated form of this literal is already present
+            var negated = NegateOperatorInLiteral(key);
+            if (negated != null && allLits.Contains(negated))
+                return $"complement: {negated} ∧ {key}";
+            allLits.Add(key);
         }
 
         // 2 & 3. Relational contradiction detection via AST analysis
@@ -1221,6 +1218,67 @@ static class DnfEngine
         if (s.StartsWith("- "))
             s = "-" + s.Substring(2);
         return double.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out value);
+    }
+
+    /// <summary>
+    /// Returns the complement of a literal by negating its operator, or null if not recognized.
+    /// Handles: !(expr) ↔ expr, !X ↔ X, X in Y ↔ X !in Y, X == Y ↔ X != Y,
+    /// X &lt; Y ↔ X &gt;= Y, X &gt; Y ↔ X &lt;= Y.
+    /// </summary>
+    static string? NegateOperatorInLiteral(string key)
+    {
+        // !( expr ) ↔ expr
+        if (key.StartsWith("!(") && key.EndsWith(")"))
+            return key.Substring(2, key.Length - 3);
+        // !X ↔ X  (for simple identifiers/calls like !success, !prime(n))
+        if (key.StartsWith("!") && key.Length > 1 && char.IsLetterOrDigit(key[1]))
+            return key.Substring(1);
+
+        // Operator complement pairs (matched at top level only, not inside parentheses)
+        var pairs = new[] {
+            (" in ", " !in "),
+            (" == ", " != "),
+            (" < ", " >= "),
+            (" > ", " <= "),
+            (" <= ", " > "),
+            (" >= ", " < "),
+        };
+        foreach (var (op, negOp) in pairs)
+        {
+            // Find the operator at top level (not inside parens/brackets)
+            int idx = FindTopLevelOperator(key, op);
+            if (idx >= 0)
+                return key.Substring(0, idx) + negOp + key.Substring(idx + op.Length);
+            // Also check the reverse direction
+            idx = FindTopLevelOperator(key, negOp);
+            if (idx >= 0)
+                return key.Substring(0, idx) + op + key.Substring(idx + negOp.Length);
+        }
+
+        // expr → !(expr)  (generic negation for anything without a recognized operator)
+        if (!key.StartsWith("!"))
+            return "!(" + key + ")";
+
+        return null;
+    }
+
+    /// <summary>
+    /// Find the first occurrence of an operator string at the top level
+    /// (not nested inside parentheses, brackets, or braces).
+    /// Returns the index, or -1 if not found.
+    /// </summary>
+    static int FindTopLevelOperator(string s, string op)
+    {
+        int depth = 0;
+        for (int i = 0; i <= s.Length - op.Length; i++)
+        {
+            char c = s[i];
+            if (c == '(' || c == '[' || c == '{') depth++;
+            else if (c == ')' || c == ']' || c == '}') depth--;
+            else if (depth == 0 && s.Substring(i, op.Length) == op)
+                return i;
+        }
+        return -1;
     }
 
     // ──────────── SplitTopLevel (kept for backward compat) ──────────────

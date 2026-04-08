@@ -249,7 +249,6 @@ static class DafnyParser
         // This handles cases like AllPrime(f) calling IsPrime(f[i]).
         // After substitution, the caller no longer references other predicates.
         var nameSet = new HashSet<string>(result.Select(r => r.name));
-        var byName = result.ToDictionary(r => r.name, r => r);
         var substituted = new List<(string name, List<string> paramNames, string body, bool isClassMember)>();
         foreach (var r in result)
         {
