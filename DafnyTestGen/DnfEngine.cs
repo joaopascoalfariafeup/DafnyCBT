@@ -265,7 +265,21 @@ static class DnfEngine
             return (pos, neg);
         }
 
-        // Exists / ForallExpr: treat as leaf (quantifier decomposition is orthogonal)
+        // Exists quantifier: decompose into boundary cases (pos only, as simple disjunction)
+        if (expr is ExistsExpr existsFdnf)
+        {
+            var decomposed = TryDecomposeExists(existsFdnf);
+            if (decomposed != null)
+                return (decomposed, new List<List<Expression>> { new() { Negate(expr) } });
+        }
+        // Forall: neg decomposes as exists-not
+        if (expr is ForallExpr forallFdnf)
+        {
+            var decomposed = TryDecomposeNegatedForall(forallFdnf);
+            if (decomposed != null)
+                return (new List<List<Expression>> { new() { expr } }, decomposed);
+        }
+
         // LeafExpression with string-level ITE
         if (expr is LeafExpression leafIteF)
         {
@@ -721,14 +735,38 @@ static class DnfEngine
         {
             var c = Unwrap(conjuncts[i]);
 
+            // Pattern: ChainingExpression  lo <= k < hi  (3 operands, 2 operators)
+            if (c is ChainingExpression chain
+                && chain.Operands.Count == 3
+                && chain.Operators.Count == 2
+                && ReferencesVar(chain.Operands[1], boundVar.Name)
+                && !ReferencesVar(chain.Operands[0], boundVar.Name)
+                && !ReferencesVar(chain.Operands[2], boundVar.Name))
+            {
+                // Extract lo from first comparison: Operands[0] op0 k
+                if (chain.Operators[0] == BinaryExpr.Opcode.Le
+                    || chain.Operators[0] == BinaryExpr.Opcode.Lt)
+                {
+                    lo = chain.Operands[0];
+                    loIdx = i;
+                }
+                // Extract hi from second comparison: k op1 Operands[2]
+                if (chain.Operators[1] == BinaryExpr.Opcode.Lt
+                    || chain.Operators[1] == BinaryExpr.Opcode.Le)
+                {
+                    hi = chain.Operands[2];
+                    hiIdx = i; // same index — both bounds come from same conjunct
+                }
+            }
+
             // Pattern: lo <= k  (or equivalently k >= lo)
-            if (c is BinaryExpr { Op: BinaryExpr.Opcode.Le } leq
+            if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Le } leq
                 && ReferencesVar(leq.E1, boundVar.Name) && !ReferencesVar(leq.E0, boundVar.Name))
             {
                 lo = leq.E0;
                 loIdx = i;
             }
-            else if (c is BinaryExpr { Op: BinaryExpr.Opcode.Ge } geq
+            else if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Ge } geq
                 && ReferencesVar(geq.E0, boundVar.Name) && !ReferencesVar(geq.E1, boundVar.Name))
             {
                 lo = geq.E1;
@@ -736,21 +774,18 @@ static class DnfEngine
             }
 
             // Pattern: k < hi  (or equivalently hi > k)
-            if (c is BinaryExpr { Op: BinaryExpr.Opcode.Lt } lt
+            if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Lt } lt
                 && ReferencesVar(lt.E0, boundVar.Name) && !ReferencesVar(lt.E1, boundVar.Name))
             {
                 hi = lt.E1;
                 hiIdx = i;
             }
-            else if (c is BinaryExpr { Op: BinaryExpr.Opcode.Gt } gt
+            else if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Gt } gt
                 && ReferencesVar(gt.E1, boundVar.Name) && !ReferencesVar(gt.E0, boundVar.Name))
             {
                 hi = gt.E0;
                 hiIdx = i;
             }
-
-            // Pattern: chain comparison  lo <= k < hi  (parsed as (lo <= k) < hi in some cases,
-            // but Dafny AST typically decomposes chains)
         }
 
         if (lo == null || hi == null)
