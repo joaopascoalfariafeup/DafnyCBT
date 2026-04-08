@@ -491,6 +491,9 @@ static class TestValidator
                 // old(name[..]) → needs slice
                 foreach (Match om in Regex.Matches(post, @"\bold\((\w+)\[\.\.\]\)"))
                     neededOldVars[om.Groups[1].Value] = true;
+                // old(name[indexExpr]) → needs slice (array element access)
+                foreach (Match om in Regex.Matches(post, @"\bold\((\w+)\[[^\]]+\]\)"))
+                    neededOldVars[om.Groups[1].Value] = true;
                 // old(name) → plain capture (don't override if already marked as slice)
                 foreach (Match om in Regex.Matches(post, @"\bold\((\w+)\)"))
                     if (!neededOldVars.ContainsKey(om.Groups[1].Value))

@@ -907,10 +907,12 @@ class Program
         var doubleSlice = new Regex(@"\w+\[\.\.?\][^=]*\[\.\.(?!\])");
         if (allInlinedLiterals.Any(lit => varSliceMultiset.IsMatch(lit) || doubleSlice.IsMatch(lit)))
         {
-            Console.WriteLine($"  Skipping: contracts contain multiset or quantifiers on variable-indexed " +
-                $"sequence slices (after predicate inlining), which are unsolvable in SMT");
-            Console.WriteLine();
-            return "";
+            Console.WriteLine($"  Note: postconditions contain unsolvable SMT patterns (multiset/variable-indexed slices)");
+            Console.WriteLine($"  Falling back to precondition-only test generation with postcondition runtime checks");
+            // Fall back: generate inputs from preconditions only, check postconditions at runtime
+            dnfExprs = new List<List<Expression>> { new List<Expression>() }; // single trivial "true" clause
+            backgroundPostconditions = new List<Expression>(); // don't assert postconditions in SMT
+            hasNonInlinableFuncs = true; // force full postcondition expects in emitted tests
         }
 
         // Collect input/output variable info
