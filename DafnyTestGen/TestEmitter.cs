@@ -1287,6 +1287,10 @@ static class TestEmitter
                 }
                 else if (trustZ3Values && values.TryGetValue(outp.Name, out var val) && !TypeUtils.IsSeqType(typeStr) && !TypeUtils.IsArrayType(typeStr) && !TypeUtils.IsSetType(typeStr) && !TypeUtils.IsMultisetType(typeStr))
                 {
+                    // Map enum datatype ordinals to constructor names
+                    if (enumDatatypes != null && enumDatatypes.TryGetValue(typeStr, out var outEnumCtors)
+                        && int.TryParse(val, out var outOrd) && outOrd >= 0 && outOrd < outEnumCtors.Count)
+                        val = outEnumCtors[outOrd];
                     // Ensure real output values have a decimal point
                     if (typeStr == "real" && !val.Contains('.'))
                         val += ".0";
@@ -1504,21 +1508,29 @@ static class TestEmitter
                         else
                             elems = Enumerable.Range(0, postLen).Select(_ => "0").ToArray();
 
-                        string arrayLiteral;
+                        // Map element values to correct Dafny types (same as input arrays)
+                        if (elemType == "real")
+                            elems = elems.Select(e => e.Contains('.') ? e : e + ".0").ToArray();
+                        if (elemType == "bool")
+                            elems = elems.Select(e => e == "true" ? "true" : "false").ToArray();
                         if (elemType == "char")
-                        {
-                            var charElems = elems.Take(postLen).Select(e =>
+                            elems = elems.Select(e =>
                             {
                                 if (int.TryParse(e, out var code) && code >= 32 && code < 127 && code != '\'' && code != '\\')
                                     return $"'{(char)code}'";
-                                return $"'\\U{{{(int.TryParse(e, out var c) ? c : 0):X4}}}'";
-                            });
-                            arrayLiteral = $"[{string.Join(", ", charElems)}]";
-                        }
-                        else
-                        {
-                            arrayLiteral = $"[{string.Join(", ", elems.Take(postLen))}]";
-                        }
+                                if (int.TryParse(e, out var c))
+                                    return $"'\\U{{{c:X4}}}'";
+                                return e;
+                            }).ToArray();
+                        if (enumDatatypes != null && enumDatatypes.TryGetValue(elemType, out var postEnumCtors))
+                            elems = elems.Select(e =>
+                            {
+                                if (int.TryParse(e, out var ord) && ord >= 0 && ord < postEnumCtors.Count)
+                                    return postEnumCtors[ord];
+                                return postEnumCtors[0];
+                            }).ToArray();
+
+                        var arrayLiteral = $"[{string.Join(", ", elems.Take(postLen))}]";
                         if (isUnique)
                             sb.AppendLine($"    expect {inp.Name}[..] == {arrayLiteral};");
                         else

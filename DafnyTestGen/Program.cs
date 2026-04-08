@@ -794,25 +794,29 @@ class Program
         // if-then-else branch structure for DNF decomposition.
         // This produces clauses like (|a|==0 && diff==a) vs (|a|>0 && a[last] in b && ...)
         // even though inner recursive calls remain opaque.
-        var postFuncCalls = new HashSet<string>();
+        // Applied to both preconditions and postconditions.
+        var contractFuncCalls = new HashSet<string>();
         foreach (var ens in method.Ens)
             foreach (var name in FindFunctionCalls(ens.E))
-                postFuncCalls.Add(name);
-        var recursiveFuncsInPost = (recursiveFunctions ?? new())
-            .Where(f => postFuncCalls.Contains(f.name))
+                contractFuncCalls.Add(name);
+        foreach (var req in method.Req)
+            foreach (var name in FindFunctionCalls(req.E))
+                contractFuncCalls.Add(name);
+        var recursiveFuncsInContracts = (recursiveFunctions ?? new())
+            .Where(f => contractFuncCalls.Contains(f.name))
             .ToList();
-        if (recursiveFuncsInPost.Count > 0)
+        if (recursiveFuncsInContracts.Count > 0)
         {
             dnfEnsures = dnfEnsures.Select(e =>
             {
                 var s = DnfEngine.ExprToString(e);
-                var unrolled = DafnyParser.InlineRecursiveOnce(s, recursiveFuncsInPost);
+                var unrolled = DafnyParser.InlineRecursiveOnce(s, recursiveFuncsInContracts);
                 return unrolled != s ? (Expression)new LeafExpression(unrolled) : e;
             }).ToList();
             // Mark these functions as opaque so the SMT translator drops their calls
-            SmtTranslator._fuelInlinedFuncs = new HashSet<string>(recursiveFuncsInPost.Select(f => f.name));
+            SmtTranslator._fuelInlinedFuncs = new HashSet<string>(recursiveFuncsInContracts.Select(f => f.name));
             if (verbose)
-                Console.WriteLine($"  Fuel-1 inlining of recursive function(s): {string.Join(", ", recursiveFuncsInPost.Select(f => f.name))}");
+                Console.WriteLine($"  Fuel-1 inlining of recursive function(s): {string.Join(", ", recursiveFuncsInContracts.Select(f => f.name))}");
         }
         else
         {
@@ -881,6 +885,18 @@ class Program
         {
             preDnfExprs = preDnfExprs.Select(clause =>
                 clause.Select(lit => InlineExpr(lit, predsToInline)).ToList()
+            ).ToList();
+        }
+        // Fuel-1 inlining for preconditions (same as postconditions)
+        if (recursiveFuncsInContracts.Count > 0)
+        {
+            preDnfExprs = preDnfExprs.Select(clause =>
+                clause.Select(lit =>
+                {
+                    var s = DnfEngine.ExprToString(lit);
+                    var unrolled = DafnyParser.InlineRecursiveOnce(s, recursiveFuncsInContracts);
+                    return unrolled != s ? (Expression)new LeafExpression(unrolled) : lit;
+                }).ToList()
             ).ToList();
         }
         bool hasDisjunctivePre = preDnfExprs.Count > 1;

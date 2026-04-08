@@ -563,6 +563,8 @@ static class TestValidator
         result = Regex.Replace(result, @"\bold\((\w+)\[([^\]]+)\]\)", "old_$1[$2]");
         // Handle old(name) → old_name  (simple variable)
         result = Regex.Replace(result, @"\bold\((\w+)\)", "old_$1");
+        // old_ variables for arrays are captured as seq (via X[..]), so .Length → |old_X|
+        result = Regex.Replace(result, @"\bold_(\w+)\.Length\b", "|old_$1|");
         return result;
     }
 
