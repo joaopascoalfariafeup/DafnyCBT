@@ -324,12 +324,16 @@ static class TestValidator
                     callMatch.Groups[1].Value.Split(',').Select(n => n.Trim()).Where(n => n.Length > 0));
             }
 
-            // Extract POST expressions from test comments for postcondition fallback checks.
-            // When Z3's concrete value is wrong, postcondition checks determine if the
-            // implementation's actual output is valid — enabling "rescue" of the test.
+            // Extract full postcondition expressions (ENSURES:) for fallback checks.
+            // These are the original ensures clauses that always hold, unlike per-clause
+            // POST: literals which only hold for specific DNF branches.
             var postExprs = new List<string>();
-            foreach (Match pm in Regex.Matches(testBlocks[i].comment, @"//\s+POST:\s*(.+)"))
+            foreach (Match pm in Regex.Matches(testBlocks[i].comment, @"//\s+ENSURES:\s*(.+)"))
                 postExprs.Add(pm.Groups[1].Value.Trim());
+            // Fall back to POST: if no ENSURES: found (backward compatibility)
+            if (postExprs.Count == 0)
+                foreach (Match pm in Regex.Matches(testBlocks[i].comment, @"//\s+POST:\s*(.+)"))
+                    postExprs.Add(pm.Groups[1].Value.Trim());
 
             var body = ReplaceExpectsWithChecks(testBlocks[i].body, i, outputNames,
                 stringOutputNames, arrayOutputNames, postExprs);
@@ -509,16 +513,16 @@ static class TestValidator
                     // Match both "var x := Method(...);" and plain "Method(...);" (no return).
                     var captureExpr = needsSlice ? $"{varName}[..]" : varName;
                     var inserted = false;
-                    // Try "var ... := Method(...);" first
+                    // Try "var ... := Method(...);" first (with optional generic type params)
                     var newResult = Regex.Replace(result,
-                        @"(^[ \t]*)(var\s+\w+\s*:=\s*\w+\([^)]*\);)",
+                        @"(^[ \t]*)(var\s+\w+\s*:=\s*\w+(<[^>]+>)?\([^)]*\);)",
                         m2 => { if (!inserted) { inserted = true; return $"{m2.Groups[1].Value}var {oldVarName} := {captureExpr};\n{m2.Value}"; } return m2.Value; },
                         RegexOptions.Multiline);
                     if (!inserted)
                     {
-                        // Try plain "MethodName(...);" (no var assignment)
+                        // Try plain "MethodName<T>(...);" (no var assignment, with optional generics)
                         newResult = Regex.Replace(result,
-                            @"(^[ \t]+)(\w+\([^)]*\);)",
+                            @"(^[ \t]+)(\w+(<[^>]+>)?\([^)]*\);)",
                             m2 => { if (!inserted) { inserted = true; return $"{m2.Groups[1].Value}var {oldVarName} := {captureExpr};\n{m2.Value}"; } return m2.Value; },
                             RegexOptions.Multiline);
                     }

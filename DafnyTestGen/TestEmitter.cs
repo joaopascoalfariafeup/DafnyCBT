@@ -739,6 +739,13 @@ static class TestEmitter
             foreach (var lit in literals)
                 if (!TypeUtils.IsSpecOnlyLiteral(lit))
                     sb.AppendLine($"  //   POST: {lit}");
+            // Full postconditions for check-mode fallback (ensures always hold, unlike per-clause POST literals)
+            foreach (var ens in method.Ens)
+            {
+                var ensStr = DnfEngine.ExprToString(ens.E);
+                if (!TypeUtils.IsSpecOnlyLiteral(ensStr))
+                    sb.AppendLine($"  //   ENSURES: {ensStr}");
+            }
 
             sb.AppendLine("  {");
 
