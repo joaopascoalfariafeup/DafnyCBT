@@ -214,17 +214,18 @@ static class BoundaryAnalysis
                     boundaryValues.RemoveWhere(v => v < 0);
 
                 // If we have relational bounds (e.g., k <= n), add "equal" tier
-                var relBounds = ExtractRelationalBounds(name, preStrings, inputs);
+                var relBounds = ExtractRelationalBounds(name, preStrings, inputs, mutableNames);
+
+                // Relational boundaries first (e.g., k==s_pre_len) — these often
+                // represent the most structurally interesting boundary cases
+                foreach (var rel in relBounds)
+                {
+                    tiers.Add(($"={rel}", $"(= {smtName} {rel})"));
+                }
 
                 foreach (var val in boundaryValues.OrderBy(v => v))
                 {
                     tiers.Add(($"{val}", $"(= {smtName} {(val < 0 ? $"(- {-val})" : val.ToString())})"));
-                }
-
-                // Add relational boundary: param == otherParam
-                foreach (var rel in relBounds)
-                {
-                    tiers.Add(($"={rel}", $"(= {smtName} {rel})"));
                 }
             }
             else if (type == "real")
@@ -532,21 +533,44 @@ static class BoundaryAnalysis
     /// Extracts relational bounds between variables from preconditions.
     /// E.g., from "k <= n" returns ["n"] for variable "k".
     /// </summary>
-    internal static List<string> ExtractRelationalBounds(string varName, List<string> preClauses, List<(string Name, string Type)> inputs)
+    internal static List<string> ExtractRelationalBounds(string varName, List<string> preClauses, List<(string Name, string Type)> inputs, HashSet<string>? mutableNames = null)
     {
         var result = new List<string>();
-        var otherVars = inputs.Where(v => v.Name != varName).Select(v => v.Name).ToList();
+        // Only consider scalar (int/nat) parameters for plain relational bounds
+        var scalarVars = inputs.Where(v => v.Name != varName &&
+            (v.Type == "int" || v.Type == "nat" || v.Type == "real")).Select(v => v.Name).ToList();
+
+        // Collect array/seq parameter names for .Length / |s| detection
+        var arraySeqVars = inputs
+            .Where(v => TypeUtils.IsArrayType(v.Type) || TypeUtils.IsSeqType(v.Type))
+            .Select(v => v.Name).ToList();
 
         foreach (var pre in preClauses)
         {
-            foreach (var other in otherVars)
+            foreach (var other in scalarVars)
             {
                 // Match: varName <= other, varName < other, other >= varName, other > varName
-                if (Regex.IsMatch(pre, $@"{Regex.Escape(varName)}\s*<=\s*{Regex.Escape(other)}") ||
-                    Regex.IsMatch(pre, $@"{Regex.Escape(other)}\s*>=\s*{Regex.Escape(varName)}"))
+                // Use word boundary to avoid matching "k <= s" in "k <= s.Length"
+                if (Regex.IsMatch(pre, $@"{Regex.Escape(varName)}\s*<=\s*{Regex.Escape(other)}\b(?!\.)") ||
+                    Regex.IsMatch(pre, $@"\b{Regex.Escape(other)}\b\s*>=\s*{Regex.Escape(varName)}"))
                 {
                     if (!result.Contains(other))
                         result.Add(other);
+                }
+            }
+
+            // Match: varName <= other.Length, varName <= |other| (array/seq length bounds)
+            foreach (var other in arraySeqVars)
+            {
+                var smtBase = (mutableNames != null && mutableNames.Contains(other)) ? $"{other}_pre" : other;
+                var smtLen = smtBase + "_len";
+                if (result.Contains(smtLen)) continue;
+                if (Regex.IsMatch(pre, $@"{Regex.Escape(varName)}\s*<=?\s*{Regex.Escape(other)}\.Length") ||
+                    Regex.IsMatch(pre, $@"{Regex.Escape(varName)}\s*<=?\s*\|{Regex.Escape(other)}\|") ||
+                    Regex.IsMatch(pre, $@"{Regex.Escape(other)}\.Length\s*>=?\s*{Regex.Escape(varName)}") ||
+                    Regex.IsMatch(pre, $@"\|{Regex.Escape(other)}\|\s*>=?\s*{Regex.Escape(varName)}"))
+                {
+                    result.Add(smtLen);
                 }
             }
         }
