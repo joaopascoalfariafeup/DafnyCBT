@@ -537,6 +537,11 @@ static class TestValidator
                 // Replace old(expr) with old_name variables that are already declared
                 // in the test body (e.g., old(a[..]) → old_a, old(count) → old_count).
                 var fixedPost = ReplaceOldExprs(post);
+                // Skip postconditions that still contain old() after replacement —
+                // these involve complex old() expressions (e.g., old(multiset(a[..])))
+                // that can't be evaluated in compiled (non-ghost) code.
+                if (Regex.IsMatch(fixedPost, @"\bold\s*\("))
+                    continue;
                 sb2.AppendLine($"    CheckExpect({fixedPost}, {testId});");
             }
             result = sb2.ToString();
