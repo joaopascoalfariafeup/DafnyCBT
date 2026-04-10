@@ -681,8 +681,9 @@ static class DnfEngine
 
     /// <summary>
     /// Try to decompose an exists quantifier into boundary cases at AST level.
-    /// Pattern: exists k :: lo <= k < hi && body(k)
-    /// Produces 3 DNF clauses: body[k/lo], exists k :: lo+1 <= k < hi-1 && body, body[k/hi-1]
+    /// Pattern: exists k :: lo <=|< k <|<= hi && body(k)
+    /// Computes effective boundaries (adjusting for strict inequalities) and produces
+    /// 3 DNF clauses: body[k/effLo], exists k :: effLo+1 <= k < effHi && body, body[k/effHi]
     /// </summary>
     static List<List<Expression>>? TryDecomposeExists(ExistsExpr existsExpr)
     {
@@ -723,8 +724,9 @@ static class DnfEngine
 
     /// <summary>
     /// Core AST-based decomposition. Given a bound variable and a body expression,
-    /// tries to match patterns like: lo <= k [&& k] < hi && property(k)
-    /// and produces 3 boundary clauses.
+    /// tries to match patterns like: lo <=|< k [&&|&& k] <|<= hi && property(k)
+    /// and produces 3 boundary clauses with effective boundary values
+    /// (adjusted for strict vs non-strict inequalities).
     /// </summary>
     static List<List<Expression>>? TryDecomposeQuantifierBody(
         BoundVar boundVar, Expression body)
@@ -732,15 +734,17 @@ static class DnfEngine
         // Flatten top-level conjuncts
         var conjuncts = FlattenConjuncts(body);
 
-        // Try to find range bounds: lo <= k and k < hi
+        // Try to find range bounds: lo <=|< k <|<= hi
         Expression? lo = null, hi = null;
         int loIdx = -1, hiIdx = -1;
+        bool isStrictLo = false; // true for lo < k, false for lo <= k
+        bool isStrictHi = true;  // true for k < hi, false for k <= hi
 
         for (int i = 0; i < conjuncts.Count; i++)
         {
             var c = Unwrap(conjuncts[i]);
 
-            // Pattern: ChainingExpression  lo <= k < hi  (3 operands, 2 operators)
+            // Pattern: ChainingExpression  lo <=|< k <|<= hi  (3 operands, 2 operators)
             if (c is ChainingExpression chain
                 && chain.Operands.Count == 3
                 && chain.Operators.Count == 2
@@ -754,6 +758,7 @@ static class DnfEngine
                 {
                     lo = chain.Operands[0];
                     loIdx = i;
+                    isStrictLo = chain.Operators[0] == BinaryExpr.Opcode.Lt;
                 }
                 // Extract hi from second comparison: k op1 Operands[2]
                 if (chain.Operators[1] == BinaryExpr.Opcode.Lt
@@ -761,35 +766,72 @@ static class DnfEngine
                 {
                     hi = chain.Operands[2];
                     hiIdx = i; // same index — both bounds come from same conjunct
+                    isStrictHi = chain.Operators[1] == BinaryExpr.Opcode.Lt;
                 }
             }
 
-            // Pattern: lo <= k  (or equivalently k >= lo)
+            // Pattern: lo <= k  (or equivalently k >= lo) — non-strict lower bound
             if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Le } leq
                 && ReferencesVar(leq.E1, boundVar.Name) && !ReferencesVar(leq.E0, boundVar.Name))
             {
                 lo = leq.E0;
                 loIdx = i;
+                isStrictLo = false;
             }
             else if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Ge } geq
                 && ReferencesVar(geq.E0, boundVar.Name) && !ReferencesVar(geq.E1, boundVar.Name))
             {
                 lo = geq.E1;
                 loIdx = i;
+                isStrictLo = false;
             }
 
-            // Pattern: k < hi  (or equivalently hi > k)
+            // Pattern: lo < k  (or equivalently k > lo) — strict lower bound
+            if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Lt } ltLo
+                && ReferencesVar(ltLo.E1, boundVar.Name) && !ReferencesVar(ltLo.E0, boundVar.Name))
+            {
+                lo = ltLo.E0;
+                loIdx = i;
+                isStrictLo = true;
+            }
+            else if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Gt } gtLo
+                && ReferencesVar(gtLo.E0, boundVar.Name) && !ReferencesVar(gtLo.E1, boundVar.Name))
+            {
+                lo = gtLo.E1;
+                loIdx = i;
+                isStrictLo = true;
+            }
+
+            // Pattern: k < hi  (or equivalently hi > k) — strict upper bound
             if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Lt } lt
                 && ReferencesVar(lt.E0, boundVar.Name) && !ReferencesVar(lt.E1, boundVar.Name))
             {
                 hi = lt.E1;
                 hiIdx = i;
+                isStrictHi = true;
             }
             else if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Gt } gt
                 && ReferencesVar(gt.E1, boundVar.Name) && !ReferencesVar(gt.E0, boundVar.Name))
             {
                 hi = gt.E0;
                 hiIdx = i;
+                isStrictHi = true;
+            }
+
+            // Pattern: k <= hi  (or equivalently hi >= k) — non-strict upper bound
+            if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Le } leHi
+                && ReferencesVar(leHi.E0, boundVar.Name) && !ReferencesVar(leHi.E1, boundVar.Name))
+            {
+                hi = leHi.E1;
+                hiIdx = i;
+                isStrictHi = false;
+            }
+            else if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Ge } geHi
+                && !ReferencesVar(geHi.E0, boundVar.Name) && ReferencesVar(geHi.E1, boundVar.Name))
+            {
+                hi = geHi.E0;
+                hiIdx = i;
+                isStrictHi = false;
             }
         }
 
@@ -807,26 +849,26 @@ static class DnfEngine
 
         var property = BuildConjunction(propertyConjuncts);
 
-        // Build boundary expressions
-        var loPlus1 = MakeAdd(lo, 1);
-        var hiMinus1 = MakeSub(hi, 1);
+        // Compute effective boundary values accounting for strict vs non-strict bounds.
+        // For lo < k (strict): first valid k is lo+1.  For lo <= k: first valid k is lo.
+        // For k < hi (strict): last valid k is hi-1.   For k <= hi: last valid k is hi.
+        var effectiveLo = isStrictLo ? MakeAdd(lo, 1) : lo;
+        var effectiveHi = isStrictHi ? MakeSub(hi, 1) : hi;
 
-        // Guard: lo < hi ensures the range is non-empty.
-        // Without this, P(lo) or P(hi-1) could be satisfiable even when the
-        // original exists is vacuously false (empty range).
-        var rangeGuard = ParseToLeafExpression($"{ExprToString(lo)} < {ExprToString(hi)}");
+        // Guard: effectiveLo <= effectiveHi ensures the range is non-empty.
+        var rangeGuard = ParseToLeafExpression($"{ExprToString(effectiveLo)} <= {ExprToString(effectiveHi)}");
 
-        // Clause 1 (left boundary): lo < hi && property[k := lo]
-        var leftProp = SubstituteVar(property, boundVar.Name, lo);
+        // Clause 1 (left boundary): property[k := effectiveLo]
+        var leftProp = SubstituteVar(property, boundVar.Name, effectiveLo);
 
-        // Clause 2 (middle): keep as exists with narrowed range (as string, for now)
-        // Build: exists k :: lo+1 <= k < hi-1 && property
-        // (range non-emptiness is implicit: if lo+1 >= hi-1 the exists is vacuously false → UNSAT)
-        var middleStr = $"exists {boundVar.Name} :: {ExprToString(loPlus1)} <= {boundVar.Name} < {ExprToString(hiMinus1)} && {ExprToString(property)}";
+        // Clause 2 (middle): exists with narrowed range excluding both boundaries
+        // Range: effectiveLo+1 <= k < effectiveHi (i.e., effectiveLo+1 .. effectiveHi-1 inclusive)
+        var middleLo = MakeAdd(effectiveLo, 1);
+        var middleStr = $"exists {boundVar.Name} :: {ExprToString(middleLo)} <= {boundVar.Name} < {ExprToString(effectiveHi)} && {ExprToString(property)}";
         var middleExpr = ParseToLeafExpression(middleStr);
 
-        // Clause 3 (right boundary): lo < hi && property[k := hi-1]
-        var rightProp = SubstituteVar(property, boundVar.Name, hiMinus1);
+        // Clause 3 (right boundary): property[k := effectiveHi]
+        var rightProp = SubstituteVar(property, boundVar.Name, effectiveHi);
 
         return new List<List<Expression>>
         {

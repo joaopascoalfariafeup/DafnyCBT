@@ -1263,6 +1263,15 @@ static class TestEmitter
                 // This is always correct regardless of Z3's concrete output value.
                 if (specExpects != null && specExpects.TryGetValue(outp.Name, out var specExpr))
                 {
+                    // For class methods, qualify unqualified field references with "obj."
+                    if (classInfo != null)
+                    {
+                        var allFields = new HashSet<string>(fieldNames);
+                        allFields.UnionWith(constFieldNames);
+                        allFields.UnionWith(ghostFieldNames);
+                        foreach (var fn in allFields)
+                            specExpr = Regex.Replace(specExpr, @"(?<!\.)\b" + Regex.Escape(fn) + @"\b", "obj." + fn);
+                    }
                     sb.AppendLine($"    expect {outp.Name} == {specExpr};");
                     coveredOutputs.Add(outp.Name);
                     continue;
@@ -1627,10 +1636,19 @@ static class TestEmitter
                         }
                     }
                 }
-                // Skip literals mentioning no output/mutable when we have concrete values —
+                // Skip literals mentioning no output/mutable when all outputs are covered —
                 // they are implied by the output assertions and add noise to the test.
-                if (!mentionsAnyOutput && !mentionsMutable && trustZ3Values)
-                    continue;
+                // This covers both trustZ3Values (unique concrete values) and specExpects
+                // (deterministic spec expressions). With uninterpreted functions, condition-only
+                // literals (like branch conditions referencing opaque calls) are unreliable
+                // because Z3's model may not match the actual function behavior.
+                if (!mentionsAnyOutput && !mentionsMutable)
+                {
+                    bool allOutputsCovered = method.Outs.All(o =>
+                        coveredOutputs.Contains(o.Name) ||
+                        !literals.Any(lit2 => Regex.IsMatch(lit2, @"\b" + Regex.Escape(o.Name) + @"\b")));
+                    if (allOutputsCovered) continue;
+                }
                 // Emit if: mentions an uncovered output (or no-output in full-postcondition mode)
                 if (!mentionsAnyOutput || !mentionsOnlyCoveredOutputs)
                 {

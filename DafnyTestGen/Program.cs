@@ -770,7 +770,12 @@ class Program
         foreach (var ens in ensuresClauses)
         {
             var ensStr = DnfEngine.ExprToString(ens);
-            // Match "outName == expr" or "expr == outName" at the top level of each ensures
+            // Match "outName == expr" or "expr == outName" at the top level of each ensures.
+            // The == must be the top-level operator, not nested inside a quantifier body.
+            // Skip if the ensures starts with a quantifier (exists/forall) — the == inside
+            // the quantifier body is not a top-level equality (e.g., "exists i :: ... && a[i] == diff").
+            if (Regex.IsMatch(ensStr, @"^\s*(exists|forall)\b"))
+                continue;
             foreach (var outName in outputNames)
             {
                 // outName == expr (outName on left)
