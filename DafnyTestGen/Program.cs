@@ -265,13 +265,10 @@ class Program
             }
         }
 
-        // Find non-recursive predicates/functions for inlining into postconditions
+        // Find all functions/predicates with bodies for unified 2-level inlining
         var inlinablePredicates = DafnyParser.FindInlinablePredicates(program);
         if (inlinablePredicates.Count > 0 && verbose)
-            Console.WriteLine($"[DafnyTestGen] Found {inlinablePredicates.Count} inlinable predicate(s): {string.Join(", ", inlinablePredicates.Select(p => p.name))}");
-
-        // Find recursive functions for fuel-1 inlining (DNF decomposition)
-        var recursiveFuncsForFuel = DafnyParser.FindRecursiveFunctionsForFuel(program);
+            Console.WriteLine($"[DafnyTestGen] Found {inlinablePredicates.Count} inlinable function(s)/predicate(s): {string.Join(", ", inlinablePredicates.Select(p => p.name))}");
 
         // Find recursive functions that can be finitely unrolled into SMT define-fun
         var recursiveFunctions = DafnyParser.FindRecursiveFunctions(program);
@@ -529,7 +526,7 @@ class Program
 
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program, recursiveFuncsForFuel);
+            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program);
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -750,8 +747,7 @@ class Program
     static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
         List<(string name, List<string> paramNames, string body, bool isClassMember)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool hasNonInlinableFuncs = false,
         Dictionary<string, List<string>>? enumDatatypes = null, Dictionary<string, (string dtName, int ordinal)>? enumConstructors = null,
-        ClassInfo? classInfo = null, Microsoft.Dafny.Program? program = null,
-        List<(string name, List<string> paramNames, string body, bool isClassMember)>? recursiveFunctions = null)
+        ClassInfo? classInfo = null, Microsoft.Dafny.Program? program = null)
     {
         z3Path ??= Z3Runner.FindZ3Path();
         enumDatatypes ??= new Dictionary<string, List<string>>();
@@ -764,6 +760,32 @@ class Program
         // Get DNF clauses as AST Expressions — kept as Expressions throughout the pipeline.
         // Strings are only used for display, dedup keys, and at the TestEmitter boundary.
         var ensuresClauses = method.Ens.Select(e => e.E).ToList();
+
+        // Detect "output == expr" patterns in original postconditions.
+        // When an ensures clause has the form `outName == specExpr`, the output is uniquely
+        // determined by the spec expression — we emit `expect outName == specExpr` directly
+        // (evaluated at runtime with ghost removed) instead of Z3's concrete value.
+        var outputNames = new HashSet<string>(method.Outs.Select(o => o.Name));
+        var specExpects = new Dictionary<string, string>(); // outputName → specExpression
+        foreach (var ens in ensuresClauses)
+        {
+            var ensStr = DnfEngine.ExprToString(ens);
+            // Match "outName == expr" or "expr == outName" at the top level of each ensures
+            foreach (var outName in outputNames)
+            {
+                // outName == expr (outName on left)
+                var m = Regex.Match(ensStr, @"^" + Regex.Escape(outName) + @"\s*==\s*(.+)$");
+                if (m.Success && !specExpects.ContainsKey(outName))
+                {
+                    specExpects[outName] = m.Groups[1].Value.Trim();
+                    continue;
+                }
+                // expr == outName (outName on right)
+                m = Regex.Match(ensStr, @"^(.+?)\s*==\s*" + Regex.Escape(outName) + @"$");
+                if (m.Success && !specExpects.ContainsKey(outName))
+                    specExpects[outName] = m.Groups[1].Value.Trim();
+            }
+        }
 
         // Build the full postcondition strings for use as expects when non-inlinable functions are present.
         // These are the original ensures expressions before any decomposition.
@@ -788,39 +810,6 @@ class Program
                 dnfEnsures = dnfEnsures
                     .Select(e => InlineExpr(e, predsToInline)).ToList();
             }
-        }
-
-        // Fuel-1 inlining: unroll recursive functions one level to expose
-        // if-then-else branch structure for DNF decomposition.
-        // This produces clauses like (|a|==0 && diff==a) vs (|a|>0 && a[last] in b && ...)
-        // even though inner recursive calls remain opaque.
-        // Applied to both preconditions and postconditions.
-        var contractFuncCalls = new HashSet<string>();
-        foreach (var ens in method.Ens)
-            foreach (var name in FindFunctionCalls(ens.E))
-                contractFuncCalls.Add(name);
-        foreach (var req in method.Req)
-            foreach (var name in FindFunctionCalls(req.E))
-                contractFuncCalls.Add(name);
-        var recursiveFuncsInContracts = (recursiveFunctions ?? new())
-            .Where(f => contractFuncCalls.Contains(f.name))
-            .ToList();
-        if (recursiveFuncsInContracts.Count > 0)
-        {
-            dnfEnsures = dnfEnsures.Select(e =>
-            {
-                var s = DnfEngine.ExprToString(e);
-                var unrolled = DafnyParser.InlineRecursiveOnce(s, recursiveFuncsInContracts);
-                return unrolled != s ? (Expression)new LeafExpression(unrolled) : e;
-            }).ToList();
-            // Mark these functions as opaque so the SMT translator drops their calls
-            SmtTranslator._fuelInlinedFuncs = new HashSet<string>(recursiveFuncsInContracts.Select(f => f.name));
-            if (verbose)
-                Console.WriteLine($"  Fuel-1 inlining of recursive function(s): {string.Join(", ", recursiveFuncsInContracts.Select(f => f.name))}");
-        }
-        else
-        {
-            SmtTranslator._fuelInlinedFuncs.Clear();
         }
 
         // Compute DNF on un-inlined ensures for expect emission (preserves predicate names).
@@ -922,18 +911,6 @@ class Program
         {
             preDnfExprs = preDnfExprs.Select(clause =>
                 clause.Select(lit => InlineExpr(lit, predsToInline)).ToList()
-            ).ToList();
-        }
-        // Fuel-1 inlining for preconditions (same as postconditions)
-        if (recursiveFuncsInContracts.Count > 0)
-        {
-            preDnfExprs = preDnfExprs.Select(clause =>
-                clause.Select(lit =>
-                {
-                    var s = DnfEngine.ExprToString(lit);
-                    var unrolled = DafnyParser.InlineRecursiveOnce(s, recursiveFuncsInContracts);
-                    return unrolled != s ? (Expression)new LeafExpression(unrolled) : lit;
-                }).ToList()
             ).ToList();
         }
         bool hasDisjunctivePre = preDnfExprs.Count > 1;
@@ -1984,7 +1961,7 @@ class Program
         bool hasUninterpFuncs = hasNonInlinableFuncs || SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
         // Emit Dafny test file
-        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo, inlinablePredicates);
+        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo, inlinablePredicates, specExpects);
     }
 
     /// <summary>

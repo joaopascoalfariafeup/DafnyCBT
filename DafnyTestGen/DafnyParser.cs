@@ -218,8 +218,9 @@ static class DafnyParser
     }
 
     /// <summary>
-    /// Finds non-recursive predicates and functions that can be inlined into postcondition literals.
-    /// Returns a list of (name, paramNames, bodyString) for each inlinable predicate/function.
+    /// Finds all functions and predicates with bodies that can be inlined into contracts.
+    /// Collects both recursive and non-recursive functions uniformly.
+    /// Returns a list of (name, paramNames, bodyString, isClassMember) for each.
     /// </summary>
     internal static List<(string name, List<string> paramNames, string body, bool isClassMember)> FindInlinablePredicates(
         Microsoft.Dafny.Program program)
@@ -236,150 +237,11 @@ static class DafnyParser
                     if (member is Function func && func.Body != null)
                     {
                         var bodyStr = DnfEngine.ExprToString(func.Body);
-                        // Skip recursive functions (body references the function name)
-                        if (bodyStr.Contains(func.Name + "(")) continue;
                         var paramNames = func.Ins.Select(p => p.Name).ToList();
                         result.Add((func.Name, paramNames, bodyStr, isClassMember));
                     }
                 }
             }
-        }
-        // For predicates whose body calls another inlinable predicate (1-level nesting),
-        // substitute the callee's body inline to produce a self-contained predicate.
-        // This handles cases like AllPrime(f) calling IsPrime(f[i]).
-        // After substitution, the caller no longer references other predicates.
-        var nameSet = new HashSet<string>(result.Select(r => r.name));
-        var substituted = new List<(string name, List<string> paramNames, string body, bool isClassMember)>();
-        foreach (var r in result)
-        {
-            var calledPredicates = result.Where(o => o.name != r.name && r.body.Contains(o.name + "(")).ToList();
-            if (calledPredicates.Count == 0)
-            {
-                substituted.Add(r);
-                continue;
-            }
-            // Check that callees themselves don't call other predicates (limit to 2 levels)
-            bool calleeCallsOther = calledPredicates.Any(c =>
-                result.Any(o => o.name != c.name && c.body.Contains(o.name + "(")));
-            if (calleeCallsOther)
-            {
-                Console.WriteLine($"  Note: predicate '{r.name}' has >2-level nesting — not inlining");
-                continue;
-            }
-            // Substitute each callee's body into this predicate's body
-            var newBody = r.body;
-            foreach (var callee in calledPredicates)
-            {
-                // Replace calls like IsPrime(expr) with (expr > 1 && forall k :: ...)
-                // Use regex to find call sites and substitute parameter
-                var pattern = callee.name + @"\(";
-                int searchFrom = 0;
-                while (searchFrom < newBody.Length)
-                {
-                    var callIdx = newBody.IndexOf(callee.name + "(", searchFrom);
-                    if (callIdx < 0) break;
-                    // Extract the argument list by matching parentheses
-                    int parenStart = callIdx + callee.name.Length;
-                    int depth = 0;
-                    int parenEnd = parenStart;
-                    for (int ci = parenStart; ci < newBody.Length; ci++)
-                    {
-                        if (newBody[ci] == '(') depth++;
-                        else if (newBody[ci] == ')') { depth--; if (depth == 0) { parenEnd = ci; break; } }
-                    }
-                    var argsStr = newBody.Substring(parenStart + 1, parenEnd - parenStart - 1);
-                    // Split arguments (respecting nested parens/brackets)
-                    var args = SplitArgs(argsStr);
-                    if (args.Count == callee.paramNames.Count)
-                    {
-                        var inlinedBody = callee.body;
-                        for (int pi = 0; pi < args.Count; pi++)
-                        {
-                            // Replace parameter name with argument, using word boundaries
-                            inlinedBody = System.Text.RegularExpressions.Regex.Replace(
-                                inlinedBody, @"\b" + System.Text.RegularExpressions.Regex.Escape(callee.paramNames[pi]) + @"\b", args[pi]);
-                        }
-                        var replacement = $"({inlinedBody})";
-                        newBody = newBody.Substring(0, callIdx) + replacement + newBody.Substring(parenEnd + 1);
-                        searchFrom = callIdx + replacement.Length;
-                    }
-                    else
-                    {
-                        searchFrom = parenEnd + 1;
-                    }
-                }
-            }
-            substituted.Add((r.name, r.paramNames, newBody, r.isClassMember));
-        }
-        result = substituted;
-
-        return result;
-    }
-
-    /// <summary>
-    /// Finds recursive functions (self-referencing body) in the program for fuel-1 inlining.
-    /// Returns the same tuple format as FindInlinablePredicates, but only includes
-    /// recursive functions (which FindInlinablePredicates skips).
-    /// </summary>
-    internal static List<(string name, List<string> paramNames, string body, bool isClassMember)> FindRecursiveFunctionsForFuel(
-        Microsoft.Dafny.Program program)
-    {
-        var result = new List<(string name, List<string> paramNames, string body, bool isClassMember)>();
-        foreach (var topDecl in AllTopLevelDecls(program))
-        {
-            if (topDecl is TopLevelDeclWithMembers cls)
-            {
-                bool isClassMember = cls is not DefaultClassDecl;
-                foreach (var member in cls.Members)
-                {
-                    if (member is Function func && func.Body != null)
-                    {
-                        var bodyStr = DnfEngine.ExprToString(func.Body);
-                        // Only collect recursive functions (body references the function name)
-                        if (!bodyStr.Contains(func.Name + "(")) continue;
-                        var paramNames = func.Ins.Select(p => p.Name).ToList();
-                        result.Add((func.Name, paramNames, bodyStr, isClassMember));
-                    }
-                }
-            }
-        }
-        return result;
-    }
-
-    /// <summary>
-    /// Inlines recursive function calls exactly once (fuel=1).
-    /// Replaces each top-level call to a recursive function with its body,
-    /// but does NOT recurse into the replacement — inner recursive calls stay opaque.
-    /// </summary>
-    internal static string InlineRecursiveOnce(string literal,
-        List<(string name, List<string> paramNames, string body, bool isClassMember)> funcs)
-    {
-        var result = literal;
-        foreach (var (name, paramNames, body, _) in funcs)
-        {
-            var pattern = @"\b" + Regex.Escape(name) + @"\s*\(";
-            var match = Regex.Match(result, pattern);
-            if (!match.Success) continue;
-
-            int argsStart = match.Index + match.Length;
-            int depth = 1, pos = argsStart;
-            while (pos < result.Length && depth > 0)
-            {
-                if (result[pos] == '(') depth++;
-                else if (result[pos] == ')') depth--;
-                pos++;
-            }
-            if (depth != 0) continue;
-
-            var argsStr = result.Substring(argsStart, pos - 1 - argsStart);
-            var args = SplitArgs(argsStr);
-            if (args.Count != paramNames.Count) continue;
-
-            var inlined = body;
-            for (int p = 0; p < paramNames.Count; p++)
-                inlined = Regex.Replace(inlined, @"\b" + Regex.Escape(paramNames[p]) + @"\b", args[p].Trim());
-
-            result = result[..match.Index] + "(" + inlined + ")" + result[pos..];
         }
         return result;
     }
@@ -509,16 +371,19 @@ static class DafnyParser
     {
         var result = literal;
         const int maxInlinedLength = 50_000; // safety limit to prevent exponential growth
-        for (int pass = 0; pass < 3; pass++) // max 3 inlining passes for nested calls
+        for (int pass = 0; pass < 2; pass++) // 2 passes: inline 1st-level, then 2nd-level; 3rd-level stays uninterpreted
         {
             var changed = false;
             foreach (var (name, paramNames, body, _) in predicates)
             {
-                // Find occurrences of name(args...)
-                var pattern = @"\b" + Regex.Escape(name) + @"\s*\(";
-                while (result.Length < maxInlinedLength && Regex.IsMatch(result, pattern))
+                // Find occurrences of name(args...) — search forward past each replacement
+                // to avoid re-inlining calls introduced by the replacement (recursive functions).
+                var regex = new Regex(@"\b" + Regex.Escape(name) + @"\s*\(");
+                int searchFrom = 0;
+                while (result.Length < maxInlinedLength)
                 {
-                    var match = Regex.Match(result, pattern);
+                    var match = regex.Match(result, searchFrom);
+                    if (!match.Success) break;
                     int argsStart = match.Index + match.Length;
 
                     // Find the closing paren and extract the arguments string
@@ -599,8 +464,12 @@ static class DafnyParser
                         }
                     }
 
-                    // Replace the call with parenthesized inlined body
-                    result = result.Substring(0, match.Index) + "(" + inlined + ")" + result.Substring(pos);
+                    // Replace the call with parenthesized inlined body;
+                    // advance searchFrom past the replacement to avoid re-inlining
+                    // calls introduced by the inlined body (handles recursive functions).
+                    var replacement = "(" + inlined + ")";
+                    result = result.Substring(0, match.Index) + replacement + result.Substring(pos);
+                    searchFrom = match.Index + replacement.Length;
                     changed = true;
                 }
             }

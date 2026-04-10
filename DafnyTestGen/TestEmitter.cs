@@ -670,7 +670,8 @@ static class TestEmitter
         HashSet<string>? mutableNames = null,
         Dictionary<string, List<string>>? enumDatatypes = null,
         ClassInfo? classInfo = null,
-        List<(string name, List<string> paramNames, string body, bool isClassMember)>? inlinablePredicates = null)
+        List<(string name, List<string> paramNames, string body, bool isClassMember)>? inlinablePredicates = null,
+        Dictionary<string, string>? specExpects = null)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("// Auto-generated test cases by DafnyTestGen");
@@ -1256,6 +1257,16 @@ static class TestEmitter
                 var outPattern = @"\b" + Regex.Escape(outp.Name) + @"\b";
                 if (!literals.Any(lit => Regex.IsMatch(lit, outPattern)))
                     continue;
+
+                // When the original postcondition has `outName == specExpr`, emit the spec
+                // expression directly — it's deterministic and evaluable at runtime (ghost removed).
+                // This is always correct regardless of Z3's concrete output value.
+                if (specExpects != null && specExpects.TryGetValue(outp.Name, out var specExpr))
+                {
+                    sb.AppendLine($"    expect {outp.Name} == {specExpr};");
+                    coveredOutputs.Add(outp.Name);
+                    continue;
+                }
 
                 var typeStr = SubstTypeParams(outp.Type.ToString(), typeParamMap);
                 // When postconditions use non-inlinable functions AND uniqueness is not proven,

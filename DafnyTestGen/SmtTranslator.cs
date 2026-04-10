@@ -65,8 +65,7 @@ static class SmtTranslator
     internal static Dictionary<string, string> _definedFuncs = new();
     // Names of functions with define-fun (used to prevent adding to _uninterpFuncs)
     internal static HashSet<string> _definedFuncNames = new();
-    // Names of recursive functions that were fuel-1 inlined — calls should be treated as opaque (return null)
-    internal static HashSet<string> _fuelInlinedFuncs = new();
+
     // Parameter info for defined functions (used to fix array→seq arg substitution at call sites)
     internal static Dictionary<string, List<(string pName, string pType)>> _definedFuncParamInfo = new();
     // True if any postcondition literal could not be translated to SMT
@@ -1668,9 +1667,6 @@ static class SmtTranslator
                     return BuildIsSortedSmt(seqSmt);
                 }
             }
-            // Fuel-1 inlined recursive functions are opaque — can't be expressed in SMT
-            if (_fuelInlinedFuncs.Contains(funcCall.Name))
-                return null;
             // Generic: defined function (finitely unrolled) or uninterpreted function
             var smtArgs = funcCall.Args.Select(a => ExprToSmt(a, inputs, mutableNames, isPostContext, insideOld)).ToList();
             if (smtArgs.All(a => a != null))
@@ -3003,9 +2999,6 @@ static class SmtTranslator
         if (funcMatch.Success)
         {
             var funcName = funcMatch.Groups[1].Value;
-            // Fuel-1 inlined recursive functions are opaque — can't be expressed in SMT
-            if (_fuelInlinedFuncs.Contains(funcName))
-                return null;
             var argsStr = funcMatch.Groups[2].Value;
             // Split arguments on commas (respecting parentheses)
             var args = SplitArgs(argsStr);
