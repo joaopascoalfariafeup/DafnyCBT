@@ -270,27 +270,6 @@ class Program
         if (inlinablePredicates.Count > 0 && verbose)
             Console.WriteLine($"[DafnyTestGen] Found {inlinablePredicates.Count} inlinable function(s)/predicate(s): {string.Join(", ", inlinablePredicates.Select(p => p.name))}");
 
-        // Find recursive functions that can be finitely unrolled into SMT define-fun
-        var recursiveFunctions = DafnyParser.FindRecursiveFunctions(program);
-        if (recursiveFunctions.Count > 0 && verbose)
-            Console.WriteLine($"[DafnyTestGen] Found {recursiveFunctions.Count} recursive function(s): {string.Join(", ", recursiveFunctions.Select(f => f.name))}");
-        // Pre-build define-fun for each; names are added to SmtTranslator._definedFuncNames
-        SmtTranslator._definedFuncs.Clear();
-        SmtTranslator._definedFuncNames.Clear();
-        SmtTranslator._definedFuncParamInfo.Clear();
-        foreach (var (rName, rParams, rRetType, rBody, rKind) in recursiveFunctions)
-        {
-            if (SmtTranslator.TryBuildDefineFun(rName, rParams, rRetType, rBody, rKind))
-            {
-                if (verbose)
-                    Console.WriteLine($"  → built define-fun for '{rName}' ({rKind})");
-            }
-            else
-            {
-                Console.WriteLine($"  → could not unroll '{rName}' — will remain uninterpreted");
-            }
-        }
-
         // Collect bodyless functions/predicates (no body = abstract/opaque) for skip detection
         var bodylessFunctions = DafnyParser.AllTopLevelDecls(program)
             .OfType<TopLevelDeclWithMembers>()
@@ -469,7 +448,6 @@ class Program
 
             // Check for non-inlinable function calls in postconditions (e.g., recursive/ghost functions)
             // These become uninterpreted in SMT and produce incorrect test values.
-            // Functions that have been finitely unrolled (define-fun) are NOT considered unsupported.
             var builtInFuncs = new HashSet<string> { "IsSorted" };
             var inlinableNames = new HashSet<string>(inlinablePredicates.Select(p => p.name));
             var allFuncCalls = new HashSet<string>();
@@ -477,8 +455,7 @@ class Program
                 foreach (var name in FindFunctionCalls(ens.E))
                     allFuncCalls.Add(name);
             var unsupportedFuncs = allFuncCalls
-                .Where(f => !builtInFuncs.Contains(f) && !inlinableNames.Contains(f)
-                         && !SmtTranslator._definedFuncNames.Contains(f))
+                .Where(f => !builtInFuncs.Contains(f) && !inlinableNames.Contains(f))
                 .ToList();
             bool hasNonInlinableFuncs = unsupportedFuncs.Count > 0;
             if (hasNonInlinableFuncs)

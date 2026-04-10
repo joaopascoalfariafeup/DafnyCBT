@@ -1,4 +1,4 @@
-using System.Text.RegularExpressions;
+﻿using System.Text.RegularExpressions;
 using Microsoft.Dafny;
 
 namespace DafnyTestGen;
@@ -60,14 +60,6 @@ static class SmtTranslator
     internal static HashSet<string> _boundVars = new();
     // Tracks uninterpreted functions discovered during expression translation
     internal static Dictionary<string, int> _uninterpFuncs = new();
-    // Tracks recursively-defined functions that have been finitely unrolled as (define-fun ...)
-    // Key: function name, Value: full SMT (define-fun ...) string
-    internal static Dictionary<string, string> _definedFuncs = new();
-    // Names of functions with define-fun (used to prevent adding to _uninterpFuncs)
-    internal static HashSet<string> _definedFuncNames = new();
-
-    // Parameter info for defined functions (used to fix array→seq arg substitution at call sites)
-    internal static Dictionary<string, List<(string pName, string pType)>> _definedFuncParamInfo = new();
     // True if any postcondition literal could not be translated to SMT
     internal static bool _hasUntranslatedPost = false;
     // Tracks precondition strings that were successfully translated to SMT
@@ -139,7 +131,7 @@ static class SmtTranslator
             sb.AppendLine("(declare-const _str_u7 (Seq Int)) (assert (= _str_u7 (seq.unit 103)))"); // "g"
         }
 
-        // Multiset operation macros (multisets encoded as (Array Int Int) — counts)
+        // Multiset operation macros (multisets encoded as (Array Int Int) â€” counts)
         var hasMultisetParam = inputs.Concat(outputs).Any(v => TypeUtils.IsMultisetType(v.Type));
         if (hasMultisetParam)
         {
@@ -147,7 +139,7 @@ static class SmtTranslator
             sb.AppendLine("; Multiset operations over (Array Int Int) encoding (element -> count)");
             sb.AppendLine("(define-fun EmptyMultiset () (Array Int Int) ((as const (Array Int Int)) 0))");
             sb.AppendLine("(define-fun MultisetMember ((x Int) (m (Array Int Int))) Bool (> (select m x) 0))");
-            // Pointwise expansion over bounded universe — avoids (_ map) which requires
+            // Pointwise expansion over bounded universe â€” avoids (_ map) which requires
             // declare-fun (not define-fun), and the forall axioms that entails cause Z3
             // to return "unknown". Since our universe is bounded, we can expand each
             // operation as a chain of store expressions.
@@ -192,7 +184,7 @@ static class SmtTranslator
         }
 
         // Multiset-forming count helper for permutation constraints:
-        // multiset(a[..]) == multiset(old(a[..])) → count equality over bounded indices
+        // multiset(a[..]) == multiset(old(a[..])) â†’ count equality over bounded indices
         var hasMutableArray = inputs.Concat(outputs).Any(v => TypeUtils.IsArrayType(v.Type) && mutableNames.Contains(v.Name));
         if (hasMutableArray)
         {
@@ -215,7 +207,7 @@ static class SmtTranslator
                 .Where(v => TypeUtils.IsMapType(v.Type))
                 .SelectMany(v => TypeUtils.GetElementUniverse(TypeUtils.GetMapKeyType(v.Type)))
                 .Distinct().OrderBy(x => x).ToArray();
-            // MapMerge: right-biased union — domain = d1 || d2, value = ite(d2, v2, v1)
+            // MapMerge: right-biased union â€” domain = d1 || d2, value = ite(d2, v2, v1)
             sb.AppendLine("(define-fun MapMergeDomain ((d1 (Array Int Bool)) (d2 (Array Int Bool))) (Array Int Bool)");
             sb.AppendLine($"  ((_ map or) d1 d2))");
             sb.AppendLine("(define-fun MapMergeValues ((d1 (Array Int Bool)) (v1 (Array Int Int)) (d2 (Array Int Bool)) (v2 (Array Int Int))) (Array Int Int)");
@@ -287,8 +279,8 @@ static class SmtTranslator
             else if (TypeUtils.IsMapType(type))
             {
                 // Maps are encoded as two parallel arrays over bounded key universe:
-                //   domain (Array K Bool) — which keys are present
-                //   values (Array K V)    — the value for each key
+                //   domain (Array K Bool) â€” which keys are present
+                //   values (Array K V)    â€” the value for each key
                 var keyType = TypeUtils.GetMapKeyType(type);
                 var valType = TypeUtils.GetMapValueType(type);
                 var keyUniverse = TypeUtils.GetElementUniverse(keyType);
@@ -500,7 +492,7 @@ static class SmtTranslator
                     }
                     else
                     {
-                        // seq<(T,U)> — component sequences are named {name}_{ci}
+                        // seq<(T,U)> â€” component sequences are named {name}_{ci}
                         for (int ci = 0; ci < tupleComponents.Count; ci++)
                             seqNames.Add($"{name}_{ci}");
                     }
@@ -606,7 +598,7 @@ static class SmtTranslator
 
         // Bound multiset element variables and define cardinality helpers.
         // Multisets are constructed from zero-default base with per-element variables (name_e0..name_eN),
-        // so no forall constraints are needed — out-of-universe indices are automatically 0.
+        // so no forall constraints are needed â€” out-of-universe indices are automatically 0.
         foreach (var (name, type) in inputs.Concat(outputs).ToList())
         {
             if (TypeUtils.IsMultisetType(type))
@@ -677,7 +669,6 @@ static class SmtTranslator
         sb.AppendLine();
 
         // Reset per-query state (well-formedness guards, uninterpreted functions, translation status)
-        // Note: _definedFuncs and _definedFuncNames are NOT cleared — they are set once at startup
         _wfGuards.Clear();
         _uninterpFuncs.Clear();
         _hasUntranslatedPost = false;
@@ -712,7 +703,7 @@ static class SmtTranslator
 
         // Assert full (un-decomposed) postconditions as background constraints.
         // This catches cases where DNF decomposition loses quantifier range guards.
-        // Save WF guard count — background postconditions are disjunctive, so their
+        // Save WF guard count â€” background postconditions are disjunctive, so their
         // WF guards (e.g., index bounds for one disjunct) must not be asserted unconditionally.
         if (backgroundPostconditions != null)
         {
@@ -725,7 +716,7 @@ static class SmtTranslator
                 if (smtExpr != null)
                     assertions.AppendLine($"(assert {smtExpr})");
             }
-            // Discard WF guards from background postconditions — they may over-constrain
+            // Discard WF guards from background postconditions â€” they may over-constrain
             // when only some disjuncts are active (e.g., bounds for str1[|prefix|] conflict
             // with |prefix| == |str1| when the access disjunct is not selected).
             if (_wfGuards.Count > wfCountBefore)
@@ -769,12 +760,6 @@ static class SmtTranslator
                     assertions.AppendLine($"; Could not translate precondition: {preStr}");
                 }
             }
-        }
-
-        // Emit finitely-unrolled recursive function definitions (must come before assertions)
-        foreach (var (funcName, defineFun) in _definedFuncs)
-        {
-            sb.AppendLine(defineFun);
         }
 
         // Emit uninterpreted function declarations (discovered during translation)
@@ -834,7 +819,7 @@ static class SmtTranslator
             foreach (var excl in exclusions)
             {
                 var wfBefore = _wfGuards.Count;
-                // Exclusions are postcondition literals — translate for post-state
+                // Exclusions are postcondition literals â€” translate for post-state
                 var smtExpr = ExprToSmt(excl, inputsAndOutputs, mutableNames, isPostContext: true);
                 if (smtExpr != null)
                 {
@@ -919,7 +904,7 @@ static class SmtTranslator
                     }
                     else
                     {
-                        // seq<(T,U)> — component sequences named {name}_{ci}
+                        // seq<(T,U)> â€” component sequences named {name}_{ci}
                         sb.AppendLine($"(get-value ((seq.len {name}_0)))");
                         for (int ci = 0; ci < tupleComponents.Count; ci++)
                             for (int i = 0; i < 8; i++)
@@ -998,7 +983,7 @@ static class SmtTranslator
         }
 
         // Post-process: rewrite nested seq references to flat encoding.
-        // Replace (seq.nth varName K) → varName_K and (seq.len varName) → varName_len
+        // Replace (seq.nth varName K) â†’ varName_K and (seq.len varName) â†’ varName_len
         // for all nested seq<seq<T>> / seq<string> parameters.
         var smtText = sb.ToString();
         foreach (var (name, type) in inputs.Concat(outputs))
@@ -1018,13 +1003,13 @@ static class SmtTranslator
         return smtText;
     }
 
-    // ───────────────── AST-based Expression → SMT translator ─────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ AST-based Expression â†’ SMT translator â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// <summary>
     /// Translates a Dafny AST Expression to an SMT2 expression string.
     /// Handles mutable variable renaming (pre/post state) at the AST level:
-    /// - In post context: bare mutable refs → _post, inside old() → _pre
-    /// - In pre context: mutable refs → _pre
+    /// - In post context: bare mutable refs â†’ _post, inside old() â†’ _pre
+    /// - In pre context: mutable refs â†’ _pre
     /// Falls back to string-based DafnyExprToSmt for LeafExpression nodes
     /// (produced by predicate inlining) and unrecognized AST patterns.
     /// </summary>
@@ -1037,7 +1022,7 @@ static class SmtTranslator
         // Unwrap syntax wrappers
         expr = UnwrapExpr(expr);
 
-        // LeafExpression (from predicate inlining) — use string-based fallback
+        // LeafExpression (from predicate inlining) â€” use string-based fallback
         if (expr is LeafExpression leaf)
         {
             var renamedInputs = BuildRenamedInputs(inputs, mutableNames, isPostContext && !insideOld);
@@ -1056,7 +1041,7 @@ static class SmtTranslator
             return inner != null ? $"(not {inner})" : null;
         }
 
-        // OldExpr — switch to pre-state renaming
+        // OldExpr â€” switch to pre-state renaming
         if (expr is OldExpr oldExpr)
             return ExprToSmt(oldExpr.Expr, inputs, mutableNames, isPostContext, insideOld: true);
 
@@ -1113,7 +1098,7 @@ static class SmtTranslator
                 var (smtSeq, upperBound, lowerBound) = seqInfo.Value;
                 string containsExpr;
                 if (lowerBound != null && upperBound != null)
-                    // a[lo..hi] — combine both bounds
+                    // a[lo..hi] â€” combine both bounds
                     containsExpr = ExpandSeqContainsBounded(smtSeq, valSmt, upperBound, lowerBound);
                 else if (lowerBound != null)
                     containsExpr = ExpandSeqContainsFromIndex(smtSeq, valSmt, lowerBound);
@@ -1124,7 +1109,7 @@ static class SmtTranslator
                 return bin.Op == BinaryExpr.Opcode.NotIn ? $"(not {containsExpr})" : containsExpr;
             }
 
-            // Tuple equality: r == (e1, e2) → (and (= r_0 smt_e1) (= r_1 smt_e2))
+            // Tuple equality: r == (e1, e2) â†’ (and (= r_0 smt_e1) (= r_1 smt_e2))
             if ((bin.Op == BinaryExpr.Opcode.Eq || bin.Op == BinaryExpr.Opcode.Neq)
                 && (IsTupleDatatypeValue(bin.E0) || IsTupleDatatypeValue(bin.E1)))
             {
@@ -1161,7 +1146,7 @@ static class SmtTranslator
                 }
             }
 
-            // multiset(s1) == multiset(s2) → permutation constraint via element counting
+            // multiset(s1) == multiset(s2) â†’ permutation constraint via element counting
             if ((bin.Op == BinaryExpr.Opcode.Eq || bin.Op == BinaryExpr.Opcode.Neq)
                 && UnwrapExpr(bin.E0) is MultiSetFormingExpr mf0
                 && UnwrapExpr(bin.E1) is MultiSetFormingExpr mf1)
@@ -1250,7 +1235,7 @@ static class SmtTranslator
             goto fallback;
         }
 
-        // DatatypeValue — enum constructor reference (resolved AST, e.g. Red or Red())
+        // DatatypeValue â€” enum constructor reference (resolved AST, e.g. Red or Red())
         if (expr is DatatypeValue dtVal && dtVal.Arguments.Count == 0)
         {
             if (_enumConstructors.TryGetValue(dtVal.MemberName, out var enumInfo))
@@ -1260,7 +1245,7 @@ static class SmtTranslator
         // ThisExpr: 'this' has no SMT representation (object reference)
         if (expr is ThisExpr) return null;
 
-        // IdentifierExpr / NameSegment — check enum constructor first, then variable
+        // IdentifierExpr / NameSegment â€” check enum constructor first, then variable
         // Skip 'Repr' (ghost set<object>, not an SMT-representable variable)
         if (expr is IdentifierExpr idExpr)
         {
@@ -1338,8 +1323,8 @@ static class SmtTranslator
                     var bv0 = boundVars[0];
 
                     // First check: if bound var is a VALUE (appears in set select AND compared to seq.nth)
-                    // then skip ALL finite expansions — keep as real forall/exists.
-                    // Example: "forall x :: x in result ==> x in a[..]" — x ranges over all values,
+                    // then skip ALL finite expansions â€” keep as real forall/exists.
+                    // Example: "forall x :: x in result ==> x in a[..]" â€” x ranges over all values,
                     // not just array indices. Finite expansion would miss values outside arrays.
                     {
                         var bvPatEarly = Regex.Escape(bv0.Name);
@@ -1354,7 +1339,7 @@ static class SmtTranslator
                     // If the body contains (= varName (seq.nth SEQNAME K)), the bound variable
                     // is seq-typed (e.g., "forall x :: x in outerSeq ==> body"). Substitute
                     // (seq.nth outerSeq k) for each k instead of an integer index.
-                    // After post-processing, (seq.nth outerSeq k) → outerSeq_k (flat encoding).
+                    // After post-processing, (seq.nth outerSeq k) â†’ outerSeq_k (flat encoding).
                     var seqNameMatch = Regex.Match(bodySmt,
                         @"\(= " + Regex.Escape(bv0.Name) + @" \(seq\.nth (\S+) \d+\)\)");
                     if (!seqNameMatch.Success)
@@ -1371,8 +1356,8 @@ static class SmtTranslator
                                 @"(?<![a-zA-Z_])" + Regex.Escape(bv0.Name) + @"(?![a-zA-Z_0-9])",
                                 elem);
                             // Guard: only consider when k is a valid index in the outer seq.
-                            // For forall: (=> guard body) — vacuously true for out-of-bounds (correct).
-                            // For exists: (and guard body) — out-of-bounds doesn't count as witness.
+                            // For forall: (=> guard body) â€” vacuously true for out-of-bounds (correct).
+                            // For exists: (and guard body) â€” out-of-bounds doesn't count as witness.
                             var guard = $"(>= (seq.len {outerSeqSmt}) {k + 1})";
                             instance = quantifier == "forall"
                                 ? $"(=> {guard} {instance})"
@@ -1385,7 +1370,7 @@ static class SmtTranslator
                     }
 
                     // Check if bound var is a value (appears in set select AND compared to seq.nth)
-                    // — if so, skip finite expansion and keep as real forall
+                    // â€” if so, skip finite expansion and keep as real forall
                     var bvPat = Regex.Escape(bv0.Name);
                     bool bvInSelect = Regex.IsMatch(bodySmt, @"\(select \S+ " + bvPat + @"\b");
                     bool bvComparedToSeqNth = Regex.IsMatch(bodySmt,
@@ -1446,7 +1431,7 @@ static class SmtTranslator
 
             if (isMultiset && seqSel.SelectOne && seqSel.E0 != null)
             {
-                // M[x] → (select M x) — returns the count/multiplicity
+                // M[x] â†’ (select M x) â€” returns the count/multiplicity
                 var idxSmt = ExprToSmt(seqSel.E0, inputs, mutableNames, isPostContext, insideOld);
                 if (idxSmt == null) goto fallback;
                 return $"(select {seqBaseSmt} {idxSmt})";
@@ -1455,7 +1440,7 @@ static class SmtTranslator
             var isMap = origName != null && inputs.Any(v => v.Name == origName && TypeUtils.IsMapType(v.Type));
             if (isMap && seqSel.SelectOne && seqSel.E0 != null)
             {
-                // m[k] → (select m_values k) — returns the value
+                // m[k] â†’ (select m_values k) â€” returns the value
                 var idxSmt = ExprToSmt(seqSel.E0, inputs, mutableNames, isPostContext, insideOld);
                 if (idxSmt == null) goto fallback;
                 return $"(select {seqBaseSmt}_values {idxSmt})";
@@ -1463,11 +1448,11 @@ static class SmtTranslator
 
             if (seqSel.SelectOne)
             {
-                // a[i] → seq.nth
+                // a[i] â†’ seq.nth
                 if (seqSel.E0 == null) goto fallback;
                 var idxSmt = ExprToSmt(seqSel.E0, inputs, mutableNames, isPostContext, insideOld);
                 if (idxSmt == null) goto fallback;
-                // For tuple-element arrays/seqs, there's no single a_seq — use a_seq_0 for bounds check
+                // For tuple-element arrays/seqs, there's no single a_seq â€” use a_seq_0 for bounds check
                 var selElemType = origName != null
                     ? inputs.FirstOrDefault(v => v.Name == origName).Type
                     : null;
@@ -1478,7 +1463,7 @@ static class SmtTranslator
                 var idxName = GetOriginalName(seqSel.E0);
                 if (idxName == null || !_boundVars.Contains(idxName))
                     _wfGuards.Add($"(and (<= 0 {idxSmt}) (< {idxSmt} (seq.len {smtSeq})))");
-                // For tuple elements, return null — caller should use GetTupleComponentSmt
+                // For tuple elements, return null â€” caller should use GetTupleComponentSmt
                 if (isTupleElemSel) goto fallback;
                 var ret = $"(seq.nth {smtSeq} {idxSmt})";
                 return ret;
@@ -1488,7 +1473,7 @@ static class SmtTranslator
                 // a[..], a[lo..hi], a[..hi]
                 var smtSeq = isArray ? $"{seqBaseSmt}_seq" : seqBaseSmt;
                 if (seqSel.E0 == null && seqSel.E1 == null)
-                    return smtSeq; // a[..] → full sequence
+                    return smtSeq; // a[..] â†’ full sequence
                 var fromSmt = seqSel.E0 != null
                     ? ExprToSmt(seqSel.E0, inputs, mutableNames, isPostContext, insideOld) : "0";
                 var toSmt = seqSel.E1 != null
@@ -1500,7 +1485,7 @@ static class SmtTranslator
             }
         }
 
-        // SeqDisplayExpr: [x] → (seq.unit x), [x, y] → (seq.++ (seq.unit x) (seq.unit y)), [] → empty
+        // SeqDisplayExpr: [x] â†’ (seq.unit x), [x, y] â†’ (seq.++ (seq.unit x) (seq.unit y)), [] â†’ empty
         if (expr is SeqDisplayExpr seqDisp)
         {
             if (seqDisp.Elements.Count == 0)
@@ -1516,7 +1501,7 @@ static class SmtTranslator
             return $"(seq.++ {string.Join(" ", elemSmts)})";
         }
 
-        // MemberSelectExpr: a.Length → a_len, this.field → field (with renaming)
+        // MemberSelectExpr: a.Length â†’ a_len, this.field â†’ field (with renaming)
         if (expr is MemberSelectExpr memSel)
         {
             if (memSel.MemberName == "Length")
@@ -1558,7 +1543,7 @@ static class SmtTranslator
                                     }
                                     else
                                     {
-                                        // seq<(T,U)> — component sequences named {name}_{ci}
+                                        // seq<(T,U)> â€” component sequences named {name}_{ci}
                                         seqName = $"{innerOrigName}_{tupleIdx}";
                                     }
                                     var idxName = GetOriginalName(innerSeqSel.E0);
@@ -1650,7 +1635,7 @@ static class SmtTranslator
         // FunctionCallExpr
         if (expr is FunctionCallExpr funcCall)
         {
-            // IsSorted: built-in SMT encoding — finite consecutive-pair expansion
+            // IsSorted: built-in SMT encoding â€” finite consecutive-pair expansion
             // (avoids Z3 quantifier instantiation failures with two-variable forall over seq.nth)
             if (funcCall.Name == "IsSorted" && funcCall.Args.Count == 1)
             {
@@ -1671,45 +1656,16 @@ static class SmtTranslator
             var smtArgs = funcCall.Args.Select(a => ExprToSmt(a, inputs, mutableNames, isPostContext, insideOld)).ToList();
             if (smtArgs.All(a => a != null))
             {
-                // Only register as uninterpreted if not already defined via finite unrolling
-                if (!_definedFuncNames.Contains(funcCall.Name))
-                    _uninterpFuncs[funcCall.Name] = smtArgs.Count;
-                // For defined functions, substitute array args with their _seq form
-                // (the define-fun declares seq-typed params, but ExprToSmt returns the Int-typed array handle)
-                if (_definedFuncParamInfo.TryGetValue(funcCall.Name, out var paramInfo))
-                {
-                    for (int pi = 0; pi < Math.Min(smtArgs.Count, paramInfo.Count); pi++)
-                    {
-                        if (TypeUtils.IsArrayType(paramInfo[pi].pType) && !smtArgs[pi]!.EndsWith("_seq"))
-                            smtArgs[pi] = smtArgs[pi] + "_seq";
-                    }
-                    // Fill in missing default args (e.g. SumOfNegatives(a) → SumOfNegatives(a, a_len))
-                    // For ArrayIndexedCountdown: missing int/nat param defaults to array.Length
-                    if (smtArgs.Count < paramInfo.Count)
-                    {
-                        // Find the array arg (already translated to _seq form)
-                        var arrayArgIdx = Enumerable.Range(0, paramInfo.Count)
-                            .FirstOrDefault(i => TypeUtils.IsArrayType(paramInfo[i].pType), -1);
-                        for (int pi = smtArgs.Count; pi < paramInfo.Count; pi++)
-                        {
-                            if ((paramInfo[pi].pType == "int" || paramInfo[pi].pType == "nat")
-                                && arrayArgIdx >= 0 && arrayArgIdx < smtArgs.Count)
-                            {
-                                // Default: array.Length → (seq.len arrayArg)
-                                smtArgs.Add($"(seq.len {smtArgs[arrayArgIdx]})");
-                            }
-                        }
-                    }
-                }
+                _uninterpFuncs[funcCall.Name] = smtArgs.Count;
                 return $"({funcCall.Name} {string.Join(" ", smtArgs)})";
             }
             goto fallback;
         }
 
-        // UnaryExpr for |expr| (sequence length / set cardinality) — may be UnaryOpExpr with Cardinality
+        // UnaryExpr for |expr| (sequence length / set cardinality) â€” may be UnaryOpExpr with Cardinality
         // Handled in fallback for now.
 
-        // SetDisplayExpr: {e1, e2, ...} — set literal
+        // SetDisplayExpr: {e1, e2, ...} â€” set literal
         if (expr is SetDisplayExpr setDisplay)
         {
             var setType = setDisplay.Type?.ToString() ?? "";
@@ -1728,7 +1684,7 @@ static class SmtTranslator
             return result;
         }
 
-        // MultiSetDisplayExpr: multiset{e1, e2, ...} — multiset literal
+        // MultiSetDisplayExpr: multiset{e1, e2, ...} â€” multiset literal
         if (expr is MultiSetDisplayExpr multisetDisplay)
         {
             if (multisetDisplay.Elements.Count == 0)
@@ -1748,7 +1704,7 @@ static class SmtTranslator
         // Fallback: convert to string and use the string-based translator
 
         var exprStr = DnfEngine.ExprToString(expr);
-        // Skip expressions referencing Repr or bare 'this' — these are heap constraints
+        // Skip expressions referencing Repr or bare 'this' â€” these are heap constraints
         // that can't be represented in our SMT encoding
         if (Regex.IsMatch(exprStr, @"\bRepr\b") || Regex.IsMatch(exprStr, @"\bthis\b"))
             return null;
@@ -1797,7 +1753,7 @@ static class SmtTranslator
 
     /// <summary>
     /// Extracts the original (unrenamed) identifier name from an expression.
-    /// Looks through OldExpr wrappers (e.g., old(a)[i] → "a").
+    /// Looks through OldExpr wrappers (e.g., old(a)[i] â†’ "a").
     /// </summary>
     static string? GetOriginalName(Expression expr)
     {
@@ -1894,8 +1850,8 @@ static class SmtTranslator
 
     /// <summary>
     /// Gets the SMT expression for the ci-th component of a tuple-typed expression.
-    /// Handles: simple variable names (r → r_ci), SeqSelectExpr (a[i] → seq.nth a_seq_ci i),
-    /// DatatypeValue tuple literals ((e1, e2) → translate e_ci), and MemberSelectExpr (a[0].0).
+    /// Handles: simple variable names (r â†’ r_ci), SeqSelectExpr (a[i] â†’ seq.nth a_seq_ci i),
+    /// DatatypeValue tuple literals ((e1, e2) â†’ translate e_ci), and MemberSelectExpr (a[0].0).
     /// </summary>
     static string? GetTupleComponentSmt(Expression expr, int ci,
         List<(string Name, string Type)> inputs, HashSet<string> mutableNames,
@@ -1990,7 +1946,7 @@ static class SmtTranslator
     }
 
     /// <summary>
-    /// Checks if an AST expression is a sequence type (for + → seq.++ disambiguation).
+    /// Checks if an AST expression is a sequence type (for + â†’ seq.++ disambiguation).
     /// </summary>
     static bool IsSeqExprAst(Expression expr, List<(string Name, string Type)> inputs)
     {
@@ -2146,7 +2102,7 @@ static class SmtTranslator
         if (mutableNames.Count == 0) return literal;
         var result = literal;
 
-        // Step 1: Handle old() expressions — strip old() and rename mutable refs to _pre.
+        // Step 1: Handle old() expressions â€” strip old() and rename mutable refs to _pre.
         // Process all old(...) occurrences with balanced parenthesis matching.
         while (true)
         {
@@ -2162,7 +2118,7 @@ static class SmtTranslator
                 else if (result[pos] == ')') depth--;
                 pos++;
             }
-            if (depth != 0) break; // unbalanced — safety exit
+            if (depth != 0) break; // unbalanced â€” safety exit
 
             var innerExpr = result.Substring(start, pos - 1 - start);
             // Rename mutable refs in the inner expression to _pre
@@ -2193,7 +2149,7 @@ static class SmtTranslator
         var expr = dafnyExpr.Trim();
 
         // Strip balanced outer parentheses: (expr) -> expr
-        // But don't strip tuple literals like (e1, e2) — detected by comma at depth 1
+        // But don't strip tuple literals like (e1, e2) â€” detected by comma at depth 1
         while (expr.StartsWith("(") && expr.EndsWith(")"))
         {
             // Verify the parens are actually balanced outer parens, not e.g. "(a) && (b)"
@@ -2213,7 +2169,7 @@ static class SmtTranslator
                 break;
         }
 
-        // multiset(s1) == multiset(s2) → permutation constraint via element counting
+        // multiset(s1) == multiset(s2) â†’ permutation constraint via element counting
         var msetEqMatch = Regex.Match(expr, @"^multiset\((.+?)\)\s*==\s*multiset\((.+?)\)$");
         if (msetEqMatch.Success)
         {
@@ -2340,7 +2296,7 @@ static class SmtTranslator
                     var bv0s = boundVars[0];
                     // Try body-pattern detection: if body contains (= varName (seq.nth SEQNAME K)),
                     // the bound variable is seq-typed. Use (seq.nth outerSeq k) substitution.
-                    // Do NOT require smtType check — string-path bound vars default to "Int".
+                    // Do NOT require smtType check â€” string-path bound vars default to "Int".
                     var seqNameMatchS = Regex.Match(bodySmt,
                         @"\(= " + Regex.Escape(bv0s.name) + @" \(seq\.nth (\S+) \d+\)\)");
                     if (!seqNameMatchS.Success)
@@ -2357,8 +2313,8 @@ static class SmtTranslator
                                 @"(?<![a-zA-Z_])" + Regex.Escape(bv0s.name) + @"(?![a-zA-Z_0-9])",
                                 elem);
                             // Guard: only consider when k is a valid index in the outer seq.
-                            // For forall: (=> guard body) — vacuously true for out-of-bounds.
-                            // For exists: (and guard body) — out-of-bounds doesn't count as witness.
+                            // For forall: (=> guard body) â€” vacuously true for out-of-bounds.
+                            // For exists: (and guard body) â€” out-of-bounds doesn't count as witness.
                             var guard = $"(>= (seq.len {outerSeqSmtS}) {k + 1})";
                             instance = quantifier == "forall"
                                 ? $"(=> {guard} {instance})"
@@ -2619,14 +2575,14 @@ static class SmtTranslator
 
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
-                // Suffix slice: a[lo..] — elem not in elements from index lo onward
+                // Suffix slice: a[lo..] â€” elem not in elements from index lo onward
                 if (sliceLowerBound != null)
                 {
                     var lowerSmt = DafnyExprToSmt(sliceLowerBound, inputs);
                     if (lowerSmt != null)
                         return $"(not {ExpandSeqContainsFromIndex(smtSeq, valExpr, lowerSmt)})";
                 }
-                // Prefix slice: a[..hi] — elem not in first hi elements
+                // Prefix slice: a[..hi] â€” elem not in first hi elements
                 if (sliceUpperBound != null)
                 {
                     var boundSmt = DafnyExprToSmt(sliceUpperBound, inputs);
@@ -2666,14 +2622,14 @@ static class SmtTranslator
 
                 var isArray = inputs.Any(v => v.Name == seqName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = (hasSlice || isArray) ? $"{seqName}_seq" : seqName;
-                // Suffix slice: a[lo..] — elem in elements from index lo onward
+                // Suffix slice: a[lo..] â€” elem in elements from index lo onward
                 if (sliceLowerBound != null)
                 {
                     var lowerSmt = DafnyExprToSmt(sliceLowerBound, inputs);
                     if (lowerSmt != null)
                         return ExpandSeqContainsFromIndex(smtSeq, valExpr, lowerSmt);
                 }
-                // Prefix slice: a[..hi] — elem in first hi elements
+                // Prefix slice: a[..hi] â€” elem in first hi elements
                 if (sliceUpperBound != null)
                 {
                     var boundSmt = DafnyExprToSmt(sliceUpperBound, inputs);
@@ -2764,7 +2720,7 @@ static class SmtTranslator
             if (inner != null) return $"(seq.len {inner})";
         }
 
-        // Handle a[..][i] — array-to-seq slice then element access (from predicate inlining
+        // Handle a[..][i] â€” array-to-seq slice then element access (from predicate inlining
         // where seq param s is substituted with a[..], turning s[k] into a[..][k]).
         var sliceIndexMatch = Regex.Match(expr, @"^(\w+)\[\.\.\]\[(.+)\]$");
         if (sliceIndexMatch.Success)
@@ -3005,32 +2961,7 @@ static class SmtTranslator
             var smtArgs = args.Select(a => DafnyExprToSmt(a.Trim(), inputs)).ToList();
             if (smtArgs.All(a => a != null))
             {
-                // Only register as uninterpreted if not already defined via finite unrolling
-                if (!_definedFuncNames.Contains(funcName))
-                    _uninterpFuncs[funcName] = smtArgs.Count;
-                // For defined functions, substitute array args with their _seq form
-                if (_definedFuncParamInfo.TryGetValue(funcName, out var paramInfo))
-                {
-                    for (int pi = 0; pi < Math.Min(smtArgs.Count, paramInfo.Count); pi++)
-                    {
-                        if (TypeUtils.IsArrayType(paramInfo[pi].pType) && !smtArgs[pi]!.EndsWith("_seq"))
-                            smtArgs[pi] = smtArgs[pi] + "_seq";
-                    }
-                    // Fill in missing default args
-                    if (smtArgs.Count < paramInfo.Count)
-                    {
-                        var arrayArgIdx = Enumerable.Range(0, paramInfo.Count)
-                            .FirstOrDefault(i => TypeUtils.IsArrayType(paramInfo[i].pType), -1);
-                        for (int pi = smtArgs.Count; pi < paramInfo.Count; pi++)
-                        {
-                            if ((paramInfo[pi].pType == "int" || paramInfo[pi].pType == "nat")
-                                && arrayArgIdx >= 0 && arrayArgIdx < smtArgs.Count)
-                            {
-                                smtArgs.Add($"(seq.len {smtArgs[arrayArgIdx]})");
-                            }
-                        }
-                    }
-                }
+                _uninterpFuncs[funcName] = smtArgs.Count;
                 return $"({funcName} {string.Join(" ", smtArgs)})";
             }
         }
@@ -3078,7 +3009,7 @@ static class SmtTranslator
                 if ((remaining.StartsWith("forall ") || remaining.StartsWith("exists ")) &&
                     (i == 0 || !char.IsLetterOrDigit(expr[i - 1])))
                 {
-                    // Skip to end — quantifier body extends to end of expression
+                    // Skip to end â€” quantifier body extends to end of expression
                     break;
                 }
             }
@@ -3119,7 +3050,7 @@ static class SmtTranslator
     /// <summary>
     /// Builds consecutive-pair constraints with a given comparison operator.
     /// Used by boundary analysis to generate ordering shape tiers:
-    ///   op="=" → all-equal array, op="&lt;" → strictly ascending, op="&gt;" → strictly descending.
+    ///   op="=" â†’ all-equal array, op="&lt;" â†’ strictly ascending, op="&gt;" â†’ strictly descending.
     /// </summary>
     internal static string BuildConsecutivePairsSmt(string seqName, string op)
     {
@@ -3127,592 +3058,6 @@ static class SmtTranslator
         for (int i = 0; i < MAX_SEQ_LEN - 1; i++)
             conjuncts.Add($"(=> (>= (seq.len {seqName}) {i + 2}) ({op} (seq.nth {seqName} {i}) (seq.nth {seqName} {i + 1})))");
         return conjuncts.Count == 1 ? conjuncts[0] : $"(and {string.Join(" ", conjuncts)})";
-    }
-
-    // Maximum depth for integer countdown unrolling (e.g., Fact(10), C(10))
-    internal const int MAX_UNROLL_DEPTH = 10;
-
-    /// <summary>
-    /// Attempts to build a finite (define-fun ...) for a recursive function.
-    /// Dispatches to the appropriate builder based on recursion kind.
-    /// Returns true if a define-fun was generated and added to _definedFuncs.
-    /// </summary>
-    internal static bool TryBuildDefineFun(
-        string name,
-        List<(string pName, string pType)> parameters,
-        string returnType, string body,
-        DafnyParser.RecursionKind kind)
-    {
-        string? smt = kind switch
-        {
-            DafnyParser.RecursionKind.IntCountdown
-                => BuildIntCountdownDefineFun(name, parameters, returnType, body),
-            DafnyParser.RecursionKind.SeqFold
-                => BuildSeqFoldDefineFun(name, parameters, returnType, body),
-            DafnyParser.RecursionKind.ArrayIndexedCountdown
-                => BuildArrayIndexedDefineFun(name, parameters, returnType, body),
-            _ => null
-        };
-        if (smt != null)
-        {
-            _definedFuncs[name] = smt;
-            _definedFuncNames.Add(name);
-            _definedFuncParamInfo[name] = parameters;
-            return true;
-        }
-        return false;
-    }
-
-    /// <summary>
-    /// Builds a define-fun for integer countdown functions like Fact(n), C(n), SumOfDigits(n).
-    /// Precomputes concrete values by evaluating the recurrence in C#, then builds a nested ite chain:
-    ///   (define-fun Fact ((n Int)) Int (ite (= n 0) 1 (ite (= n 1) 1 (ite (= n 2) 2 ... 0))))
-    /// </summary>
-    static string? BuildIntCountdownDefineFun(
-        string name,
-        List<(string pName, string pType)> parameters,
-        string returnType, string body)
-    {
-        // Must have exactly one parameter of type nat or int
-        if (parameters.Count != 1) return null;
-        var (paramName, paramType) = parameters[0];
-        if (paramType != "nat" && paramType != "int") return null;
-
-        // Parse the body pattern: if <cond> then <base> else <expr with recursive call>
-        // The body format from ExprToString is like: "if n == 0 then 1 else n * Fact(n - 1)"
-        var ifMatch = Regex.Match(body, @"^if\s+(.+?)\s+then\s+(.+?)\s+else\s+(.+)$");
-        if (!ifMatch.Success) return null;
-
-        var condStr = ifMatch.Groups[1].Value.Trim();
-        var baseStr = ifMatch.Groups[2].Value.Trim();
-        var recurStr = ifMatch.Groups[3].Value.Trim();
-
-        // Handle inverted form: if n > 0 then <recursive> else <base>
-        bool inverted = false;
-        if (Regex.IsMatch(condStr, $@"^{Regex.Escape(paramName)}\s*>\s*\d+$") ||
-            Regex.IsMatch(condStr, $@"^{Regex.Escape(paramName)}\s*!=\s*\d+$"))
-        {
-            inverted = true;
-            (baseStr, recurStr) = (recurStr, baseStr);
-        }
-
-        // Determine base case value(s)
-        var baseValues = new Dictionary<long, long>();
-        if (long.TryParse(baseStr, out var baseVal))
-        {
-            if (inverted)
-            {
-                // For "if n > K then recurse else base", base applies to 0..K
-                var gtMatch = Regex.Match(condStr, $@"^{Regex.Escape(paramName)}\s*>\s*(\d+)$");
-                if (gtMatch.Success && long.TryParse(gtMatch.Groups[1].Value, out var gtN))
-                {
-                    for (long i = 0; i <= gtN; i++)
-                        baseValues[i] = baseVal;
-                }
-            }
-            else
-            {
-                var eqMatch = Regex.Match(condStr, $@"^{Regex.Escape(paramName)}\s*==\s*(\d+)$");
-                if (eqMatch.Success && long.TryParse(eqMatch.Groups[1].Value, out var baseN))
-                    baseValues[baseN] = baseVal;
-
-                var ltMatch = Regex.Match(condStr, $@"^{Regex.Escape(paramName)}\s*<\s*(\d+)$");
-                if (ltMatch.Success && long.TryParse(ltMatch.Groups[1].Value, out var ltBound))
-                    for (long i = 0; i < ltBound; i++)
-                        baseValues[i] = baseVal;
-
-                var leqMatch = Regex.Match(condStr, $@"^{Regex.Escape(paramName)}\s*<=\s*(\d+)$");
-                if (leqMatch.Success && long.TryParse(leqMatch.Groups[1].Value, out var leqBound))
-                    for (long i = 0; i <= leqBound; i++)
-                        baseValues[i] = baseVal;
-            }
-        }
-        // Handle paramName as base value: "if n == 0 then 0 else ..." or "if n < 2 then n else ..."
-        if (baseValues.Count == 0 && baseStr == paramName)
-        {
-            var eqMatch = Regex.Match(condStr, $@"^{Regex.Escape(paramName)}\s*==\s*(\d+)$");
-            if (eqMatch.Success && long.TryParse(eqMatch.Groups[1].Value, out var baseN))
-                baseValues[baseN] = baseN; // base case returns the parameter value itself
-
-            var ltMatch = Regex.Match(condStr, $@"^{Regex.Escape(paramName)}\s*<\s*(\d+)$");
-            if (ltMatch.Success && long.TryParse(ltMatch.Groups[1].Value, out var ltBound))
-                for (long i = 0; i < ltBound; i++)
-                    baseValues[i] = i;
-        }
-
-        if (baseValues.Count == 0) return null;
-
-        // Compute values iteratively for 0..MAX_UNROLL_DEPTH
-        var computed = new Dictionary<long, long>(baseValues);
-        for (long i = 0; i <= MAX_UNROLL_DEPTH; i++)
-        {
-            if (computed.ContainsKey(i)) continue;
-            // Substitute paramName with i, evaluate the recursive expression
-            var expr = recurStr.Replace(paramName, i.ToString());
-            var result = EvalArithExpr(expr, name, computed);
-            if (result == long.MinValue)
-            {
-                Console.WriteLine($"  Note: could not precompute {name}({i}) — falling back to uninterpreted");
-                return null;
-            }
-            computed[i] = result;
-        }
-
-        // Build the nested ite chain
-        var smtRetType = (returnType == "real") ? "Real"
-                       : (returnType == "bool") ? "Bool" : "Int";
-        var smtParamType = (paramType == "real") ? "Real" : "Int";
-        var ite = "0"; // default for out-of-range
-        for (long i = MAX_UNROLL_DEPTH; i >= 0; i--)
-        {
-            var val = computed[i];
-            var smtVal = val < 0 ? $"(- {-val})" : val.ToString();
-            ite = $"(ite (= {paramName} {i}) {smtVal} {ite})";
-        }
-
-        return $"(define-fun {name} (({paramName} {smtParamType})) {smtRetType} {ite})";
-    }
-
-    /// <summary>
-    /// Simple arithmetic expression evaluator for integer expressions.
-    /// Handles: +, -, *, /, %, parentheses, function calls to already-computed values.
-    /// Returns long.MinValue on failure.
-    /// </summary>
-    static long EvalArithExpr(string expr, string funcName, Dictionary<long, long> known)
-    {
-        expr = expr.Trim();
-
-        // Try parsing as a literal
-        if (long.TryParse(expr, out var lit)) return lit;
-
-        // Handle parenthesized expression
-        if (expr.StartsWith("(") && FindMatchingParen(expr, 0) == expr.Length - 1)
-            return EvalArithExpr(expr.Substring(1, expr.Length - 2), funcName, known);
-
-        // Handle function call: FuncName(argExpr) — only if it spans the entire expression
-        if (expr.StartsWith(funcName + "("))
-        {
-            var argStart = funcName.Length + 1;
-            var argEnd = FindMatchingParen(expr, funcName.Length);
-            if (argEnd == expr.Length - 1) // closing paren is the last char
-            {
-                var argStr = expr.Substring(argStart, argEnd - argStart);
-                var argVal = EvalArithExpr(argStr, funcName, known);
-                if (argVal == long.MinValue) return long.MinValue;
-                return known.TryGetValue(argVal, out var fVal) ? fVal : long.MinValue;
-            }
-        }
-
-        // Binary operators (lowest precedence first): +, -, then *, /, %
-        // Find the rightmost + or - at depth 0 (not inside parens)
-        int splitPos = -1;
-        int depth = 0;
-        for (int i = expr.Length - 1; i >= 1; i--)
-        {
-            if (expr[i] == ')') depth++;
-            else if (expr[i] == '(') depth--;
-            else if (depth == 0 && (expr[i] == '+' || expr[i] == '-'))
-            {
-                // A '-' is a binary op only if left side is not an operator or open paren
-                if (i > 0 && expr[i - 1] != '*' && expr[i - 1] != '/' && expr[i - 1] != '%'
-                          && expr[i - 1] != '+' && expr[i - 1] != '-' && expr[i - 1] != '(')
-                {
-                    splitPos = i;
-                    break;
-                }
-            }
-        }
-        if (splitPos > 0)
-        {
-            var lhs = EvalArithExpr(expr.Substring(0, splitPos).Trim(), funcName, known);
-            var rhs = EvalArithExpr(expr.Substring(splitPos + 1).Trim(), funcName, known);
-            if (lhs == long.MinValue || rhs == long.MinValue) return long.MinValue;
-            return expr[splitPos] == '+' ? lhs + rhs : lhs - rhs;
-        }
-
-        // Find the rightmost * / % at depth 0
-        splitPos = -1;
-        depth = 0;
-        for (int i = expr.Length - 1; i >= 1; i--)
-        {
-            if (expr[i] == ')') depth++;
-            else if (expr[i] == '(') depth--;
-            else if (depth == 0 && (expr[i] == '*' || expr[i] == '/' || expr[i] == '%'))
-            {
-                splitPos = i;
-                break;
-            }
-        }
-        if (splitPos > 0)
-        {
-            var lhs = EvalArithExpr(expr.Substring(0, splitPos).Trim(), funcName, known);
-            var rhs = EvalArithExpr(expr.Substring(splitPos + 1).Trim(), funcName, known);
-            if (lhs == long.MinValue || rhs == long.MinValue) return long.MinValue;
-            if (rhs == 0 && (expr[splitPos] == '/' || expr[splitPos] == '%')) return long.MinValue;
-            return expr[splitPos] switch
-            {
-                '*' => lhs * rhs,
-                '/' => lhs / rhs,
-                '%' => lhs % rhs,
-                _ => long.MinValue
-            };
-        }
-
-        return long.MinValue;
-    }
-
-    /// <summary>
-    /// Finds the index of the closing parenthesis matching the one at position start.
-    /// </summary>
-    static int FindMatchingParen(string s, int start)
-    {
-        if (start >= s.Length || s[start] != '(') return -1;
-        int depth = 0;
-        for (int i = start; i < s.Length; i++)
-        {
-            if (s[i] == '(') depth++;
-            else if (s[i] == ')') { depth--; if (depth == 0) return i; }
-        }
-        return -1;
-    }
-
-    /// <summary>
-    /// Builds a define-fun for array-indexed countdown functions like SumOfNegatives(a, n).
-    /// The function has an array param and a single int/nat index param that counts down.
-    /// Pattern: if n == 0 then BASE else [if COND then F(a, n-1) OP ELEM else F(a, n-1)]
-    ///          or: if n == 0 then BASE else F(a, n-1) OP a[n-1]
-    /// Output: nested ite chain over n=0..MAX_SEQ_LEN with symbolic per-element accumulation.
-    /// </summary>
-    static string? BuildArrayIndexedDefineFun(
-        string name,
-        List<(string pName, string pType)> parameters,
-        string returnType, string body)
-    {
-        // Find array param and single int/nat index param
-        var arrayParam = parameters.FirstOrDefault(p => TypeUtils.IsArrayType(p.pType));
-        if (arrayParam == default) return null;
-        var arrayName = arrayParam.pName;
-
-        var indexParams = parameters.Where(p => p.pType == "int" || p.pType == "nat").ToList();
-        if (indexParams.Count != 1) return null; // only support single index countdown
-        var idxName = indexParams[0].pName;
-
-        // Parse body: if <cond> then <base/recur> else <recur/base>
-        var ifMatch = Regex.Match(body, @"^if\s+(.+?)\s+then\s+(.+?)\s+else\s+(.+)$");
-        if (!ifMatch.Success) return null;
-
-        var condStr = ifMatch.Groups[1].Value.Trim();
-        var thenStr = ifMatch.Groups[2].Value.Trim();
-        var elseStr = ifMatch.Groups[3].Value.Trim();
-
-        // Determine base case: n == 0 or n <= 0
-        string baseStr, recurStr;
-        if (Regex.IsMatch(condStr, $@"^{Regex.Escape(idxName)}\s*==\s*0$") ||
-            Regex.IsMatch(condStr, $@"^{Regex.Escape(idxName)}\s*<=\s*0$"))
-        {
-            baseStr = thenStr;
-            recurStr = elseStr;
-        }
-        else if (Regex.IsMatch(condStr, $@"^{Regex.Escape(idxName)}\s*>\s*0$") ||
-                 Regex.IsMatch(condStr, $@"^{Regex.Escape(idxName)}\s*!=\s*0$"))
-        {
-            baseStr = elseStr;
-            recurStr = thenStr;
-        }
-        else
-            return null;
-
-        // Parse base value
-        if (!long.TryParse(baseStr, out var baseVal)) return null;
-        var smtBaseVal = baseVal < 0 ? $"(- {-baseVal})" : baseVal.ToString();
-
-        // Build SMT types
-        var elemType = TypeUtils.GetSeqElementType(arrayParam.pType);
-        var smtElemType = TypeUtils.DafnyTypeToSmt(elemType ?? "int");
-        var smtRetType = (returnType == "real") ? "Real"
-                       : (returnType == "bool") ? "Bool" : "Int";
-
-        // Detect per-element contribution from recurStr:
-        // Case A: Simple unconditional — "F(a, n-1) + a[n-1]" or "a[n-1] + F(a, n-1)"
-        // Case B: Conditional — "if a[n-1] < 0 then F(a, n-1) + a[n-1] else F(a, n-1)"
-        //         which means: per-element = (ite (< elem 0) elem 0) with op = +
-
-        string? combineOp = null;
-        // perElemTemplate: an SMT expression template where {elem} is replaced with (seq.nth arrayName i)
-        string? perElemTemplate = null;
-
-        // First check for conditional pattern:
-        // "if COND then EXPR1 else EXPR2" where one has F(...) OP SOMETHING, other has just F(...)
-        var innerIfMatch = Regex.Match(recurStr, @"^if\s+(.+?)\s+then\s+(.+?)\s+else\s+(.+)$");
-        if (innerIfMatch.Success)
-        {
-            var innerCond = innerIfMatch.Groups[1].Value.Trim();
-            var innerThen = innerIfMatch.Groups[2].Value.Trim();
-            var innerElse = innerIfMatch.Groups[3].Value.Trim();
-
-            // One branch should be a bare recursive call, the other adds an element
-            string? withOpBranch = null;
-            var bareCallPattern = $@"^{Regex.Escape(name)}\(";
-            if (Regex.IsMatch(innerElse, bareCallPattern) && !innerElse.Contains("+") && !innerElse.Contains("*"))
-            {
-                withOpBranch = innerThen;
-            }
-            else if (Regex.IsMatch(innerThen, bareCallPattern) && !innerThen.Contains("+") && !innerThen.Contains("*"))
-            {
-                withOpBranch = innerElse;
-                innerCond = NegateSimpleCondition(innerCond);
-            }
-
-            if (withOpBranch != null)
-            {
-                // Detect operator in withOpBranch: "F(a, n-1) + a[n - 1]"
-                foreach (var op in new[] { "+", "*" })
-                {
-                    var parts = SplitOnOperatorTopLevel(withOpBranch, op);
-                    if (parts != null)
-                    {
-                        var (left, right) = parts.Value;
-                        if (left.Contains(name + "(") || right.Contains(name + "("))
-                        {
-                            combineOp = op;
-                            var smtCond = ArrayCondToSmtTemplate(innerCond, arrayName, idxName);
-                            if (smtCond != null)
-                            {
-                                perElemTemplate = $"(ite {smtCond} {{elem}} {smtBaseVal})";
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Case A: Simple unconditional — "F(a, n-1) + a[n-1]"
-        if (combineOp == null)
-        {
-            foreach (var op in new[] { "+", "*" })
-            {
-                var parts = SplitOnOperatorTopLevel(recurStr, op);
-                if (parts != null)
-                {
-                    var (left, right) = parts.Value;
-                    if (left.Contains(name + "(") || right.Contains(name + "("))
-                    {
-                        combineOp = op;
-                        perElemTemplate = "{elem}";
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (combineOp == null || perElemTemplate == null) return null;
-
-        var smtOp = combineOp == "+" ? "+" : "*";
-
-        // Build parameter declarations (array becomes Seq in SMT)
-        var paramDecls = $"({arrayName} (Seq {smtElemType})) ({idxName} Int)";
-
-        // Build nested ite chain: for n = 0..MAX_SEQ_LEN, accumulate per-element contributions
-        string ite = smtBaseVal; // default for n > MAX_SEQ_LEN
-        for (int n = MAX_SEQ_LEN; n >= 0; n--)
-        {
-            if (n == 0)
-            {
-                ite = $"(ite (= {idxName} 0) {smtBaseVal} {ite})";
-            }
-            else
-            {
-                // Accumulate: for idx 0..n-1, apply per-element template
-                string acc = smtBaseVal;
-                for (int i = 0; i < n; i++)
-                {
-                    var elemExpr = $"(seq.nth {arrayName} {i})";
-                    var contribution = perElemTemplate.Replace("{elem}", elemExpr);
-                    acc = $"({smtOp} {contribution} {acc})";
-                }
-                ite = $"(ite (= {idxName} {n}) {acc} {ite})";
-            }
-        }
-
-        return $"(define-fun {name} ({paramDecls}) {smtRetType} {ite})";
-    }
-
-    /// <summary>
-    /// Converts an array condition like "a[n - 1] &lt; 0" into an SMT template like "(&lt; {elem} 0)".
-    /// Returns null if the condition pattern is not recognized.
-    /// </summary>
-    static string? ArrayCondToSmtTemplate(string cond, string arrayName, string idxName)
-    {
-        // Pattern: a[n - 1] <op> <value>  or  <value> <op> a[n - 1]
-        var elemPattern = $@"{Regex.Escape(arrayName)}\[{Regex.Escape(idxName)}\s*-\s*1\]";
-
-        // Try: elem <op> value
-        var m = Regex.Match(cond, $@"^{elemPattern}\s*(<|>|<=|>=|==|!=)\s*(.+)$");
-        if (m.Success)
-        {
-            var op = m.Groups[1].Value;
-            var val = m.Groups[2].Value.Trim();
-            var smtOp = op switch { "<" => "<", ">" => ">", "<=" => "<=", ">=" => ">=", "==" => "=", "!=" => "distinct", _ => null };
-            if (smtOp == null) return null;
-            if (!long.TryParse(val, out var v)) return null;
-            var smtVal = v < 0 ? $"(- {-v})" : v.ToString();
-            return $"({smtOp} {{elem}} {smtVal})";
-        }
-
-        // Try: value <op> elem
-        m = Regex.Match(cond, $@"^(.+?)\s*(<|>|<=|>=|==|!=)\s*{elemPattern}$");
-        if (m.Success)
-        {
-            var val = m.Groups[1].Value.Trim();
-            var op = m.Groups[2].Value;
-            var smtOp = op switch { "<" => "<", ">" => ">", "<=" => "<=", ">=" => ">=", "==" => "=", "!=" => "distinct", _ => null };
-            if (smtOp == null) return null;
-            if (!long.TryParse(val, out var v)) return null;
-            var smtVal = v < 0 ? $"(- {-v})" : v.ToString();
-            return $"({smtOp} {smtVal} {{elem}})";
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Negates a simple condition string: "&lt;" becomes "&gt;=", etc.
-    /// </summary>
-    static string NegateSimpleCondition(string cond)
-    {
-        if (cond.Contains(">=")) return cond.Replace(">=", "<");
-        if (cond.Contains("<=")) return cond.Replace("<=", ">");
-        if (cond.Contains("!=")) return cond.Replace("!=", "==");
-        if (cond.Contains("==")) return cond.Replace("==", "!=");
-        if (cond.Contains(">")) return cond.Replace(">", "<=");
-        if (cond.Contains("<")) return cond.Replace("<", ">=");
-        return $"!({cond})";
-    }
-
-    /// <summary>
-    /// Builds a define-fun for sequence fold functions like SumSeq(s), Count(s, x).
-    /// Creates a symbolic unrolling over seq.len:
-    ///   (define-fun SumSeq ((s (Seq Int))) Int
-    ///     (ite (= (seq.len s) 0) 0
-    ///     (ite (= (seq.len s) 1) (seq.nth s 0)
-    ///     (ite (= (seq.len s) 2) (+ (seq.nth s 0) (seq.nth s 1))
-    ///     ...))))
-    /// </summary>
-    static string? BuildSeqFoldDefineFun(
-        string name,
-        List<(string pName, string pType)> parameters,
-        string returnType, string body)
-    {
-        // Find the seq parameter
-        var seqParam = parameters.FirstOrDefault(p =>
-            TypeUtils.IsSeqType(p.pType) || TypeUtils.IsArrayType(p.pType));
-        if (seqParam == default) return null;
-        var seqName = seqParam.pName;
-
-        // Parse body: if |s| == 0 then <base> else <expr using s[|s|-1] and FuncName(s[..|s|-1])>
-        var ifMatch = Regex.Match(body, @"^if\s+(.+?)\s+then\s+(.+?)\s+else\s+(.+)$");
-        if (!ifMatch.Success) return null;
-
-        var condStr = ifMatch.Groups[1].Value.Trim();
-        var baseStr = ifMatch.Groups[2].Value.Trim();
-        var recurStr = ifMatch.Groups[3].Value.Trim();
-
-        // Handle inverted form: if |s| > 0 then <recursive> else <base>
-        if (Regex.IsMatch(condStr, $@"^\|{Regex.Escape(seqName)}\|\s*>\s*0$") ||
-            Regex.IsMatch(condStr, $@"^\|{Regex.Escape(seqName)}\|\s*!=\s*0$"))
-        {
-            (baseStr, recurStr) = (recurStr, baseStr);
-        }
-        else if (!Regex.IsMatch(condStr, $@"^\|{Regex.Escape(seqName)}\|\s*==\s*0$"))
-        {
-            // Handle |s| <= 1 pattern (like DeDup: "if |s| <= 1 then s else ...")
-            // These return non-scalar (seq) — should have been filtered by DafnyParser
-            return null;
-        }
-
-        // Parse base value
-        if (!long.TryParse(baseStr, out var baseVal)) return null;
-
-        // Detect the fold operator: + or * connecting element to recursive call
-        // Back-fold: FuncName(s[..|s|-1]) — recurse on tail slice
-        // Front-fold: FuncName(s[1..]) — recurse on head slice
-        var backFoldPrefix = $"{name}({seqName}[..";
-        var frontFoldPrefix = $"{name}({seqName}[1..";
-        string? combineOp = null;
-        if (recurStr.Contains(backFoldPrefix) || recurStr.Contains(frontFoldPrefix))
-        {
-            foreach (var op in new[] { "+", "*" })
-            {
-                var parts = SplitOnOperatorTopLevel(recurStr, op);
-                if (parts != null)
-                {
-                    var (left, right) = parts.Value;
-                    if (left.Contains(name + "(") || right.Contains(name + "("))
-                    {
-                        combineOp = op;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (combineOp == null)
-        {
-            // Try to detect conditional fold: (if cond then X else Y) + FuncName(...)
-            // e.g., Count: (if s[|s| - 1] == x then 1 else 0) + Count(s[..|s| - 1], x)
-            if ((recurStr.Contains(backFoldPrefix) || recurStr.Contains(frontFoldPrefix)) && recurStr.Contains("if "))
-            {
-                // The overall structure is: (<conditional>) + FuncName(...)
-                combineOp = "+"; // conditional folds are additive
-            }
-        }
-
-        // Build SMT types
-        var elemType = TypeUtils.GetSeqElementType(seqParam.pType);
-        var smtElemType = TypeUtils.DafnyTypeToSmt(elemType ?? "int");
-        var smtRetType = (returnType == "real") ? "Real"
-                       : (returnType == "bool") ? "Bool" : "Int";
-
-        // Build parameter declarations
-        var otherParams = parameters.Where(p => p.pName != seqName).ToList();
-        var paramDecls = $"({seqName} (Seq {smtElemType}))";
-        foreach (var (pn, pt) in otherParams)
-        {
-            var smtPt = TypeUtils.DafnyTypeToSmt(pt);
-            paramDecls += $" ({pn} {smtPt})";
-        }
-
-        if (combineOp != null)
-        {
-            var smtOp = combineOp == "+" ? "+" : "*";
-            var smtBaseVal = baseVal < 0 ? $"(- {-baseVal})" : baseVal.ToString();
-
-            // For now, handle only the simple case: each element contributes itself (sum) or itself * acc (product)
-            // Complex conditional folds (Count) need per-element templates — deferred
-
-            string ite = smtBaseVal; // default for len > MAX_SEQ_LEN
-            for (int len = MAX_SEQ_LEN; len >= 0; len--)
-            {
-                if (len == 0)
-                {
-                    ite = $"(ite (= (seq.len {seqName}) 0) {smtBaseVal} {ite})";
-                }
-                else
-                {
-                    // Build fold value: op(s[len-1], op(s[len-2], ... op(s[0], base)))
-                    string acc = smtBaseVal;
-                    for (int i = 0; i < len; i++)
-                        acc = $"({smtOp} (seq.nth {seqName} {i}) {acc})";
-                    ite = $"(ite (= (seq.len {seqName}) {len}) {acc} {ite})";
-                }
-            }
-
-            return $"(define-fun {name} ({paramDecls}) {smtRetType} {ite})";
-        }
-
-        Console.WriteLine($"  Note: could not detect fold pattern for '{name}' — falling back to uninterpreted");
-        return null;
     }
 
     /// <summary>
@@ -3744,36 +3089,6 @@ static class SmtTranslator
     }
 
     /// <summary>
-    /// Splits a string on a binary operator at the top level (outside parens/brackets).
-    /// Returns (left, right) or null if the operator is not found at the top level.
-    /// </summary>
-    static (string left, string right)? SplitOnOperatorTopLevel(string expr, string op)
-    {
-        int depth = 0;
-        int bracketDepth = 0;
-        for (int i = 0; i < expr.Length; i++)
-        {
-            if (expr[i] == '(') depth++;
-            else if (expr[i] == ')') depth--;
-            else if (expr[i] == '[') bracketDepth++;
-            else if (expr[i] == ']') bracketDepth--;
-            else if (depth == 0 && bracketDepth == 0 && i > 0 && i < expr.Length - 1)
-            {
-                if (expr[i] == op[0] && (op.Length == 1 || expr.Substring(i, op.Length) == op))
-                {
-                    // Must be surrounded by spaces (not inside identifier)
-                    if ((i > 0 && expr[i - 1] == ' ') || (i + op.Length < expr.Length && expr[i + op.Length] == ' '))
-                    {
-                        return (expr.Substring(0, i).Trim(), expr.Substring(i + op.Length).Trim());
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
-    /// <summary>
-    ///
     /// Strategy: take the original query (preconditions + postconditions), fix the input
     /// values, negate the found output values, then ask Z3 to find a satisfying assignment.
     ///   UNSAT → no other output is possible → output is uniquely determined.
@@ -3869,7 +3184,7 @@ static class SmtTranslator
         }
 
         // Build blocking clause: negation of ALL found output values simultaneously.
-        // UNSAT after adding this clause → only one valid output exists for these inputs.
+        // UNSAT after adding this clause â†’ only one valid output exists for these inputs.
         var eqParts = new List<string>();
 
         // Mutable inputs' post-states are outputs (e.g. sorted array in BubbleSort)
