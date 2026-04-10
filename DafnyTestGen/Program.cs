@@ -521,9 +521,9 @@ class Program
             int useRepeat = repeat;
             if (!simple && !allCombinations && !boundary && repeat == 1)
             {
-                // No explicit flags: use progressive auto strategy
+                // No explicit flags: use progressive auto strategy with DNF (short-circuit safe)
                 progressive = true;
-                useAllComb = true;
+                useAllComb = false;
                 Console.WriteLine($"  Auto strategy: progressive (minTests={minTests})");
             }
 
@@ -829,12 +829,12 @@ class Program
             originalDnfExprs = DnfEngine.CrossProduct(originalDnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
 
         // Compute DNF/FDNF on inlined ensures for SMT translation.
-        // FDNF (Full DNF) used in all-combinations and progressive modes:
-        // each disjunction A || B produces 3 clauses (A&&B, A&&!B, !A&&B) instead of 2,
-        // giving fewer but more meaningful combinations than the 2^N bitmask approach.
+        // FDNF (Full DNF) used only in all-combinations mode (explicit -a flag).
+        // FDNF can be unsafe with short-circuit logic (e.g., a.Length == 0 && a[0] == 0
+        // is satisfiable in SMT but causes index-out-of-bounds at runtime).
         const int fdnfClauseLimit = 200;
         bool usedFdnf = false;
-        if (allCombinations || progressive)
+        if (allCombinations)
         {
             // Compute per-ensures FDNF, checking limits at each step
             var fdnfPerEnsures = new List<List<List<Expression>>>();
@@ -940,9 +940,9 @@ class Program
         if (hasDisjunctivePre)
             Console.WriteLine($"  Disjunctive precondition: {preDnfExprs.Count} branches");
 
-        // Prune FDNF clauses that contradict preconditions (post-post contradictions
+        // Prune clauses that contradict preconditions (post-post contradictions
         // are already caught by CrossProductPruned; this catches pre-post contradictions).
-        if ((allCombinations || progressive) && preDnfExprs.Count == 1 && preDnfExprs[0].Count > 0)
+        if (preDnfExprs.Count == 1 && preDnfExprs[0].Count > 0)
         {
             int before = dnfExprs.Count;
             dnfExprs = dnfExprs.Where(clause =>
@@ -1739,10 +1739,9 @@ class Program
             }
 
             if (outputTiers.Count > 0
-                && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests)
-                && (!progressive || testCases.Count < minTests))
+                && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
             {
-                // --- Phase 2b: output boundary tiers ---
+                // --- Phase 2b: output boundary tiers (always runs to ensure output diversity) ---
                 int phase2bStart = testSchedule.Count;
                 // Add output tier entries for each singleton postcondition combination
                 for (int pi = 0; pi < preCombinations.Count; pi++)

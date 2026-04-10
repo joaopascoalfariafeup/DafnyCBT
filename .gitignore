@@ -15,3 +15,6 @@ publish/
 _dafnytestgen_check_*
 *.deps.json
 *.runtimeconfig.json
+
+#Special test cases
+test/verifixer/

@@ -371,35 +371,35 @@ static class DnfEngine
         {
             var op = bin.Op;
 
-            // A ==> B  is  !A || B
+            // A ==> B  (short-circuit safe: !A, or A && B)
             if (op == BinaryExpr.Opcode.Imp)
             {
                 var a = ExprToDnfDual(bin.E0);
                 var b = ExprToDnfDual(bin.E1);
-                var pos = new List<List<Expression>>(a.neg); // !A
-                pos.AddRange(b.pos);                          // || B
-                var neg = CrossProduct(a.pos, b.neg);         // A && !B
+                var pos = new List<List<Expression>>(a.neg);   // !A
+                pos.AddRange(CrossProduct(a.pos, b.pos));       // || A && B
+                var neg = CrossProduct(a.pos, b.neg);           // A && !B
                 return (pos, neg);
             }
 
-            // A && B
+            // A && B  (short-circuit safe: !A, or A && !B)
             if (op == BinaryExpr.Opcode.And)
             {
                 var a = ExprToDnfDual(bin.E0);
                 var b = ExprToDnfDual(bin.E1);
                 var pos = CrossProduct(a.pos, b.pos);          // A && B
                 var neg = new List<List<Expression>>(a.neg);   // !A
-                neg.AddRange(b.neg);                            // || !B
+                neg.AddRange(CrossProduct(a.pos, b.neg));       // || A && !B
                 return (pos, neg);
             }
 
-            // A || B
+            // A || B  (short-circuit safe: A, or !A && B)
             if (op == BinaryExpr.Opcode.Or)
             {
                 var a = ExprToDnfDual(bin.E0);
                 var b = ExprToDnfDual(bin.E1);
                 var pos = new List<List<Expression>>(a.pos);   // A
-                pos.AddRange(b.pos);                            // || B
+                pos.AddRange(CrossProduct(a.neg, b.pos));       // || !A && B
                 var neg = CrossProduct(a.neg, b.neg);           // !A && !B
                 return (pos, neg);
             }
