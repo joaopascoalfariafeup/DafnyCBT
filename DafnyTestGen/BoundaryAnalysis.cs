@@ -306,7 +306,8 @@ static class BoundaryAnalysis
         HashSet<string> mutableNames,
         List<(string Name, string Type)>? mutableFields,
         bool verbose,
-        List<string>? postLiterals = null)
+        List<string>? postLiterals = null,
+        Dictionary<string, List<string>>? enumDatatypes = null)
     {
         var result = new List<(string tierLabel, List<string> tierConstraints)>();
 
@@ -335,6 +336,11 @@ static class BoundaryAnalysis
                 result.Add(($"{name}>0", new List<string> { $"(> {smtName} 0.0)" }));
                 result.Add(($"{name}<0", new List<string> { $"(< {smtName} 0.0)" }));
                 result.Add(($"{name}=0", new List<string> { $"(= {smtName} 0.0)" }));
+            }
+            else if (enumDatatypes != null && enumDatatypes.TryGetValue(type, out var enumCtors))
+            {
+                for (int i = 0; i < enumCtors.Count; i++)
+                    result.Add(($"{name}={enumCtors[i]}", new List<string> { $"(= {smtName} {i})" }));
             }
         }
 
