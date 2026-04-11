@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using System.Xml.Schema;
 using Microsoft.Dafny;
 using RAST;
 
@@ -33,7 +34,7 @@ static class DnfEngine
         UseFdnf = true;
         return ExprToDnfInner(expr).pos;
     }
-    
+
     /// <summary>
     /// Cross-product of two DNF clause lists: each clause from A is merged with each clause from B.
     /// </summary>
@@ -987,6 +988,17 @@ static class DnfEngine
         _ => op  // Eq and Neq are symmetric
     };
 
+        // Create list of pairs of mutually contradictory operator combinations:
+    static readonly List<(BinaryExpr.Opcode, BinaryExpr.Opcode)> contradictoryOps = new List<(BinaryExpr.Opcode, BinaryExpr.Opcode)>
+    {
+        (BinaryExpr.Opcode.Eq, BinaryExpr.Opcode.Neq),
+        (BinaryExpr.Opcode.Eq, BinaryExpr.Opcode.Lt),
+        (BinaryExpr.Opcode.Eq, BinaryExpr.Opcode.Gt),
+        (BinaryExpr.Opcode.Lt, BinaryExpr.Opcode.Ge),
+        (BinaryExpr.Opcode.Lt, BinaryExpr.Opcode.Gt),
+        (BinaryExpr.Opcode.Le, BinaryExpr.Opcode.Gt),
+    };
+
     /// <summary>
     /// Check if two relational facts about the same variable are contradictory.
     /// Returns a reason string or null.
@@ -998,28 +1010,8 @@ static class DnfEngine
         // Same variable, same value, contradictory operators
         if (a.valKey == b.valKey)
         {
-            // x == v and x != v
-            if ((a.op == BinaryExpr.Opcode.Eq && b.op == BinaryExpr.Opcode.Neq) ||
-                (a.op == BinaryExpr.Opcode.Neq && b.op == BinaryExpr.Opcode.Eq))
-                return $"contradiction: {a.original} ∧ {b.original}";
-
-            // x < v and x >= v (or x > v and x <= v, etc.)
-            if ((a.op == BinaryExpr.Opcode.Lt && b.op == BinaryExpr.Opcode.Ge) ||
-                (a.op == BinaryExpr.Opcode.Ge && b.op == BinaryExpr.Opcode.Lt) ||
-                (a.op == BinaryExpr.Opcode.Le && b.op == BinaryExpr.Opcode.Gt) ||
-                (a.op == BinaryExpr.Opcode.Gt && b.op == BinaryExpr.Opcode.Le))
-                return $"contradiction: {a.original} ∧ {b.original}";
-
-            // x < v and x > v, x < v and x == v, x > v and x == v
-            if ((a.op == BinaryExpr.Opcode.Lt && b.op == BinaryExpr.Opcode.Gt) ||
-                (a.op == BinaryExpr.Opcode.Gt && b.op == BinaryExpr.Opcode.Lt))
-                return $"contradiction: {a.original} ∧ {b.original}";
-            if ((a.op == BinaryExpr.Opcode.Lt && b.op == BinaryExpr.Opcode.Eq) ||
-                (a.op == BinaryExpr.Opcode.Eq && b.op == BinaryExpr.Opcode.Lt))
-                return $"contradiction: {a.original} ∧ {b.original}";
-            if ((a.op == BinaryExpr.Opcode.Gt && b.op == BinaryExpr.Opcode.Eq) ||
-                (a.op == BinaryExpr.Opcode.Eq && b.op == BinaryExpr.Opcode.Gt))
-                return $"contradiction: {a.original} ∧ {b.original}";
+            if (contradictoryOps.Contains((a.op, b.op)) || contradictoryOps.Contains((b.op, a.op)))
+                return $"contradiction: {a.original} ∧ {b.original} (same variable and value with incompatible operators)";
         }
 
         // Different values: x == v1 and x == v2 where v1 != v2
@@ -1031,42 +1023,53 @@ static class DnfEngine
                 return $"contradiction: {a.original} ∧ {b.original} (distinct equalities)";
         }
 
-        // Try numeric comparison: x < a and x > b where a <= b (impossible for integers when a <= b)
-        // x < a and x > b -> needs a > b + 1 for integers (a > b for reals), conservatively use a <= b
+        // Try numeric comparison: x op1 a and x op2 b with no overlap in valid ranges, e.g., x < 0 and x > 0, or x <= 5 and x >= 10.
         if (TryParseNumeric(a.valKey, out var va) && TryParseNumeric(b.valKey, out var vb))
         {
-            // x < va and x > vb: needs va > vb + 1 (integer), so contradiction when va <= vb
-            if (a.op == BinaryExpr.Opcode.Lt && b.op == BinaryExpr.Opcode.Gt && va <= vb)
-                return $"contradiction: {a.original} ∧ {b.original} (numeric: {a.varKey} < {va} ∧ {a.varKey} > {vb})";
-            if (a.op == BinaryExpr.Opcode.Gt && b.op == BinaryExpr.Opcode.Lt && vb <= va)
-                return $"contradiction: {a.original} ∧ {b.original} (numeric: {a.varKey} > {va} ∧ {a.varKey} < {vb})";
-
-            // x < va and x >= vb: contradiction when va <= vb
-            if (a.op == BinaryExpr.Opcode.Lt && b.op == BinaryExpr.Opcode.Ge && va <= vb)
-                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
-            if (a.op == BinaryExpr.Opcode.Ge && b.op == BinaryExpr.Opcode.Lt && vb <= va)
-                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
-
-            // x <= va and x > vb: contradiction when va < vb
-            if (a.op == BinaryExpr.Opcode.Le && b.op == BinaryExpr.Opcode.Gt && va < vb)
-                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
-            if (a.op == BinaryExpr.Opcode.Gt && b.op == BinaryExpr.Opcode.Le && vb < va)
-                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
-
-            // x == va and x < vb: contradiction when va >= vb
-            if (a.op == BinaryExpr.Opcode.Eq && b.op == BinaryExpr.Opcode.Lt && va >= vb)
-                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
-            if (a.op == BinaryExpr.Opcode.Lt && b.op == BinaryExpr.Opcode.Eq && vb >= va)
-                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
-
-            // x == va and x > vb: contradiction when va <= vb
-            if (a.op == BinaryExpr.Opcode.Eq && b.op == BinaryExpr.Opcode.Gt && va <= vb)
-                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
-            if (a.op == BinaryExpr.Opcode.Gt && b.op == BinaryExpr.Opcode.Eq && vb <= va)
-                return $"contradiction: {a.original} ∧ {b.original} (numeric)";
-
-            // x == va and x != vb: not a contradiction (different values)
-            // x == va and x == vb where va != vb: already handled above
+            // Compute maximum of lower bounds and minimum of upper bounds to check for contradictions:
+            var maxLower = double.NegativeInfinity;
+            var maxLowerInclusive = false;
+            var minUpper = double.PositiveInfinity;
+            var minUpperInclusive = false;
+            var aUsed = false;
+            var bUsed = false;
+            if (a.op == BinaryExpr.Opcode.Gt || a.op == BinaryExpr.Opcode.Ge || a.op == BinaryExpr.Opcode.Eq)
+            {
+                maxLower = va;
+                maxLowerInclusive = a.op != BinaryExpr.Opcode.Gt;
+                aUsed = true;
+            }
+            if (b.op == BinaryExpr.Opcode.Gt || b.op == BinaryExpr.Opcode.Ge || b.op == BinaryExpr.Opcode.Eq)
+            {
+                if (maxLower == double.NegativeInfinity || vb > maxLower
+                     || (vb == maxLower && maxLowerInclusive))  
+                {
+                    maxLower = vb;
+                    maxLowerInclusive = b.op != BinaryExpr.Opcode.Gt;
+                }
+                bUsed = true;
+            }
+            if (a.op == BinaryExpr.Opcode.Lt || a.op == BinaryExpr.Opcode.Le || a.op == BinaryExpr.Opcode.Eq)
+            {
+                minUpper = va;
+                minUpperInclusive = a.op != BinaryExpr.Opcode.Lt;
+                aUsed = true;
+            }
+            if (b.op == BinaryExpr.Opcode.Lt || b.op == BinaryExpr.Opcode.Le || b.op == BinaryExpr.Opcode.Eq)
+            {
+                if (minUpper == double.PositiveInfinity || vb < minUpper
+                    || (vb == minUpper && minUpperInclusive))
+                {                    
+                    minUpper = vb;
+                    minUpperInclusive = b.op != BinaryExpr.Opcode.Lt;
+                }
+                bUsed = true;
+            }
+            if (aUsed && bUsed)
+            {
+                if (maxLower > minUpper || (maxLower == minUpper && !(maxLowerInclusive && minUpperInclusive)))
+                    return $"contradiction: {a.original} ∧ {b.original} (numeric range: {a.varKey} op {va} and {a.varKey} op {vb} with no overlap)";
+            }
         }
 
         return null;
