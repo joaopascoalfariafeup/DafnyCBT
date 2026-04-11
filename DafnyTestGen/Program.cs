@@ -784,7 +784,6 @@ class Program
         var fullPostconditionStrings = ensuresClauses.Select(e => DnfEngine.ExprToString(e)).ToList();
 
         List<List<Expression>> dnfExprs;
-        List<Expression> backgroundPostconditions;
 
         // Inline predicates BEFORE DNF conversion so that if-then-else inside
         // predicate bodies gets decomposed into separate DNF clauses.
@@ -824,18 +823,6 @@ class Program
             dnfExprs = DnfEngine.ExprToDnf(dnfEnsures[0]);
             for (int i = 1; i < dnfEnsures.Count; i++)
                 dnfExprs = DnfEngine.CrossProductPruned(dnfExprs, DnfEngine.ExprToDnf(dnfEnsures[i]));
-        }
-
-        // Build background postconditions: full (un-decomposed) ensures expressions.
-        // These are asserted as background constraints to catch cases where DNF decomposition
-        // loses quantifier range guards (e.g., forall vacuously true at boundary values).
-        backgroundPostconditions = hasNonInlinableFuncs
-            ? new List<Expression>()
-            : new List<Expression>(ensuresClauses);
-        if (predsToInline != null && predsToInline.Count > 0)
-        {
-            backgroundPostconditions = backgroundPostconditions
-                .Select(e => InlineExpr(e, predsToInline)).ToList();
         }
 
         var preClauses = method.Req.Select(r => r.E).ToList();
@@ -881,8 +868,7 @@ class Program
 
         // Check for unsolvable patterns after predicate inlining.
         var allInlinedLiterals = dnfExprs.SelectMany(c => c).Select(e => DnfEngine.ExprToString(e))
-            .Concat(preDnfExprs.SelectMany(c => c).Select(e => DnfEngine.ExprToString(e)))
-            .Concat(backgroundPostconditions.Select(e => DnfEngine.ExprToString(e)));
+            .Concat(preDnfExprs.SelectMany(c => c).Select(e => DnfEngine.ExprToString(e)));
         var varSliceMultiset = new Regex(@"multiset\([^)]*\[\.\.(?!\])[^)]*\)");
         var doubleSlice = new Regex(@"\w+\[\.\.?\][^=]*\[\.\.(?!\])");
         if (allInlinedLiterals.Any(lit => varSliceMultiset.IsMatch(lit) || doubleSlice.IsMatch(lit)))
@@ -891,7 +877,6 @@ class Program
             Console.WriteLine($"  Falling back to precondition-only test generation with postcondition runtime checks");
             // Fall back: generate inputs from preconditions only, check postconditions at runtime
             dnfExprs = new List<List<Expression>> { new List<Expression>() }; // single trivial "true" clause
-            backgroundPostconditions = new List<Expression>(); // don't assert postconditions in SMT
             hasNonInlinableFuncs = true; // force full postcondition expects in emitted tests
         }
 
@@ -1277,7 +1262,7 @@ class Program
             else
                 Console.Write($"\r  Solving {schedIdx}/{schedTotal}...   ");
             if (verbose) { Console.WriteLine($"  [DEBUG] Building SMT query..."); Console.Out.Flush(); }
-            var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
+            var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits, mutableNames);
             if (verbose)
             {
                 Console.WriteLine($"  [DEBUG] SMT2 query for {solveLabel} ({smt.Length} chars):");
@@ -1338,7 +1323,7 @@ class Program
                 {
                     var simplifiedLits = lits.Where(l => !EKey(l).Contains("exists ")).ToList();
                     if (verbose) Console.WriteLine($"  Combination {solveLabel}: unknown, retrying without {existsLits.Count} exists-quantified postcondition(s)...");
-                    var smt2 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, simplifiedLits, method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
+                    var smt2 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, simplifiedLits, method, verbose, excl, extra, preLits, mutableNames);
                     if (verbose)
                     {
                         Console.WriteLine($"  [DEBUG] Retry SMT2 query for {solveLabel}:");
@@ -1364,7 +1349,7 @@ class Program
                 if (!TimedOut())
                 {
                     if (verbose) Console.WriteLine($"  Combination {solveLabel}: retrying with input-only constraints...");
-                    var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, new List<Expression>(), method, verbose, excl, extra, preLits, backgroundPostconditions, mutableNames);
+                    var smt3 = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, new List<Expression>(), method, verbose, excl, extra, preLits, mutableNames);
                     if (verbose)
                     {
                         Console.WriteLine($"  [DEBUG] Input-only SMT2 query for {solveLabel}:");

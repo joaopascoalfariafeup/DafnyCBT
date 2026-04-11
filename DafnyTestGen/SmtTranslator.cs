@@ -78,7 +78,6 @@ static class SmtTranslator
         List<Expression>? exclusions = null,
         List<string>? extraConstraints = null,
         List<Expression>? preLiterals = null,
-        List<Expression>? backgroundPostconditions = null,
         HashSet<string>? mutableNames = null)
     {
         mutableNames ??= new HashSet<string>();
@@ -701,27 +700,6 @@ static class SmtTranslator
             }
         }
 
-        // Assert full (un-decomposed) postconditions as background constraints.
-        // This catches cases where DNF decomposition loses quantifier range guards.
-        // Save WF guard count â€” background postconditions are disjunctive, so their
-        // WF guards (e.g., index bounds for one disjunct) must not be asserted unconditionally.
-        if (backgroundPostconditions != null)
-        {
-            var wfCountBefore = _wfGuards.Count;
-            foreach (var bgPost in backgroundPostconditions)
-            {
-                var bgStr = DnfEngine.ExprToString(bgPost);
-                if (TypeUtils.IsSpecOnlyLiteral(bgStr)) continue;
-                var smtExpr = ExprToSmt(bgPost, inputsAndOutputs, mutableNames, isPostContext: true);
-                if (smtExpr != null)
-                    assertions.AppendLine($"(assert {smtExpr})");
-            }
-            // Discard WF guards from background postconditions â€” they may over-constrain
-            // when only some disjuncts are active (e.g., bounds for str1[|prefix|] conflict
-            // with |prefix| == |str1| when the access disjunct is not selected).
-            if (_wfGuards.Count > wfCountBefore)
-                _wfGuards.RemoveRange(wfCountBefore, _wfGuards.Count - wfCountBefore);
-        }
 
         // Encode preconditions (constrain pre-state variables)
         if (preLiterals != null && preLiterals.Count > 0)
