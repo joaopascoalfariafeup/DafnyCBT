@@ -811,55 +811,13 @@ class Program
 
         // Compute DNF/FDNF on inlined ensures for SMT translation.
         // FDNF (Full DNF) used only in all-combinations mode (explicit -a flag).
-        // FDNF can be unsafe with short-circuit logic (e.g., a.Length == 0 && a[0] == 0
-        // is satisfiable in SMT but causes index-out-of-bounds at runtime).
-        const int fdnfClauseLimit = 200;
         bool usedFdnf = false;
         if (allCombinations)
-        {
-            // Compute per-ensures FDNF, checking limits at each step
-            var fdnfPerEnsures = new List<List<List<Expression>>>();
-            List<List<Expression>>? fdnfExprs = null;
-            bool fdnfOverflow = false;
-            for (int i = 0; i < dnfEnsures.Count; i++)
-            {
-                var fdnf = DnfEngine.ExprToFdnf(dnfEnsures[i]);
-                fdnfPerEnsures.Add(fdnf.pos);
-                if (progressive && fdnf.pos.Count > fdnfClauseLimit)
-                {
-                    if (verbose) Console.WriteLine($"  FDNF ensures[{i}]: {fdnf.pos.Count} clauses (exceeds limit)");
-                    fdnfOverflow = true;
-                    break;
-                }
-            }
-            if (!fdnfOverflow)
-            {
-                fdnfExprs = fdnfPerEnsures[0];
-                for (int i = 1; i < fdnfPerEnsures.Count; i++)
-                {
-                    fdnfExprs = DnfEngine.CrossProductPruned(fdnfExprs, fdnfPerEnsures[i]);
-                    if (progressive && fdnfExprs.Count > fdnfClauseLimit)
-                    {
-                        if (verbose) Console.WriteLine($"  FDNF cross-product after ensures[{i}]: {fdnfExprs.Count} clauses (exceeds limit)");
-                        fdnfOverflow = true;
-                        fdnfExprs = null;
-                        break;
-                    }
-                }
-            }
-            if (fdnfOverflow && verbose)
-                Console.WriteLine($"  FDNF exceeded {fdnfClauseLimit} clauses, falling back to simple DNF");
-            if (fdnfExprs != null)
-            {
-                dnfExprs = fdnfExprs;
-                usedFdnf = true;
-            }
-            else
-            {
-                dnfExprs = DnfEngine.ExprToDnf(dnfEnsures[0]);
-                for (int i = 1; i < dnfEnsures.Count; i++)
-                    dnfExprs = DnfEngine.CrossProductPruned(dnfExprs, DnfEngine.ExprToDnf(dnfEnsures[i]));
-            }
+        {            
+            dnfExprs = DnfEngine.ExprToFdnf(dnfEnsures[0]);
+            for (int i = 1; i < dnfEnsures.Count; i++)
+                dnfExprs = DnfEngine.CrossProductPruned(dnfExprs, DnfEngine.ExprToFdnf(dnfEnsures[i]));
+            usedFdnf = true;
         }
         else
         {
@@ -894,7 +852,7 @@ class Program
         foreach (var pre in preClauses)
         {
             var preDnf = DnfEngine.ExprToDnf(pre);
-            preDnfExprs = DnfEngine.CrossProduct(preDnfExprs, preDnf);
+            preDnfExprs = DnfEngine.CrossProductPruned(preDnfExprs, preDnf);
         }
         // Remove the empty "true" elements from single-clause results
         preDnfExprs = preDnfExprs.Select(c => c.Where(e => DnfEngine.ExprToString(e).Length > 0).ToList()).ToList();
