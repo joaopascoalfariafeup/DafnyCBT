@@ -1157,13 +1157,6 @@ class Program
         // Helper: convert Expression to string key for set operations and dedup
         static string EKey(Expression e) => DnfEngine.ExprToString(e);
 
-        // Find the common literals shared by all clauses (using string keys)
-        var commonLiteralKeys = dnfExprs.Count > 0
-            ? new HashSet<string>(dnfExprs[0].Select(EKey))
-            : new HashSet<string>();
-        foreach (var clause in dnfExprs)
-            commonLiteralKeys.IntersectWith(clause.Select(EKey));
-
         // Build precondition combinations (all-combinations with exclusions, like postconditions)
         var preCommonKeys = preDnfExprs.Count > 0
             ? new HashSet<string>(preDnfExprs[0].Select(EKey))
@@ -1235,11 +1228,7 @@ class Program
             outputTiers = BoundaryAnalysis.BuildOutputTiers(outputs, mutableNames, mutableFieldsList, verbose, postLitStrings);
         }
 
-        // usedFdnf (set above) tracks whether FDNF was used (clauses are self-contained, no bitmask/exclusion needed)
-
         // Helper: build schedule entries for a given mode.
-        // When usedFdnf is true, each clause is a complete FDNF entry (no exclusions needed).
-        // When usedFdnf is false: simple mode with per-clause exclusions.
         void BuildScheduleEntries(
             List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule,
             bool useBoundary)
@@ -1260,25 +1249,7 @@ class Program
                     var clause = dnfExprs[ci];
                     var label = $"{fullPreLabel}{{{ci + 1}}}";
                     int simpleMask = 1 << ci;
-
-                    // In FDNF mode, negated literals are already in the clause — no exclusions.
-                    // In simple DNF mode, exclude other clauses' distinguishing literals.
                     var exclusions = new List<Expression>();
-                    if (!usedFdnf)
-                    {
-                        var clauseKeys = new HashSet<string>(clause.Select(EKey));
-                        for (int oi = 0; oi < dnfExprs.Count; oi++)
-                        {
-                            if (oi == ci) continue;
-                            var clauseLits = dnfExprs[oi]
-                                .Where(lit => !commonLiteralKeys.Contains(EKey(lit)) && !clauseKeys.Contains(EKey(lit)))
-                                .ToList();
-                            if (clauseLits.Count == 1)
-                                exclusions.Add(clauseLits[0]);
-                            else if (clauseLits.Count > 1)
-                                exclusions.Add(ConjoinExprs(clauseLits));
-                        }
-                    }
 
                     if (useBoundary && bTiers.Count > 0)
                     {
@@ -1685,18 +1656,7 @@ class Program
                         int simpleMask = 1 << ci;
                         var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}";
 
-                        // Build exclusions for non-selected clauses
-                        var clauseKeys = new HashSet<string>(clause.Select(EKey));
                         var exclusions = new List<Expression>();
-                        for (int oi = 0; oi < dnfExprs.Count; oi++)
-                        {
-                            if (oi == ci) continue;
-                            var otherLits = dnfExprs[oi]
-                                .Where(lit => !commonLiteralKeys.Contains(EKey(lit)) && !clauseKeys.Contains(EKey(lit)))
-                                .ToList();
-                            if (otherLits.Count == 1) exclusions.Add(otherLits[0]);
-                            else if (otherLits.Count > 1) exclusions.Add(ConjoinExprs(otherLits));
-                        }
 
                         foreach (var (tierLabel, tierConstraints) in outputTiers)
                         {

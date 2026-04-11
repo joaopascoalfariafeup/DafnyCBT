@@ -988,7 +988,7 @@ static class DnfEngine
         _ => op  // Eq and Neq are symmetric
     };
 
-        // Create list of pairs of mutually contradictory operator combinations:
+    // Create list of pairs of mutually contradictory operator combinations:
     static readonly List<(BinaryExpr.Opcode, BinaryExpr.Opcode)> contradictoryOps = new List<(BinaryExpr.Opcode, BinaryExpr.Opcode)>
     {
         (BinaryExpr.Opcode.Eq, BinaryExpr.Opcode.Neq),
