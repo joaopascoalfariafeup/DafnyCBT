@@ -671,7 +671,8 @@ static class TestEmitter
         Dictionary<string, List<string>>? enumDatatypes = null,
         ClassInfo? classInfo = null,
         List<(string name, List<string> paramNames, string body, bool isClassMember)>? inlinablePredicates = null,
-        Dictionary<string, string>? specExpects = null)
+        Dictionary<string, string>? specExpects = null,
+        bool isBodyless = false)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("// Auto-generated test cases by DafnyTestGen");
@@ -1025,6 +1026,7 @@ static class TestEmitter
             }
 
             // Capture old() expressions before the method call.
+            // Skipped for bodyless methods (no call → no post-state to compare).
             // Build known identifiers: all names that are in scope before the call.
             var knownIdentifiers = new HashSet<string>(method.Ins.Select(i => i.Name));
             knownIdentifiers.UnionWith(fieldNames);
@@ -1096,7 +1098,8 @@ static class TestEmitter
                                         $"obj.{pName}");
                     }
                 }
-                sb.AppendLine($"    var {varName} := {captureExpr};");
+                if (!isBodyless)
+                    sb.AppendLine($"    var {varName} := {captureExpr};");
                 emittedVarNames.Add(varName);
             }
 
@@ -1153,9 +1156,11 @@ static class TestEmitter
             //      mutable inputs (to snapshot the pre-call state), or
             //   b) inline the RHS directly in the post-call expect (no extra variable needed).
             // Only applies to outputs NOT already covered by concrete Z3 values.
+            // Skipped for bodyless methods (no call → no expects).
             var outNames_set = new HashSet<string>(method.Outs.Select(o => o.Name));
             var rhsCaptures = new Dictionary<string, string>(); // outName -> check_outName (pre-captured)
             var rhsInline = new Dictionary<string, string>();   // outName -> rhs (inline after call)
+            if (!isBodyless)
             foreach (var lit in expectLiterals)
             {
                 // Match "outName == <expr>" at the start of the literal (but not <==> or ==>)
@@ -1230,20 +1235,22 @@ static class TestEmitter
             }
 
             // Call the method
+            // For bodyless methods: comment out the call and all expects (spec-only test)
             var callPrefix = classInfo != null ? "obj." : "";
             var callArgs = string.Join(", ", method.Ins.Select(i => i.Name));
+            var commentPrefix = isBodyless ? "// " : "";
             if (method.Outs.Count > 0)
             {
                 var outNames = string.Join(", ", method.Outs.Select(o => o.Name));
-                sb.AppendLine($"    var {outNames} := {callPrefix}{methodCallName}({callArgs});");
+                sb.AppendLine($"    {commentPrefix}var {outNames} := {callPrefix}{methodCallName}({callArgs});");
             }
             else
             {
-                sb.AppendLine($"    {callPrefix}{methodCallName}({callArgs});");
+                sb.AppendLine($"    {commentPrefix}{callPrefix}{methodCallName}({callArgs});");
             }
 
             // For autocontracts methods that modify this: verify Valid() holds after the call
-            if (classInfo is { IsAutoContracts: true } && mutableNames != null && mutableNames.Count > 0)
+            if (!isBodyless && classInfo is { IsAutoContracts: true } && mutableNames != null && mutableNames.Count > 0)
                 sb.AppendLine("    expect obj.Valid();");
 
             // Emit expect assertions.
@@ -1251,6 +1258,8 @@ static class TestEmitter
             // If Z3 didn't provide a parseable value for an output, fall back to
             // postcondition literals that mention it.
             // Postcondition literals that mention NO output (e.g. "x in C") are always emitted.
+            // For bodyless methods: record position, emit normally, then comment out expect lines.
+            int expectStartPos = isBodyless ? sb.Length : -1;
             foreach (var outp in method.Outs)
             {
                 // Skip outputs not constrained by any postcondition
@@ -1261,7 +1270,11 @@ static class TestEmitter
                 // When the original postcondition has `outName == specExpr`, emit the spec
                 // expression directly — it's deterministic and evaluable at runtime (ghost removed).
                 // This is always correct regardless of Z3's concrete output value.
-                if (specExpects != null && specExpects.TryGetValue(outp.Name, out var specExpr))
+                // For bodyless methods: prefer concrete Z3 values when trustworthy (unique +
+                // no uninterpreted functions). When the postcondition uses recursive/uninterpreted
+                // functions, Z3's uniqueness is unreliable (partial model) — always use specExpects.
+                if (specExpects != null && specExpects.TryGetValue(outp.Name, out var specExpr)
+                    && !(isBodyless && trustZ3Values && !hasUninterpFuncs))
                 {
                     // For class methods, qualify unqualified field references with "obj."
                     if (classInfo != null)
@@ -1659,6 +1672,25 @@ static class TestEmitter
                         sb.AppendLine($"    expect {litMatch.Groups[1].Value} == {inlineRhs};");
                     else
                         sb.AppendLine($"    expect {lit};");
+                }
+            }
+
+            // For bodyless methods: comment out all expect lines emitted above
+            if (isBodyless && expectStartPos >= 0 && sb.Length > expectStartPos)
+            {
+                var expectBlock = sb.ToString(expectStartPos, sb.Length - expectStartPos);
+                sb.Length = expectStartPos; // truncate
+                foreach (var line in expectBlock.Split('\n'))
+                {
+                    var trimmed = line.TrimEnd('\r');
+                    if (trimmed.Length == 0) continue;
+                    // Comment out expect/var lines, skip already-commented lines
+                    if (trimmed.TrimStart().StartsWith("//"))
+                        sb.AppendLine(trimmed);
+                    else if (trimmed.TrimStart().StartsWith("expect ") || trimmed.TrimStart().StartsWith("var "))
+                        sb.AppendLine(trimmed.Replace(trimmed.TrimStart(), "// " + trimmed.TrimStart()));
+                    else
+                        sb.AppendLine(trimmed);
                 }
             }
 

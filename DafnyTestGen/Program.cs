@@ -37,10 +37,12 @@ class Program
         maxTestsOpt.AddAlias("-x");
         var timeoutOpt = new Option<int>("--timeout", () => 60, "Timeout in seconds for test generation per method (0 = unlimited, default: 60)");
         var trustUnknownOpt = new Option<bool>("--trust-unknown", () => true, "Trust Z3 output values when uniqueness check returns 'unknown' (default: true)");
+        var skipBodylessOpt = new Option<bool>("--skip-bodyless", "Skip bodyless methods instead of generating spec-only tests (inputs only, call/expects commented)");
+        skipBodylessOpt.AddAlias("-p");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, skipBodylessOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -60,6 +62,7 @@ class Program
             var maxTests = ctx.ParseResult.GetValueForOption(maxTestsOpt);
             var timeout = ctx.ParseResult.GetValueForOption(timeoutOpt);
             TrustUnknownUniqueness = ctx.ParseResult.GetValueForOption(trustUnknownOpt);
+            var skipBodyless = ctx.ParseResult.GetValueForOption(skipBodylessOpt);
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
             var z3Path = Z3Runner.FindZ3Path(z3PathCli);
@@ -104,7 +107,7 @@ class Program
                 if (files.Count > 1)
                     Console.WriteLine($"{'='} Processing: {file.Name} {'=',40}");
 
-                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat, minTests, z3Path, maxTests, timeout);
+                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat, minTests, z3Path, maxTests, timeout, skipBodyless);
 
                 if (files.Count > 1)
                     Console.WriteLine();
@@ -147,7 +150,7 @@ class Program
         return new List<FileInfo>();
     }
 
-    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1, int minTests = 4, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0)
+    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1, int minTests = 4, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool skipBodyless = false)
     {
         if (!file.Exists)
         {
@@ -288,8 +291,10 @@ class Program
             .Select(f => f.Name)
             .ToHashSet();
 
-        // Detect bodyless methods — these will be skipped individually during test generation,
-        // and the -c (check) option is not supported for programs containing them
+        // Detect bodyless methods — by default, spec-only tests are generated
+        // (inputs uncommented, method call and expects commented out).
+        // With --skip-bodyless, they are skipped entirely.
+        // The -c (check) option is not supported for programs containing bodyless methods
         // (dafny build fails on bodyless methods).
         var allProgramMethods = DafnyParser.AllTopLevelDecls(program)
             .OfType<TopLevelDeclWithMembers>()
@@ -301,7 +306,10 @@ class Program
         if (hasBodylessMethods)
         {
             var names = string.Join(", ", bodylessMethods.Select(m => $"'{m.Name}'"));
-            Console.WriteLine($"[DafnyTestGen] Note: program contains bodyless method(s) {names} (will be skipped; -c not supported)");
+            if (skipBodyless)
+                Console.WriteLine($"[DafnyTestGen] Note: program contains bodyless method(s) {names} (will be skipped; --skip-bodyless)");
+            else
+                Console.WriteLine($"[DafnyTestGen] Note: program contains bodyless method(s) {names} (spec-only tests: call/expects commented)");
             Console.WriteLine();
         }
 
@@ -358,10 +366,12 @@ class Program
                 continue;
             }
 
-            // Skip bodyless methods (abstract/declared without a body — nothing to test)
-            if (method.Body == null)
+            // Skip bodyless methods when --skip-bodyless is set.
+            // Otherwise, generate spec-only tests (call/expects commented out).
+            bool isBodyless = method.Body == null;
+            if (isBodyless && skipBodyless)
             {
-                Console.WriteLine($"  Skipping '{method.Name}': bodyless method (no implementation to test)");
+                Console.WriteLine($"  Skipping '{method.Name}': bodyless method (--skip-bodyless)");
                 Console.WriteLine();
                 continue;
             }
@@ -503,7 +513,7 @@ class Program
 
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program);
+            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program, isBodyless);
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -559,7 +569,7 @@ class Program
 
         if (check && hasBodylessMethods)
         {
-            Console.WriteLine("[DafnyTestGen] Warning: -c (check) is not supported for programs with bodyless methods (dafny build would fail). Writing unchecked tests.");
+            Console.WriteLine("[DafnyTestGen] Warning: -c (check) is not supported for programs with bodyless methods (dafny build cannot compile them). Writing unchecked tests.");
             File.WriteAllText(outputPath, allTestCode.ToString());
         }
         else if (check)
@@ -724,7 +734,7 @@ class Program
     static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
         List<(string name, List<string> paramNames, string body, bool isClassMember)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool hasNonInlinableFuncs = false,
         Dictionary<string, List<string>>? enumDatatypes = null, Dictionary<string, (string dtName, int ordinal)>? enumConstructors = null,
-        ClassInfo? classInfo = null, Microsoft.Dafny.Program? program = null)
+        ClassInfo? classInfo = null, Microsoft.Dafny.Program? program = null, bool isBodyless = false)
     {
         z3Path ??= Z3Runner.FindZ3Path();
         enumDatatypes ??= new Dictionary<string, List<string>>();
@@ -1943,7 +1953,7 @@ class Program
         bool hasUninterpFuncs = hasNonInlinableFuncs || SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
         // Emit Dafny test file
-        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo, inlinablePredicates, specExpects);
+        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo, inlinablePredicates, specExpects, isBodyless);
     }
 
     /// <summary>
