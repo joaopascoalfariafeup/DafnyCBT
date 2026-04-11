@@ -13,13 +13,13 @@ static class TestValidator
     /// Timeout for running all tests in batch (first pass).
     /// If a crash/timeout kills the process, completed results are kept.
     /// </summary>
-    const int BatchRunTimeoutMs = 15_000;
+    const int BatchRunTimeoutMs = 30_000;
 
     /// <summary>
     /// Per-test run timeout when re-checking incomplete tests individually.
     /// Only execution time — the binary is already compiled.
     /// </summary>
-    const int SingleRunTimeoutMs = 10_000;
+    const int SingleRunTimeoutMs = 20_000;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Public entry point
