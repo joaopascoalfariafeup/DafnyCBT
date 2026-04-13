@@ -285,6 +285,12 @@ static class DafnyParser
             var changed = false;
             foreach (var (name, paramNames, body, _) in predicates)
             {
+                // In pass 2, skip recursive predicates/functions: further expanding a recursive
+                // call only adds deeper uninterpreted residuals without contributing useful
+                // constraints — the structural branches introduced by pass 1 are sufficient.
+                bool isRecursive = Regex.IsMatch(body, @"\b" + Regex.Escape(name) + @"\s*\(");
+                if (pass == 1 && isRecursive) continue;
+
                 // Find occurrences of name(args...) — search forward past each replacement
                 // to avoid re-inlining calls introduced by the replacement (recursive functions).
                 var regex = new Regex(@"\b" + Regex.Escape(name) + @"\s*\(");
