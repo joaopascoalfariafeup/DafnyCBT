@@ -744,37 +744,10 @@ static class TestValidator
             }
         }
 
-        // For outputs with captured runtime values but no "expect var == <expr>" to replace
-        // (e.g., postcondition expects like "expect |result| == |a|" or "expect forall i :: ..."):
-        // Insert a concrete value expect before the first postcondition expect mentioning
-        // this variable, while preserving all postcondition expects.
-        foreach (var (varName, value) in vars)
-        {
-            if (!IsValidDafnyLiteral(value)) continue;
-            // Check if this variable already has an "expect var ==" or "expect var[..] ==" line (already handled above)
-            if (Regex.IsMatch(result, @"^\s*expect\s+" + Regex.Escape(varName) + @"(\[\.\.\])?\s*==\s*", RegexOptions.Multiline))
-                continue;
-            // Check if this variable appears in non-== expects (e.g., "expect forall i :: ... result[i] ...")
-            if (!Regex.IsMatch(result, @"^\s*expect\s+.*\b" + Regex.Escape(varName) + @"\b", RegexOptions.Multiline))
-                continue;
-
-            // Insert concrete expect before the first postcondition expect mentioning this variable
-            bool inserted = false;
-            result = Regex.Replace(result,
-                @"^([ \t]*)(expect\s+.+\b" + Regex.Escape(varName) + @"\b.+;)",
-                m2 =>
-                {
-                    if (!inserted)
-                    {
-                        inserted = true;
-                        var lhs = (arrayOutputNames != null && arrayOutputNames.Contains(varName))
-                            ? $"{varName}[..]" : varName;
-                        return $"{m2.Groups[1].Value}expect {lhs} == {value};\n{m2.Value}";
-                    }
-                    return m2.Value;
-                },
-                RegexOptions.Multiline);
-        }
+        // (Previously: injected `expect var == <runtime value>;` before postcondition expects
+        // when no explicit var-equality expect existed. Removed: the emitter already decided
+        // not to emit a concrete-value expect in non-unique cases — a runtime-value injection
+        // here would pin the output to an arbitrary satisfying value and cause false failures.)
 
         return result;
     }

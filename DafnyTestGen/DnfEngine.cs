@@ -284,7 +284,7 @@ static class DnfEngine
             return (pos, neg);
         }
 
-        // Exists quantifier: decompose into boundary cases (pos only, as simple disjunction)
+        // Exists quantifier: decompose into boundary cases 
         if (expr is ExistsExpr existsFdnf)
         {
             var decomposed = TryDecomposeExists(existsFdnf);
@@ -550,7 +550,7 @@ static class DnfEngine
     /// <summary>
     /// Core AST-based decomposition. Given a bound variable and a body expression,
     /// tries to match patterns like: lo <=|< k [&&|&& k] <|<= hi && property(k)
-    /// and produces 3 boundary clauses with effective boundary values
+    /// and produces 4 boundary clauses with effective boundary values
     /// (adjusted for strict vs non-strict inequalities).
     /// </summary>
     static List<List<Expression>>? TryDecomposeQuantifierBody(
@@ -695,11 +695,23 @@ static class DnfEngine
         // Clause 3 (right boundary): property[k := effectiveHi]
         var rightProp = SubstituteVar(property, boundVar.Name, effectiveHi);
 
+        // Clause 4: multiple entries satisfying the property
+        // exists i, i_2 :: effLo <= i < i_2 <= effHi && property(i) && property(i_2)
+        // This forces at least two distinct positions satisfying the property.
+        var varName = boundVar.Name;
+        var var2Name = varName + "_2";
+        var property2 = SubstituteVar(property, varName, ParseToLeafExpression(var2Name));
+        var multiStr = $"exists {varName}, {var2Name} :: " +
+            $"{ExprToString(effectiveLo)} <= {varName} < {var2Name} <= {ExprToString(effectiveHi)} && " +
+            $"{ExprToString(property)} && {ExprToString(property2)}";
+        var multiExpr = ParseToLeafExpression(multiStr);
+
         return new List<List<Expression>>
         {
             new List<Expression> { rangeGuard, leftProp },
             new List<Expression> { middleExpr },
-            new List<Expression> { rangeGuard, rightProp }
+            new List<Expression> { rangeGuard, rightProp },
+            new List<Expression> { multiExpr },
         };
     }
 

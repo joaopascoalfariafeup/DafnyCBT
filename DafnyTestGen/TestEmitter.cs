@@ -1649,19 +1649,11 @@ static class TestEmitter
                         }
                     }
                 }
-                // Skip literals mentioning no output/mutable when all outputs are covered —
-                // they are implied by the output assertions and add noise to the test.
-                // This covers both trustZ3Values (unique concrete values) and specExpects
-                // (deterministic spec expressions). With uninterpreted functions, condition-only
-                // literals (like branch conditions referencing opaque calls) are unreliable
-                // because Z3's model may not match the actual function behavior.
+                // Skip literals mentioning no output and no mutable input: they are tautologies
+                // at runtime because the test constructed the inputs to satisfy the preconditions,
+                // so any predicate over immutable inputs alone is already true by construction.
                 if (!mentionsAnyOutput && !mentionsMutable)
-                {
-                    bool allOutputsCovered = method.Outs.All(o =>
-                        coveredOutputs.Contains(o.Name) ||
-                        !literals.Any(lit2 => Regex.IsMatch(lit2, @"\b" + Regex.Escape(o.Name) + @"\b")));
-                    if (allOutputsCovered) continue;
-                }
+                    continue;
                 // Emit if: mentions an uncovered output (or no-output in full-postcondition mode)
                 if (!mentionsAnyOutput || !mentionsOnlyCoveredOutputs)
                 {

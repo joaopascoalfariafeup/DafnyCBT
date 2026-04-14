@@ -84,8 +84,8 @@ static class BoundaryAnalysis
                 {
                     var constraint = $"(= (seq.len {smtName}) {sz})";
                     // Skip distinctness when shape tiers control element relationships,
-                    // or for tuple element sequences
-                    if (sz >= 2 && !isTupleElem && !paramsWithShapeTiers.Contains(name))
+                    // or for tuple element sequences //or for 33% of cases at random to allow some duplicates in the mix
+                    if (sz >= 2 && !isTupleElem && !paramsWithShapeTiers.Contains(name)) 
                     {
                         var distincts = new List<string>();
                         for (int a = 0; a < sz; a++)

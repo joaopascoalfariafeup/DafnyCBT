@@ -1285,8 +1285,14 @@ class Program
                 {
                     if (verbose)
                         Console.WriteLine($"  Combination {solveLabel}: SAT - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
-                    // Uniqueness check: is the output uniquely determined for these specific inputs?
-                    var uQuery = SmtTranslator.BuildUniquenessQuery(smt, inputs, outputs, values, mutableNames);
+                    // Uniqueness check: is the output uniquely determined for these specific inputs
+                    // under the ORIGINAL spec (preconditions + full ensures conjunction)?
+                    // Use a fresh SMT query built from dnfEnsures (no tier literals, no exclusions,
+                    // no tier extra constraints) — otherwise tier literals that pin the output
+                    // (e.g. index == 0 from an output-boundary tier) would make uniqueness trivially
+                    // hold, producing false-positive "unique" verdicts and wrong concrete expects.
+                    var specSmt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, dnfEnsures, method, false, null, null, preLits, mutableNames);
+                    var uQuery = SmtTranslator.BuildUniquenessQuery(specSmt, inputs, outputs, values, mutableNames);
                     if (!string.IsNullOrEmpty(uQuery) && !TimedOut())
                     {
                         var uResult = await Z3Runner.RunZ3(z3Path, uQuery);
