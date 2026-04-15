@@ -1197,7 +1197,7 @@ class Program
 
         // Build boundary tiers per precondition combination (always compute when progressive or boundary)
         var boundaryTiersPerPre = new Dictionary<int, List<(string tierLabel, List<string> tierConstraints)>>();
-        var outputTiers = new List<(string tierLabel, List<string> tierConstraints)>();
+        var outputTiers = new List<(string tierLabel, List<string> tierConstraints, string? dafnyKey)>();
         if (boundary || progressive)
         {
             for (int pi = 0; pi < preCombinations.Count; pi++)
@@ -1600,6 +1600,72 @@ class Program
 
             BuildScheduleEntries(testSchedule, useBoundary: false);
 
+            // Phase 1 extras: for any array/seq input referenced inside a pre- or post-
+            // quantifier (forall/exists, directly or via inlined predicate), force explicit
+            // size={0, 1, ≥2} variants. Z3 naturally minimizes collection length, so without
+            // these, a forall-bearing postcondition like
+            //     forall i :: 0 <= i < a.Length - 1 ==> a[i] <= a[i+1]
+            // would only ever be exercised on length ≤ 1 inputs (vacuously true), missing
+            // the non-trivial case.
+            var quantifiedCollections = new HashSet<string>();
+            foreach (var expr in preClauses.Concat(dnfEnsures))
+            {
+                var s = DnfEngine.ExprToString(expr);
+                if (!s.Contains("forall") && !s.Contains("exists")) continue;
+                foreach (var (name, type) in inputs)
+                {
+                    if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type)) continue;
+                    if (Regex.IsMatch(s, @"\b" + Regex.Escape(name) + @"\b"))
+                        quantifiedCollections.Add(name);
+                }
+            }
+
+            if (quantifiedCollections.Count > 0)
+            {
+                foreach (var collName in quantifiedCollections)
+                {
+                    var input = inputs.First(v => v.Name == collName);
+                    var seqName = TypeUtils.SeqSmtName(collName, input.Type);
+                    var tiers = new (string label, List<string> cs)[]
+                    {
+                        ($"|{collName}|>=2", new List<string> { $"(>= (seq.len {seqName}) 2)" }),
+                        ($"|{collName}|=1",  new List<string> { $"(= (seq.len {seqName}) 1)" }),
+                        ($"|{collName}|=0",  new List<string> { $"(= (seq.len {seqName}) 0)" }),
+                    };
+                    var collPattern = @"\b" + Regex.Escape(collName) + @"\b";
+                    for (int pi = 0; pi < preCombinations.Count; pi++)
+                    {
+                        var (preLabel, preLits, preExclusions) = preCombinations[pi];
+                        var fullPreLits = new List<Expression>(preLits);
+                        foreach (var excl in preExclusions)
+                            fullPreLits.Add(DnfEngine.Negate(excl));
+                        var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
+                        for (int ci = 0; ci < dnfExprs.Count; ci++)
+                        {
+                            var clause = dnfExprs[ci];
+                            // Only expand size tiers for clauses that contain a positive forall
+                            // referencing this collection. Negated-forall cases are already
+                            // structurally decomposed via the exists 4-case split, so they don't
+                            // need length expansion (and crossing would just add redundant work).
+                            bool hasPositiveForall = clause.Any(lit =>
+                            {
+                                var k = DnfEngine.ExprToString(lit);
+                                return k.Contains("forall") && !k.StartsWith("!")
+                                    && Regex.IsMatch(k, collPattern);
+                            });
+                            if (!hasPositiveForall) continue;
+                            int simpleMask = 1 << ci;
+                            var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}";
+                            foreach (var (tLabel, tCs) in tiers)
+                            {
+                                testSchedule.Add(($"{clauseLabel}/Q{tLabel}",
+                                    clause, fullPreLits, new List<Expression>(), tCs, simpleMask, pi));
+                            }
+                        }
+                    }
+                }
+            }
+
             await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count,
                 testCases, baseConditionExclusions, knownUnsatLiteralMasks);
 
@@ -1627,11 +1693,12 @@ class Program
                 Console.WriteLine($"  Phase 2 complete: {testCases.Count} test(s)");
             }
 
-            if (outputTiers.Count > 0
+            if (testCases.Count < minTests && outputTiers.Count > 0
                 && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
             {
-                // --- Phase 2b: output boundary tiers (always runs to ensure output diversity) ---
+                // --- Phase 2b: output boundary tiers ---
                 int phase2bStart = testSchedule.Count;
+                int prunedByImplication = 0;
                 // Add output tier entries for each singleton postcondition combination
                 for (int pi = 0; pi < preCombinations.Count; pi++)
                 {
@@ -1649,8 +1716,33 @@ class Program
 
                         var exclusions = new List<Expression>();
 
-                        foreach (var (tierLabel, tierConstraints) in outputTiers)
+                        // Collect Dafny-form literal keys from this clause's conjuncts + pre literals.
+                        // Used to prune output tiers whose constraint is already implied (redundant)
+                        // or contradicted (UNSAT) by the clause, so we don't waste Z3 calls on them.
+                        var clauseLitKeys = new HashSet<string>();
+                        foreach (var c in clause)
+                            clauseLitKeys.Add(DnfEngine.ExprToString(c));
+                        foreach (var p in fullPreLits)
+                            clauseLitKeys.Add(DnfEngine.ExprToString(p));
+
+                        foreach (var (tierLabel, tierConstraints, dafnyKey) in outputTiers)
                         {
+                            if (dafnyKey != null)
+                            {
+                                if (clauseLitKeys.Contains(dafnyKey))
+                                {
+                                    // Tier literal already in clause → redundant, Z3 would return same model.
+                                    prunedByImplication++;
+                                    continue;
+                                }
+                                var neg = DnfEngine.NegateOperatorInLiteral(dafnyKey);
+                                if (neg != null && clauseLitKeys.Contains(neg))
+                                {
+                                    // Tier literal contradicts clause → UNSAT, skip.
+                                    prunedByImplication++;
+                                    continue;
+                                }
+                            }
                             testSchedule.Add(($"{clauseLabel}/O{tierLabel}",
                                 clause, fullPreLits, exclusions, tierConstraints, simpleMask, pi));
                         }
@@ -1659,9 +1751,10 @@ class Program
                 int phase2bEntries = testSchedule.Count - phase2bStart;
                 if (phase2bEntries > 0)
                 {
-                    Console.WriteLine($"  Phase 2b: adding output boundary ({phase2bEntries} new entries)");
+                    var prunedNote = prunedByImplication > 0 ? $", {prunedByImplication} pruned" : "";
+                    Console.WriteLine($"  Phase 2b: adding output boundary ({phase2bEntries} new entries{prunedNote})");
                     await SolveRange(testSchedule, phase2bStart, testSchedule.Count, testSchedule.Count,
-                        testCases, baseConditionExclusions, knownUnsatLiteralMasks, 0);
+                        testCases, baseConditionExclusions, knownUnsatLiteralMasks, minTests);
                     if (!verbose) Console.Write("\r                          \r");
                     Console.WriteLine($"  Phase 2b complete: {testCases.Count} test(s)");
                 }

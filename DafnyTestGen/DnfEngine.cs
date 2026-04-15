@@ -701,9 +701,9 @@ static class DnfEngine
         var varName = boundVar.Name;
         var var2Name = varName + "_2";
         var property2 = SubstituteVar(property, varName, ParseToLeafExpression(var2Name));
-        var multiStr = $"exists {varName}, {var2Name} :: " +
-            $"{ExprToString(effectiveLo)} <= {varName} < {var2Name} <= {ExprToString(effectiveHi)} && " +
-            $"{ExprToString(property)} && {ExprToString(property2)}";
+        var multiStr = $"exists {varName}, {var2Name} | " +
+            $"{ExprToString(effectiveLo)} <= {varName} && {varName} < {var2Name} && {var2Name} <= {ExprToString(effectiveHi)} :: " +
+            $"({ExprToString(property)}) && ({ExprToString(property2)})";
         var multiExpr = ParseToLeafExpression(multiStr);
 
         return new List<List<Expression>>
@@ -720,7 +720,7 @@ static class DnfEngine
     /// <summary>
     /// Flatten nested && into a list of conjuncts.
     /// </summary>
-    static List<Expression> FlattenConjuncts(Expression expr)
+    internal static List<Expression> FlattenConjuncts(Expression expr)
     {
         var result = new List<Expression>();
         FlattenConjunctsInner(Unwrap(expr), result);
@@ -1106,7 +1106,7 @@ static class DnfEngine
     /// Handles: !(expr) ↔ expr, !X ↔ X, X in Y ↔ X !in Y, X == Y ↔ X != Y,
     /// X &lt; Y ↔ X &gt;= Y, X &gt; Y ↔ X &lt;= Y.
     /// </summary>
-    static string? NegateOperatorInLiteral(string key)
+    internal static string? NegateOperatorInLiteral(string key)
     {
         // !( expr ) ↔ expr
         if (key.StartsWith("!(") && key.EndsWith(")"))

@@ -301,7 +301,7 @@ static class BoundaryAnalysis
     /// Generates lightweight output boundary tiers for scalar output variables.
     /// These are NOT cross-producted with input tiers — each tier is an independent entry.
     /// </summary>
-    internal static List<(string tierLabel, List<string> tierConstraints)> BuildOutputTiers(
+    internal static List<(string tierLabel, List<string> tierConstraints, string? dafnyKey)> BuildOutputTiers(
         List<(string Name, string Type)> outputs,
         HashSet<string> mutableNames,
         List<(string Name, string Type)>? mutableFields,
@@ -309,38 +309,40 @@ static class BoundaryAnalysis
         List<string>? postLiterals = null,
         Dictionary<string, List<string>>? enumDatatypes = null)
     {
-        var result = new List<(string tierLabel, List<string> tierConstraints)>();
+        var result = new List<(string tierLabel, List<string> tierConstraints, string? dafnyKey)>();
 
         void AddScalarTiers(string name, string type, string smtName)
         {
-            // Order non-trivial tiers first (Z3 naturally gravitates to 0/minimal values)
+            // Order non-trivial tiers first (Z3 naturally gravitates to 0/minimal values).
+            // dafnyKey is the equivalent Dafny-form literal (matching DnfEngine.ExprToString output)
+            // used for syntactic implication/contradiction pruning against Phase-1 clause literals.
             if (type == "nat" || type == "T")
             {
-                result.Add(($"{name}>=2", new List<string> { $"(>= {smtName} 2)" }));
-                result.Add(($"{name}=1", new List<string> { $"(= {smtName} 1)" }));
-                result.Add(($"{name}=0", new List<string> { $"(= {smtName} 0)" }));
+                result.Add(($"{name}>=2", new List<string> { $"(>= {smtName} 2)" }, $"{name} >= 2"));
+                result.Add(($"{name}=1", new List<string> { $"(= {smtName} 1)" }, $"{name} == 1"));
+                result.Add(($"{name}=0", new List<string> { $"(= {smtName} 0)" }, $"{name} == 0"));
             }
             else if (type == "int")
             {
-                result.Add(($"{name}>0", new List<string> { $"(> {smtName} 0)" }));
-                result.Add(($"{name}<0", new List<string> { $"(< {smtName} 0)" }));
-                result.Add(($"{name}=0", new List<string> { $"(= {smtName} 0)" }));
+                result.Add(($"{name}>0", new List<string> { $"(> {smtName} 0)" }, $"{name} > 0"));
+                result.Add(($"{name}<0", new List<string> { $"(< {smtName} 0)" }, $"{name} < 0"));
+                result.Add(($"{name}=0", new List<string> { $"(= {smtName} 0)" }, $"{name} == 0"));
             }
             else if (type == "bool")
             {
-                result.Add(($"{name}=true", new List<string> { $"(= {smtName} true)" }));
-                result.Add(($"{name}=false", new List<string> { $"(= {smtName} false)" }));
+                result.Add(($"{name}=true", new List<string> { $"(= {smtName} true)" }, name));
+                result.Add(($"{name}=false", new List<string> { $"(= {smtName} false)" }, $"!{name}"));
             }
             else if (type == "real")
             {
-                result.Add(($"{name}>0", new List<string> { $"(> {smtName} 0.0)" }));
-                result.Add(($"{name}<0", new List<string> { $"(< {smtName} 0.0)" }));
-                result.Add(($"{name}=0", new List<string> { $"(= {smtName} 0.0)" }));
+                result.Add(($"{name}>0", new List<string> { $"(> {smtName} 0.0)" }, $"{name} > 0.0"));
+                result.Add(($"{name}<0", new List<string> { $"(< {smtName} 0.0)" }, $"{name} < 0.0"));
+                result.Add(($"{name}=0", new List<string> { $"(= {smtName} 0.0)" }, $"{name} == 0.0"));
             }
             else if (enumDatatypes != null && enumDatatypes.TryGetValue(type, out var enumCtors))
             {
                 for (int i = 0; i < enumCtors.Count; i++)
-                    result.Add(($"{name}={enumCtors[i]}", new List<string> { $"(= {smtName} {i})" }));
+                    result.Add(($"{name}={enumCtors[i]}", new List<string> { $"(= {smtName} {i})" }, $"{name} == {enumCtors[i]}"));
             }
         }
 
@@ -357,16 +359,16 @@ static class BoundaryAnalysis
             {
                 // Seq output length tiers: |f|=1, |f|>=2, |f|>=3
                 var seqName = TypeUtils.SeqSmtName(name, type);
-                result.Add(($"|{name}|>=3", new List<string> { $"(>= (seq.len {seqName}) 3)" }));
-                result.Add(($"|{name}|>=2", new List<string> { $"(>= (seq.len {seqName}) 2)" }));
-                result.Add(($"|{name}|=1", new List<string> { $"(= (seq.len {seqName}) 1)" }));
+                result.Add(($"|{name}|>=3", new List<string> { $"(>= (seq.len {seqName}) 3)" }, $"|{name}| >= 3"));
+                result.Add(($"|{name}|>=2", new List<string> { $"(>= (seq.len {seqName}) 2)" }, $"|{name}| >= 2"));
+                result.Add(($"|{name}|=1", new List<string> { $"(= (seq.len {seqName}) 1)" }, $"|{name}| == 1"));
             }
             else if (TypeUtils.IsSetType(type) || TypeUtils.IsMultisetType(type) || TypeUtils.IsMapType(type))
             {
                 // Set/multiset/map output cardinality tiers
-                result.Add(($"|{name}|>=3", new List<string> { $"(>= {name}_card 3)" }));
-                result.Add(($"|{name}|>=2", new List<string> { $"(>= {name}_card 2)" }));
-                result.Add(($"|{name}|>=1", new List<string> { $"(>= {name}_card 1)" }));
+                result.Add(($"|{name}|>=3", new List<string> { $"(>= {name}_card 3)" }, $"|{name}| >= 3"));
+                result.Add(($"|{name}|>=2", new List<string> { $"(>= {name}_card 2)" }, $"|{name}| >= 2"));
+                result.Add(($"|{name}|>=1", new List<string> { $"(>= {name}_card 1)" }, $"|{name}| >= 1"));
             }
             else if (!TypeUtils.IsArrayType(type))
             {
@@ -398,7 +400,7 @@ static class BoundaryAnalysis
         if (verbose && result.Count > 0)
         {
             Console.WriteLine($"  Output boundary tiers ({result.Count} total):");
-            foreach (var (label, constraints) in result)
+            foreach (var (label, constraints, _) in result)
                 Console.WriteLine($"    {label}: {string.Join(" & ", constraints)}");
         }
 
