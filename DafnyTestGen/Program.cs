@@ -1384,10 +1384,10 @@ class Program
 
         // Helper: build an SMT exclusion constraint from a set of input values.
         // For mutable arrays, use _pre names (we're excluding based on input values).
-        string? BuildInputExclusion(Dictionary<string, string> values)
+        List<string> BuildEqParts(Dictionary<string, string> values, List<(string Name, string Type)> varList)
         {
             var eqParts = new List<string>();
-            foreach (var (name, type) in inputs)
+            foreach (var (name, type) in varList)
             {
                 if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
                 {
@@ -1465,9 +1465,51 @@ class Program
                     }
                 }
             }
+            return eqParts;
+        }
+
+        string? BuildInputExclusion(Dictionary<string, string> values)
+        {
+            var eqParts = BuildEqParts(values, inputs);
             if (eqParts.Count == 0) return null;
             var conjunction = eqParts.Count == 1 ? eqParts[0] : $"(and {string.Join(" ", eqParts)})";
             return $"(not {conjunction})";
+        }
+
+        // Build a positive SMT conjunction pinning a prior test case's inputs + outputs.
+        // Used for subsumption pruning: if a new (clause, tier) goal is satisfied under
+        // this pin, a prior test case already covers it and we can skip calling Z3 for it.
+        string? BuildModelPin(Dictionary<string, string> values)
+        {
+            var eqParts = BuildEqParts(values, inputs);
+            eqParts.AddRange(BuildEqParts(values, outputs));
+            if (eqParts.Count == 0) return null;
+            return eqParts.Count == 1 ? eqParts[0] : $"(and {string.Join(" ", eqParts)})";
+        }
+
+        // Return true iff some prior test case (pinned input + output) already
+        // satisfies the candidate's literals + tier constraints. Checks up to
+        // MAX_SUBSUME_PRIOR most-recent results. Conservative on translator failures:
+        // if pinning yields no eqParts, we don't treat as covered.
+        const int MAX_SUBSUME_PRIOR = 20;
+        async Task<bool> IsAlreadyCovered(
+            List<Expression> lits, List<Expression> preLits, List<Expression> excl,
+            List<string> tierExtra,
+            List<(string label, Dictionary<string, string> values, List<Expression> literals)> results)
+        {
+            int start = Math.Max(0, results.Count - MAX_SUBSUME_PRIOR);
+            for (int i = results.Count - 1; i >= start; i--)
+            {
+                if (TimedOut()) return false;
+                var pin = BuildModelPin(results[i].values);
+                if (pin == null) continue;
+                var extraWithPin = new List<string>(tierExtra) { pin };
+                var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, false, excl, extraWithPin, preLits, mutableNames);
+                var result = await Z3Runner.RunZ3(z3Path, smt);
+                if (result.Split('\n').Select(l => l.Trim()).Any(l => l == "sat"))
+                    return true;
+            }
+            return false;
         }
 
         // Helper: build string key for a schedule entry (for dedup and input exclusion tracking)
@@ -1486,11 +1528,13 @@ class Program
             List<(string label, Dictionary<string, string> values, List<Expression> literals)> results,
             Dictionary<string, List<string>> baseExclusions,
             Dictionary<int, List<int>> knownUnsatLiteralMasks,
-            int earlyStopCount = 0)
+            int earlyStopCount = 0,
+            bool enableSubsumption = false)
         {
             int satCount = 0;
             int prunedCount = 0;
             int contradictionCount = 0;
+            int subsumedCount = 0;
             // Track base (no boundary) UNSAT results per (preIdx, mask) to skip their boundary tiers
             var baseUnsatMasks = new HashSet<(int preIdx, int mask)>();
             for (int i = from; i < to; i++)
@@ -1559,6 +1603,21 @@ class Program
                 allExtra.AddRange(extraConstraints);
                 allExtra.AddRange(inputExclusions);
 
+                // --- Optimization 3: subsumption pruning ---
+                // If a previously generated test case already witnesses this candidate's
+                // literals under its tier constraints, skip the redundant Z3 call.
+                if (enableSubsumption && results.Count > 0)
+                {
+                    var tierExtra = new List<string>(globalExtraConstraints);
+                    tierExtra.AddRange(extraConstraints);
+                    if (await IsAlreadyCovered(literals, preLits, exclusions, tierExtra, results))
+                    {
+                        if (verbose) Console.WriteLine($"  Combination {label}: skipped (subsumed by prior test case)");
+                        subsumedCount++;
+                        continue;
+                    }
+                }
+
                 var (solvedValues, isDefinitiveUnsat) = await SolveOne(label, i + 1, displayTotal, literals, preLits, exclusions, allExtra);
                 if (solvedValues != null)
                 {
@@ -1577,8 +1636,10 @@ class Program
                     baseUnsatMasks.Add((preIdx, postMask));
                 }
             }
-            if (verbose && (prunedCount > 0 || contradictionCount > 0))
-                Console.WriteLine($"  Pruning stats: {contradictionCount} syntactic contradiction(s), {prunedCount} superset-pruned");
+            if (verbose && (prunedCount > 0 || contradictionCount > 0 || subsumedCount > 0))
+                Console.WriteLine($"  Pruning stats: {contradictionCount} syntactic contradiction(s), {prunedCount} superset-pruned, {subsumedCount} subsumed");
+            else if (subsumedCount > 0)
+                Console.WriteLine($"  Subsumption pruning: {subsumedCount} skipped");
             return satCount;
         }
 
@@ -1683,7 +1744,8 @@ class Program
             }
 
             await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count,
-                testCases, baseConditionExclusions, knownUnsatLiteralMasks);
+                testCases, baseConditionExclusions, knownUnsatLiteralMasks,
+                earlyStopCount: 0, enableSubsumption: true);
 
             if (!verbose) Console.Write("\r                          \r"); // clear progress line
             Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
@@ -1704,7 +1766,8 @@ class Program
                 Console.WriteLine($"  Phase 2: adding boundary analysis ({newEntries} new entries)");
 
                 await SolveRange(testSchedule, phase2Start, testSchedule.Count, testSchedule.Count,
-                    testCases, baseConditionExclusions, knownUnsatLiteralMasks, minTests);
+                    testCases, baseConditionExclusions, knownUnsatLiteralMasks, minTests,
+                    enableSubsumption: true);
                 if (!verbose) Console.Write("\r                          \r");
                 Console.WriteLine($"  Phase 2 complete: {testCases.Count} test(s)");
             }
@@ -1770,7 +1833,8 @@ class Program
                     var prunedNote = prunedByImplication > 0 ? $", {prunedByImplication} pruned" : "";
                     Console.WriteLine($"  Phase 2b: adding output boundary ({phase2bEntries} new entries{prunedNote})");
                     await SolveRange(testSchedule, phase2bStart, testSchedule.Count, testSchedule.Count,
-                        testCases, baseConditionExclusions, knownUnsatLiteralMasks, minTests);
+                        testCases, baseConditionExclusions, knownUnsatLiteralMasks, minTests,
+                        enableSubsumption: true);
                     if (!verbose) Console.Write("\r                          \r");
                     Console.WriteLine($"  Phase 2b complete: {testCases.Count} test(s)");
                 }
