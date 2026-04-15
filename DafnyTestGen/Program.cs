@@ -1614,7 +1614,9 @@ class Program
                 if (!s.Contains("forall") && !s.Contains("exists")) continue;
                 foreach (var (name, type) in inputs)
                 {
-                    if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type)) continue;
+                    if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type)
+                        && !TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type)
+                        && !TypeUtils.IsMapType(type)) continue;
                     if (Regex.IsMatch(s, @"\b" + Regex.Escape(name) + @"\b"))
                         quantifiedCollections.Add(name);
                 }
@@ -1625,12 +1627,26 @@ class Program
                 foreach (var collName in quantifiedCollections)
                 {
                     var input = inputs.First(v => v.Name == collName);
-                    var seqName = TypeUtils.SeqSmtName(collName, input.Type);
+                    string sizeGe2, sizeEq1, sizeEq0;
+                    if (TypeUtils.IsArrayType(input.Type) || TypeUtils.IsSeqType(input.Type))
+                    {
+                        var seqName = TypeUtils.SeqSmtName(collName, input.Type);
+                        sizeGe2 = $"(>= (seq.len {seqName}) 2)";
+                        sizeEq1 = $"(= (seq.len {seqName}) 1)";
+                        sizeEq0 = $"(= (seq.len {seqName}) 0)";
+                    }
+                    else
+                    {
+                        // set/multiset/map use {name}_card
+                        sizeGe2 = $"(>= {collName}_card 2)";
+                        sizeEq1 = $"(= {collName}_card 1)";
+                        sizeEq0 = $"(= {collName}_card 0)";
+                    }
                     var tiers = new (string label, List<string> cs)[]
                     {
-                        ($"|{collName}|>=2", new List<string> { $"(>= (seq.len {seqName}) 2)" }),
-                        ($"|{collName}|=1",  new List<string> { $"(= (seq.len {seqName}) 1)" }),
-                        ($"|{collName}|=0",  new List<string> { $"(= (seq.len {seqName}) 0)" }),
+                        ($"|{collName}|>=2", new List<string> { sizeGe2 }),
+                        ($"|{collName}|=1",  new List<string> { sizeEq1 }),
+                        ($"|{collName}|=0",  new List<string> { sizeEq0 }),
                     };
                     var collPattern = @"\b" + Regex.Escape(collName) + @"\b";
                     for (int pi = 0; pi < preCombinations.Count; pi++)
