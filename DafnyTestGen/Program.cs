@@ -1210,7 +1210,7 @@ class Program
             // Build output boundary tiers for scalar outputs and mutable scalar fields
             var mutableFieldsList = classInfo?.Fields?.Where(f => mutableNames.Contains(f.Name)).ToList();
             var postLitStrings = method.Ens.Select(e => DnfEngine.ExprToString(e.E)).ToList();
-            outputTiers = BoundaryAnalysis.BuildOutputTiers(outputs, mutableNames, mutableFieldsList, verbose, postLitStrings, enumDatatypes);
+            outputTiers = BoundaryAnalysis.BuildOutputTiers(outputs, mutableNames, mutableFieldsList, verbose, postLitStrings, enumDatatypes, inputs);
         }
 
         // Helper: build schedule entries for a given mode.

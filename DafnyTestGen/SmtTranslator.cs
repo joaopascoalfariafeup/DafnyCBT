@@ -2126,6 +2126,16 @@ static class SmtTranslator
     {
         var expr = dafnyExpr.Trim();
 
+        // Simplify prefix-slice reductions introduced by predicate inlining:
+        //   name[..N][i]  →  name[i]       (valid under any range guard 0 <= i < N)
+        //   |name[..N]|   →  N             (length of prefix slice)
+        // The enclosing quantifier's range guard ensures i is within bounds. Without
+        // this rewrite, the string translator would fail to translate the slice and
+        // the entire precondition would be silently dropped (see && tolerance).
+        var before = expr;
+        expr = Regex.Replace(expr, @"\b(\w+)\[\.\.([^\[\]]+?)\]\[([^\[\]]+?)\]", "$1[$3]");
+        expr = Regex.Replace(expr, @"\|(\w+)\[\.\.([^\[\]|]+?)\]\|", "($2)");
+
         // Strip balanced outer parentheses: (expr) -> expr
         // But don't strip tuple literals like (e1, e2) â€” detected by comma at depth 1
         while (expr.StartsWith("(") && expr.EndsWith(")"))
@@ -2141,7 +2151,9 @@ static class SmtTranslator
                 if (depth == 0) { isOuter = false; break; }
                 if (expr[i] == ',' && depth == 1) hasCommaAtDepth1 = true;
             }
-            if (isOuter && !hasCommaAtDepth1)
+            // Quantifier bodies have commas at depth 1 (bound var list) but are NOT tuple literals.
+            bool isQuantInner = isOuter && Regex.IsMatch(expr, @"^\(\s*(forall|exists)\s");
+            if (isOuter && (!hasCommaAtDepth1 || isQuantInner))
                 expr = expr.Substring(1, expr.Length - 2).Trim();
             else
                 break;

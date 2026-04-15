@@ -307,7 +307,8 @@ static class BoundaryAnalysis
         List<(string Name, string Type)>? mutableFields,
         bool verbose,
         List<string>? postLiterals = null,
-        Dictionary<string, List<string>>? enumDatatypes = null)
+        Dictionary<string, List<string>>? enumDatatypes = null,
+        List<(string Name, string Type)>? inputs = null)
     {
         var result = new List<(string tierLabel, List<string> tierConstraints, string? dafnyKey)>();
 
@@ -394,6 +395,59 @@ static class BoundaryAnalysis
                 if (postLiterals != null && !AppearsInPostState(fieldName, postLiterals))
                     continue;
                 AddScalarTiers(fieldName, fieldType, $"{fieldName}_post");
+
+                // Equal/different-from-initial tiers: only when the field is mentioned
+                // in ensures both as post-state and inside old(...). This exercises the
+                // "no-op" vs "actually mutated" branches of the postcondition.
+                if (postLiterals != null && AppearsInOldWrapper(fieldName, postLiterals))
+                {
+                    result.Add(($"{fieldName}≠old", new List<string> { $"(not (= {fieldName}_post {fieldName}_pre))" }, null));
+                    result.Add(($"{fieldName}=old", new List<string> { $"(= {fieldName}_post {fieldName}_pre)" }, null));
+                }
+            }
+        }
+
+        // Mutable array/seq parameters and fields: compare full pre/post contents.
+        // Strict filter: the variable must appear in ensures both as post-state and inside old(...).
+        void AddArrayEqualityTiers(string name, string type)
+        {
+            if (postLiterals == null) return;
+            if (!AppearsInPostState(name, postLiterals)) return;
+            if (!AppearsInOldWrapper(name, postLiterals)) return;
+            var elemType = TypeUtils.GetSeqElementType(type);
+            string eqExpr;
+            if (TypeUtils.IsTupleType(elemType))
+            {
+                var comps = TypeUtils.GetTupleComponentTypes(elemType);
+                var parts = new List<string>();
+                for (int ci = 0; ci < comps.Count; ci++)
+                    parts.Add($"(= {name}_pre_seq_{ci} {name}_post_seq_{ci})");
+                eqExpr = parts.Count == 1 ? parts[0] : "(and " + string.Join(" ", parts) + ")";
+            }
+            else
+            {
+                eqExpr = $"(= {name}_pre_seq {name}_post_seq)";
+            }
+            result.Add(($"{name}≠old", new List<string> { $"(not {eqExpr})" }, null));
+            result.Add(($"{name}=old", new List<string> { eqExpr }, null));
+        }
+
+        if (inputs != null)
+        {
+            foreach (var (name, type) in inputs)
+            {
+                if (!mutableNames.Contains(name)) continue;
+                if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type)) continue;
+                AddArrayEqualityTiers(name, type);
+            }
+        }
+        if (mutableFields != null)
+        {
+            foreach (var (fieldName, fieldType) in mutableFields)
+            {
+                if (!mutableNames.Contains(fieldName)) continue;
+                if (!TypeUtils.IsArrayType(fieldType) && !TypeUtils.IsSeqType(fieldType)) continue;
+                AddArrayEqualityTiers(fieldName, fieldType);
             }
         }
 
@@ -419,6 +473,36 @@ static class BoundaryAnalysis
             var stripped = StripOldWrappers(lit);
             if (Regex.IsMatch(stripped, fieldPattern))
                 return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Checks whether a field name appears inside an old(...) wrapper in any literal.
+    /// </summary>
+    static bool AppearsInOldWrapper(string fieldName, IEnumerable<string> literals)
+    {
+        var escapedName = Regex.Escape(fieldName);
+        var fieldPattern = @"\b" + escapedName + @"\b";
+        foreach (var lit in literals)
+        {
+            // Extract the content of every old(...) occurrence and search within it.
+            int i = 0;
+            while (true)
+            {
+                var idx = lit.IndexOf("old(", i);
+                if (idx < 0) break;
+                if (idx > 0 && char.IsLetterOrDigit(lit[idx - 1])) { i = idx + 1; continue; }
+                int depth = 0, start = idx + 3, end = start;
+                for (int k = start; k < lit.Length; k++)
+                {
+                    if (lit[k] == '(') depth++;
+                    else if (lit[k] == ')') { depth--; if (depth == 0) { end = k; break; } }
+                }
+                var inner = lit.Substring(start + 1, Math.Max(0, end - start - 1));
+                if (Regex.IsMatch(inner, fieldPattern)) return true;
+                i = end + 1;
+            }
         }
         return false;
     }
