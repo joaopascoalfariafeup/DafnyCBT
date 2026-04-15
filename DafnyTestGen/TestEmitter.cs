@@ -1267,14 +1267,13 @@ static class TestEmitter
                 if (!literals.Any(lit => Regex.IsMatch(lit, outPattern)))
                     continue;
 
-                // When the original postcondition has `outName == specExpr`, emit the spec
-                // expression directly — it's deterministic and evaluable at runtime (ghost removed).
-                // This is always correct regardless of Z3's concrete output value.
-                // For bodyless methods: prefer concrete Z3 values when trustworthy (unique +
-                // no uninterpreted functions). When the postcondition uses recursive/uninterpreted
-                // functions, Z3's uniqueness is unreliable (partial model) — always use specExpects.
+                // When the original postcondition has `outName == specExpr`, the spec expression
+                // is deterministic and evaluable at runtime. Prefer concrete Z3 values whenever
+                // trustworthy (unique + no uninterpreted functions) — that's the normal shape for
+                // test code. Fall back to the symbolic spec expression only when Z3's values can't
+                // be trusted (non-unique, or postcondition uses recursive/uninterpreted functions).
                 if (specExpects != null && specExpects.TryGetValue(outp.Name, out var specExpr)
-                    && !(isBodyless && trustZ3Values && !hasUninterpFuncs))
+                    && !(trustZ3Values && !hasUninterpFuncs))
                 {
                     // For class methods, qualify unqualified field references with "obj."
                     if (classInfo != null)

@@ -804,9 +804,11 @@ class Program
         }
 
         // Compute DNF on un-inlined ensures for expect emission (preserves predicate names).
+        // Use CrossProductPruned to keep clause structure aligned with dnfExprs — otherwise
+        // the position-based inlined→original mapping below misaligns and literals get lost.
         var originalDnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
         for (int i = 1; i < ensuresClauses.Count; i++)
-            originalDnfExprs = DnfEngine.CrossProduct(originalDnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
+            originalDnfExprs = DnfEngine.CrossProductPruned(originalDnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
 
         // Compute DNF/FDNF on inlined ensures for SMT translation.
         // FDNF (Full DNF) used only in all-combinations mode (explicit -a flag).
@@ -1669,10 +1671,19 @@ class Program
             // would only ever be exercised on length ≤ 1 inputs (vacuously true), missing
             // the non-trivial case.
             var quantifiedCollections = new HashSet<string>();
+            // Inlinable predicates whose body contains a quantifier — calls to these
+            // hide a forall/exists and must be treated as quantified for this detection.
+            var quantifiedPredicates = inlinablePredicates == null
+                ? new HashSet<string>()
+                : new HashSet<string>(inlinablePredicates
+                    .Where(p => p.body.Contains("forall") || p.body.Contains("exists"))
+                    .Select(p => p.name));
             foreach (var expr in preClauses.Concat(dnfEnsures))
             {
                 var s = DnfEngine.ExprToString(expr);
-                if (!s.Contains("forall") && !s.Contains("exists")) continue;
+                bool hasQuant = s.Contains("forall") || s.Contains("exists")
+                    || quantifiedPredicates.Any(p => Regex.IsMatch(s, @"\b" + Regex.Escape(p) + @"\b"));
+                if (!hasQuant) continue;
                 foreach (var (name, type) in inputs)
                 {
                     if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type)
@@ -1710,6 +1721,17 @@ class Program
                         ($"|{collName}|=0",  new List<string> { sizeEq0 }),
                     };
                     var collPattern = @"\b" + Regex.Escape(collName) + @"\b";
+                    bool LitHasPositiveForall(Expression lit)
+                    {
+                        var k = DnfEngine.ExprToString(lit);
+                        if (k.StartsWith("!")) return false;
+                        if (!Regex.IsMatch(k, collPattern)) return false;
+                        if (k.Contains("forall")) return true;
+                        // Hidden behind an inlinable predicate whose body uses forall.
+                        return quantifiedPredicates.Any(p =>
+                            Regex.IsMatch(k, @"\b" + Regex.Escape(p) + @"\b")
+                            && inlinablePredicates!.First(ip => ip.name == p).body.Contains("forall"));
+                    }
                     for (int pi = 0; pi < preCombinations.Count; pi++)
                     {
                         var (preLabel, preLits, preExclusions) = preCombinations[pi];
@@ -1717,19 +1739,17 @@ class Program
                         foreach (var excl in preExclusions)
                             fullPreLits.Add(DnfEngine.Negate(excl));
                         var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
+                        // Requires-side forall on this collection applies to every ensures clause.
+                        bool preHasPositiveForall = preLits.Any(LitHasPositiveForall);
                         for (int ci = 0; ci < dnfExprs.Count; ci++)
                         {
                             var clause = dnfExprs[ci];
-                            // Only expand size tiers for clauses that contain a positive forall
-                            // referencing this collection. Negated-forall cases are already
-                            // structurally decomposed via the exists 4-case split, so they don't
-                            // need length expansion (and crossing would just add redundant work).
-                            bool hasPositiveForall = clause.Any(lit =>
-                            {
-                                var k = DnfEngine.ExprToString(lit);
-                                return k.Contains("forall") && !k.StartsWith("!")
-                                    && Regex.IsMatch(k, collPattern);
-                            });
+                            // Expand size tiers for clauses that contain a positive forall
+                            // referencing this collection, OR when a requires-side forall
+                            // references it (applies to every ensures clause). Negated-forall
+                            // cases are already structurally decomposed via the exists 4-case
+                            // split, so clause-level check skips negated literals.
+                            bool hasPositiveForall = preHasPositiveForall || clause.Any(LitHasPositiveForall);
                             if (!hasPositiveForall) continue;
                             int simpleMask = 1 << ci;
                             var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}";
