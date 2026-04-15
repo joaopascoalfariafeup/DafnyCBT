@@ -130,6 +130,7 @@ static class TestValidator
             var completedIds = ParseDoneMarkers(batchOut);
             var skippedIds = ParseSkipMarkers(batchOut);
             var capturedVals = ParseValMarkers(batchOut);
+            var capturedRhsVals = ParseRhsValMarkers(batchOut);
             var wrongValIds = new HashSet<int>();
             ParseWrongValMarkers(batchOut, wrongValIds);
 
@@ -176,6 +177,14 @@ static class TestValidator
                             foreach (var (k, v) in vars)
                                 capturedVals[id][k] = v;
                         }
+                        var reRhsVals = ParseRhsValMarkers(reOut);
+                        foreach (var (id, vars) in reRhsVals)
+                        {
+                            if (!capturedRhsVals.ContainsKey(id))
+                                capturedRhsVals[id] = new Dictionary<string, string>();
+                            foreach (var (k, v) in vars)
+                                capturedRhsVals[id][k] = v;
+                        }
                         ParseWrongValMarkers(reOut, wrongValIds);
                     }
                 }
@@ -195,10 +204,14 @@ static class TestValidator
                 }
                 else if (failedIds.Contains(i))
                 {
-                    // Check if this is a rescued test: Z3's value was wrong (WRONGVAL)
-                    // but postconditions passed (no FAIL from postcondition checks).
-                    // Wait — if FAIL is set, postconditions actually failed. No rescue.
-                    failingBlocks.Add(testBlocks[i]);
+                    // Annotate the body's `expect out == rhs;` lines with captured
+                    // expected/actual values so the commented-out failing expect is
+                    // self-explanatory in the emitted Failing() method.
+                    var annotatedBody = AnnotateFailingExpects(
+                        testBlocks[i].body,
+                        capturedVals.GetValueOrDefault(i),
+                        capturedRhsVals.GetValueOrDefault(i));
+                    failingBlocks.Add((testBlocks[i].comment, annotatedBody));
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: FAIL");
                 }
                 else if (wrongValIds.Contains(i))
@@ -302,6 +315,16 @@ static class TestValidator
             sb.AppendLine("method PrintCharSeqVal(testId: nat, name: string, v: seq<char>)");
             sb.AppendLine("{");
             sb.AppendLine("  print \"VAL:\", testId, \":\", name, \"=[\";");
+            sb.AppendLine("  for i := 0 to |v| {");
+            sb.AppendLine("    if i > 0 { print \", \"; }");
+            sb.AppendLine("    print \"'\", [v[i]], \"'\";");
+            sb.AppendLine("  }");
+            sb.AppendLine("  print \"]\\n\";");
+            sb.AppendLine("}");
+            sb.AppendLine();
+            sb.AppendLine("method PrintCharSeqRhsVal(testId: nat, name: string, v: seq<char>)");
+            sb.AppendLine("{");
+            sb.AppendLine("  print \"RHSVAL:\", testId, \":\", name, \"=[\";");
             sb.AppendLine("  for i := 0 to |v| {");
             sb.AppendLine("    if i > 0 { print \", \"; }");
             sb.AppendLine("    print \"'\", [v[i]], \"'\";");
@@ -571,6 +594,8 @@ static class TestValidator
     /// <summary>
     /// If the expect expression is `var == <non-trivial expr>`, returns a print statement
     /// that captures the actual runtime value: print "VAL:testId:var=", var, "\n";
+    /// Also emits an RHSVAL print for the right-hand side expression (the spec-evaluated
+    /// expected value), enabling failing-test diagnostics like "expected X, got Y".
     /// Returns null if the RHS is already a simple literal (int/bool/char) — nothing to capture.
     /// </summary>
     static string? TryMakeValPrint(string expr, int testId, string indent,
@@ -587,15 +612,28 @@ static class TestValidator
         // Don't emit VAL for simple scalar literals — the expect is already concrete
         if (IsSimpleScalarLiteral(rhs)) return null;
 
+        string valLine;
+        string rhsValLine;
+
         // For string/seq<char> outputs, use helper that prints parseable ['a', 'b'] format
         if (stringOutputNames != null && stringOutputNames.Contains(varName))
-            return $"{indent}PrintCharSeqVal({testId}, \"{varName}\", {varName});";
-
+        {
+            valLine = $"{indent}PrintCharSeqVal({testId}, \"{varName}\", {varName});";
+            rhsValLine = $"{indent}PrintCharSeqRhsVal({testId}, \"{varName}\", ({rhs}));";
+        }
         // For array outputs, print as arr[..] to get sequence format
-        if (arrayOutputNames != null && arrayOutputNames.Contains(varName))
-            return $"{indent}print \"VAL:{testId}:{varName}=\", {varName}[..], \"\\n\";";
+        else if (arrayOutputNames != null && arrayOutputNames.Contains(varName))
+        {
+            valLine = $"{indent}print \"VAL:{testId}:{varName}=\", {varName}[..], \"\\n\";";
+            rhsValLine = $"{indent}print \"RHSVAL:{testId}:{varName}=\", ({rhs})[..], \"\\n\";";
+        }
+        else
+        {
+            valLine = $"{indent}print \"VAL:{testId}:{varName}=\", {varName}, \"\\n\";";
+            rhsValLine = $"{indent}print \"RHSVAL:{testId}:{varName}=\", ({rhs}), \"\\n\";";
+        }
 
-        return $"{indent}print \"VAL:{testId}:{varName}=\", {varName}, \"\\n\";";
+        return valLine + "\n" + rhsValLine;
     }
 
     /// <summary>
@@ -651,11 +689,65 @@ static class TestValidator
     /// <summary>
     /// Parses VAL:testId:varName=value markers from output.
     /// Returns a dict: testId → { varName → value }
+    /// The (?&lt;!RHS) guard prevents matching RHSVAL: lines (the substring "VAL:" appears inside "RHSVAL:").
     /// </summary>
     static Dictionary<int, Dictionary<string, string>> ParseValMarkers(string output)
     {
         var result = new Dictionary<int, Dictionary<string, string>>();
-        foreach (Match m in Regex.Matches(output, @"VAL:(\d+):(\w+)=(.+)"))
+        foreach (Match m in Regex.Matches(output, @"(?<!RHS)VAL:(\d+):(\w+)=(.+)"))
+        {
+            if (!int.TryParse(m.Groups[1].Value, out var id)) continue;
+            var varName = m.Groups[2].Value;
+            var value = m.Groups[3].Value.Trim();
+            if (!result.ContainsKey(id))
+                result[id] = new Dictionary<string, string>();
+            result[id][varName] = value;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Rewrites `expect out == rhs;` lines in a failing test body to append a
+    /// trailing comment showing the captured runtime values, e.g.
+    /// `expect res == Comb(n, k); // expected 4, got 6`.
+    /// EmitSplitTests then comments the whole expect line out.
+    /// </summary>
+    static string AnnotateFailingExpects(string body,
+        Dictionary<string, string>? vals, Dictionary<string, string>? rhsVals)
+    {
+        if ((vals == null || vals.Count == 0) && (rhsVals == null || rhsVals.Count == 0))
+            return body;
+        return Regex.Replace(body, @"^(\s*)expect\s+(\w+)\s*==\s*([^;]+);(?!\s*//)",
+            m =>
+            {
+                var indent = m.Groups[1].Value;
+                var outName = m.Groups[2].Value;
+                var rhs = m.Groups[3].Value.TrimEnd();
+                string? expected = rhsVals != null && rhsVals.TryGetValue(outName, out var e) ? e : null;
+                string? actual = vals != null && vals.TryGetValue(outName, out var a) ? a : null;
+                if (expected == null && actual == null)
+                    return m.Value;
+                // Prefer substituting the expected value into the expect (concrete, ready
+                // to uncomment once the bug is fixed); keep the actual as a trailing comment.
+                if (expected != null)
+                {
+                    var trailing = actual != null ? $" // got {actual}" : "";
+                    return $"{indent}expect {outName} == {expected};{trailing}";
+                }
+                // Only actual is available — keep original rhs, annotate with got.
+                return $"{indent}expect {outName} == {rhs}; // got {actual}";
+            },
+            RegexOptions.Multiline);
+    }
+
+    /// <summary>
+    /// Parses RHSVAL:testId:varName=value markers — the spec-side expected value
+    /// captured at runtime from the RHS of an equality-shaped ensures clause.
+    /// </summary>
+    static Dictionary<int, Dictionary<string, string>> ParseRhsValMarkers(string output)
+    {
+        var result = new Dictionary<int, Dictionary<string, string>>();
+        foreach (Match m in Regex.Matches(output, @"RHSVAL:(\d+):(\w+)=(.+)"))
         {
             if (!int.TryParse(m.Groups[1].Value, out var id)) continue;
             var varName = m.Groups[2].Value;
