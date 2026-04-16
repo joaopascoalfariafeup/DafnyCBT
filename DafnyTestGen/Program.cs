@@ -8,6 +8,7 @@ namespace DafnyTestGen;
 class Program
 {
     static bool TrustUnknownUniqueness = true;
+    static int UniquenessRounds = 1;
 
     static async Task<int> Main(string[] args)
     {
@@ -37,12 +38,14 @@ class Program
         maxTestsOpt.AddAlias("-x");
         var timeoutOpt = new Option<int>("--timeout", () => 60, "Timeout in seconds for test generation per method (0 = unlimited, default: 60)");
         var trustUnknownOpt = new Option<bool>("--trust-unknown", () => true, "Trust Z3 output values when uniqueness check returns 'unknown' (default: true)");
+        var uniquenessRoundsOpt = new Option<int>("--uniqueness-rounds", () => 1, "Max rounds of uniqueness checking to enumerate all valid outputs (default: 1). When all valid outputs are enumerated, emit expect out == v1 || out == v2 || ...;");
+        uniquenessRoundsOpt.AddAlias("-u");
         var skipBodylessOpt = new Option<bool>("--skip-bodyless", "Skip bodyless methods instead of generating spec-only tests (inputs only, call/expects commented)");
         skipBodylessOpt.AddAlias("-p");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, skipBodylessOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -62,6 +65,7 @@ class Program
             var maxTests = ctx.ParseResult.GetValueForOption(maxTestsOpt);
             var timeout = ctx.ParseResult.GetValueForOption(timeoutOpt);
             TrustUnknownUniqueness = ctx.ParseResult.GetValueForOption(trustUnknownOpt);
+            UniquenessRounds = ctx.ParseResult.GetValueForOption(uniquenessRoundsOpt);
             var skipBodyless = ctx.ParseResult.GetValueForOption(skipBodylessOpt);
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
@@ -1301,9 +1305,86 @@ class Program
                         var uResultTrimmed = uResult.Split('\n').Select(l => l.Trim()).ToList();
                         bool isUnique = uResultTrimmed.Any(l => l == "unsat");
                         bool isUnknown = !isUnique && uResultTrimmed.Any(l => l == "unknown");
+
+                        // Multi-round enumeration: when not unique and rounds > 1,
+                        // collect alternative output values to emit disjunctive expects.
+                        if (!isUnique && !isUnknown && UniquenessRounds > 1)
+                        {
+                            // Parse the alternative output values from the first uniqueness SAT result
+                            var altValues = TypeUtils.ParseZ3Model(uResult, allVars);
+                            var altList = new List<Dictionary<string, string>>();
+                            if (altValues.Count > 0)
+                                altList.Add(altValues);
+
+                            // Strip (check-sat)/(get-model) from the base query to build iteratively
+                            var baseQuery = uQuery;
+                            var checkIdx = baseQuery.LastIndexOf("(check-sat)");
+                            if (checkIdx >= 0)
+                                baseQuery = baseQuery.Substring(0, checkIdx);
+
+                            // Add blocking clause for the alternative values found in round 1
+                            var sb2 = new System.Text.StringBuilder(baseQuery);
+                            if (altValues.Count > 0)
+                            {
+                                var altBlock = SmtTranslator.BuildOutputBlockingClause(inputs, outputs, altValues, mutableNames);
+                                if (!string.IsNullOrEmpty(altBlock))
+                                    sb2.AppendLine(altBlock);
+                            }
+
+                            bool exhausted = false;
+                            for (int round = 2; round <= UniquenessRounds && !exhausted && !TimedOut(); round++)
+                            {
+                                sb2.AppendLine("(check-sat)");
+                                sb2.AppendLine("(get-model)");
+                                var roundResult = await Z3Runner.RunZ3(z3Path, sb2.ToString());
+                                var roundLines = roundResult.Split('\n').Select(l => l.Trim()).ToList();
+
+                                if (roundLines.Any(l => l == "unsat"))
+                                {
+                                    // All valid outputs have been enumerated
+                                    exhausted = true;
+                                    isUnique = true; // exhaustively enumerated
+                                }
+                                else if (roundLines.Any(l => l == "sat"))
+                                {
+                                    var roundVals = TypeUtils.ParseZ3Model(roundResult, allVars);
+                                    if (roundVals.Count > 0)
+                                    {
+                                        altList.Add(roundVals);
+                                        // Strip check-sat/get-model, add new blocking clause
+                                        var cs2 = sb2.ToString().LastIndexOf("(check-sat)");
+                                        if (cs2 >= 0)
+                                            sb2 = new System.Text.StringBuilder(sb2.ToString().Substring(0, cs2));
+                                        var newBlock = SmtTranslator.BuildOutputBlockingClause(inputs, outputs, roundVals, mutableNames);
+                                        if (!string.IsNullOrEmpty(newBlock))
+                                            sb2.AppendLine(newBlock);
+                                    }
+                                    else
+                                        break; // can't parse model, stop
+                                }
+                                else
+                                    break; // unknown/timeout, stop
+                            }
+
+                            // Store alternative values for TestEmitter
+                            if (isUnique && altList.Count > 0)
+                            {
+                                values["__alt_count__"] = altList.Count.ToString();
+                                for (int ai = 0; ai < altList.Count; ai++)
+                                    foreach (var kv in altList[ai])
+                                        values[$"__alt_{ai}_{kv.Key}"] = kv.Value;
+                            }
+
+                            if (verbose && altList.Count > 0)
+                            {
+                                var status = isUnique ? $"exhaustively enumerated ({altList.Count + 1} valid outputs)" : $"found {altList.Count + 1}+ valid outputs (cap reached)";
+                                Console.WriteLine($"  Combination {solveLabel}: output uniqueness: {status}");
+                            }
+                        }
+
                         // unknown = Z3 can't decide, but no counter-example found → trust values
                         values["__unique__"] = (isUnique || (isUnknown && TrustUnknownUniqueness)) ? "true" : "false";
-                        if (verbose)
+                        if (verbose && !values.ContainsKey("__alt_count__"))
                         {
                             var uqLabel = isUnique ? "unique" : isUnknown ? (TrustUnknownUniqueness ? "unknown (trusting Z3 values)" : "unknown (not trusted)") : "not unique";
                             Console.WriteLine($"  Combination {solveLabel}: output uniqueness: {uqLabel}");

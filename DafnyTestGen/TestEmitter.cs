@@ -973,6 +973,8 @@ static class TestEmitter
             var coveredOutputs = new HashSet<string>();
             bool isUnique = values.TryGetValue("__unique__", out var uqFlag) && uqFlag == "true";
             bool trustZ3Values = isUnique;
+            int altCount = values.TryGetValue("__alt_count__", out var altCountStr) && int.TryParse(altCountStr, out var ac) ? ac : 0;
+            bool hasEnumeratedAlts = isUnique && altCount > 0; // exhaustively enumerated multiple valid outputs
             foreach (var outp in method.Outs)
             {
                 var outPattern = @"\b" + Regex.Escape(outp.Name) + @"\b";
@@ -1311,7 +1313,29 @@ static class TestEmitter
                         var tupleVal = $"({string.Join(", ", componentValues)})";
                         if (isUnique)
                         {
-                            sb.AppendLine($"    expect {outp.Name} == {tupleVal};");
+                            if (hasEnumeratedAlts)
+                            {
+                                var allTuples = new List<string> { tupleVal };
+                                for (int ai = 0; ai < altCount; ai++)
+                                {
+                                    var altComps = new List<string>();
+                                    bool altAllFound = true;
+                                    for (int ci = 0; ci < components.Count; ci++)
+                                    {
+                                        if (values.TryGetValue($"__alt_{ai}_{outp.Name}_{ci}", out var altCompVal))
+                                            altComps.Add(FormatScalarValue(altCompVal, components[ci], enumDatatypes));
+                                        else { altAllFound = false; break; }
+                                    }
+                                    if (altAllFound)
+                                        allTuples.Add($"({string.Join(", ", altComps)})");
+                                }
+                                if (allTuples.Count > 1)
+                                    sb.AppendLine($"    expect {string.Join(" || ", allTuples.Select(v => $"{outp.Name} == {v}"))};");
+                                else
+                                    sb.AppendLine($"    expect {outp.Name} == {tupleVal};");
+                            }
+                            else
+                                sb.AppendLine($"    expect {outp.Name} == {tupleVal};");
                             coveredOutputs.Add(outp.Name);
                         }
                         else
@@ -1337,7 +1361,22 @@ static class TestEmitter
                     }
                     if (isUnique)
                     {
-                        sb.AppendLine($"    expect {outp.Name} == {val};");
+                        if (hasEnumeratedAlts)
+                        {
+                            // Collect all enumerated alternative values
+                            var allVals = new List<string> { val };
+                            for (int ai = 0; ai < altCount; ai++)
+                            {
+                                if (values.TryGetValue($"__alt_{ai}_{outp.Name}", out var altVal))
+                                    allVals.Add(FormatScalarValue(altVal, typeStr, enumDatatypes));
+                            }
+                            if (allVals.Count > 1)
+                                sb.AppendLine($"    expect {string.Join(" || ", allVals.Select(v => $"{outp.Name} == {v}"))};");
+                            else
+                                sb.AppendLine($"    expect {outp.Name} == {val};");
+                        }
+                        else
+                            sb.AppendLine($"    expect {outp.Name} == {val};");
                         coveredOutputs.Add(outp.Name);
                     }
                     else
@@ -1377,7 +1416,28 @@ static class TestEmitter
                     }
                     if (isUnique)
                     {
-                        sb.AppendLine($"    expect {outp.Name}[..] == {seqLiteral};");
+                        if (hasEnumeratedAlts)
+                        {
+                            var allArrayVals = new List<string> { seqLiteral };
+                            for (int ai = 0; ai < altCount; ai++)
+                            {
+                                if (values.TryGetValue($"__alt_{ai}_{outp.Name}_len", out var altLenStr) && int.TryParse(altLenStr, out var altLen) && altLen >= 0)
+                                {
+                                    string[] altElems;
+                                    if (values.TryGetValue($"__alt_{ai}_{outp.Name}_elems", out var altElemsStr))
+                                        altElems = altElemsStr.Split(',');
+                                    else
+                                        altElems = Enumerable.Range(0, altLen).Select(_ => "0").ToArray();
+                                    allArrayVals.Add($"[{string.Join(", ", altElems.Take(altLen).Select(e => FormatScalarValue(e.Trim(), rawElemType, enumDatatypes)))}]");
+                                }
+                            }
+                            if (allArrayVals.Count > 1)
+                                sb.AppendLine($"    expect {string.Join(" || ", allArrayVals.Select(v => $"{outp.Name}[..] == {v}"))};");
+                            else
+                                sb.AppendLine($"    expect {outp.Name}[..] == {seqLiteral};");
+                        }
+                        else
+                            sb.AppendLine($"    expect {outp.Name}[..] == {seqLiteral};");
                         coveredOutputs.Add(outp.Name);
                     }
                     else
@@ -1413,7 +1473,28 @@ static class TestEmitter
                     }
                     if (isUnique)
                     {
-                        sb.AppendLine($"    expect {outp.Name} == {seqLiteral};");
+                        if (hasEnumeratedAlts)
+                        {
+                            var allSeqVals = new List<string> { seqLiteral };
+                            for (int ai = 0; ai < altCount; ai++)
+                            {
+                                if (values.TryGetValue($"__alt_{ai}_{outp.Name}_len", out var altLenStr2) && int.TryParse(altLenStr2, out var altLen2) && altLen2 >= 0)
+                                {
+                                    string[] altElems2;
+                                    if (values.TryGetValue($"__alt_{ai}_{outp.Name}_elems", out var altElemsStr2))
+                                        altElems2 = altElemsStr2.Split(',');
+                                    else
+                                        altElems2 = Enumerable.Range(0, altLen2).Select(_ => "0").ToArray();
+                                    allSeqVals.Add($"[{string.Join(", ", altElems2.Take(altLen2))}]");
+                                }
+                            }
+                            if (allSeqVals.Count > 1)
+                                sb.AppendLine($"    expect {string.Join(" || ", allSeqVals.Select(v => $"{outp.Name} == {v}"))};");
+                            else
+                                sb.AppendLine($"    expect {outp.Name} == {seqLiteral};");
+                        }
+                        else
+                            sb.AppendLine($"    expect {outp.Name} == {seqLiteral};");
                         coveredOutputs.Add(outp.Name);
                     }
                     else

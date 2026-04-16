@@ -3175,6 +3175,27 @@ static class SmtTranslator
 
         // Build blocking clause: negation of ALL found output values simultaneously.
         // UNSAT after adding this clause â†’ only one valid output exists for these inputs.
+        var blockClause = BuildOutputBlockingClause(inputs, outputs, values, mutableNames);
+        if (string.IsNullOrEmpty(blockClause)) return ""; // nothing to block
+
+        sb.AppendLine(blockClause);
+        sb.AppendLine("(check-sat)");
+        sb.AppendLine("(get-model)");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Builds an SMT assertion that blocks a specific set of output values:
+    ///   (assert (not (and (= out1 v1) (= out2 v2) ...)))
+    /// Used by BuildUniquenessQuery and by the iterative enumeration loop in Program.cs.
+    /// Returns empty string if no output values can be blocked.
+    /// </summary>
+    internal static string BuildOutputBlockingClause(
+        List<(string Name, string Type)> inputs,
+        List<(string Name, string Type)> outputs,
+        Dictionary<string, string> values,
+        HashSet<string> mutableNames)
+    {
         var eqParts = new List<string>();
 
         // Mutable inputs' post-states are outputs (e.g. sorted array in BubbleSort)
@@ -3294,9 +3315,7 @@ static class SmtTranslator
         if (eqParts.Count == 0) return ""; // nothing to block
 
         var conjunction = eqParts.Count == 1 ? eqParts[0] : $"(and {string.Join(" ", eqParts)})";
-        sb.AppendLine($"(assert (not {conjunction}))");
-        sb.AppendLine("(check-sat)");
-        return sb.ToString();
+        return $"(assert (not {conjunction}))";
     }
 
     /// <summary>
