@@ -95,12 +95,62 @@ static class DnfEngine
         if (expr is UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not } neg && neg.E is LeafExpression negLeaf)
             return $"!({negLeaf.DafnyText})";
 
-        using var sw = new StringWriter();
-        var dummyOptions = new DafnyOptions(TextReader.Null, TextWriter.Null, TextWriter.Null);
-        dummyOptions.ApplyDefaultOptions();
-        var printer = new Printer(sw, dummyOptions, PrintModes.Everything);
-        printer.PrintExpression(expr, false);
-        return sw.ToString().Trim();
+        // Printer emits SplitQuantifier form (with auto-generated _t#N bound vars)
+        // when present. Temporarily null those out so printing uses the original form.
+        var saved = SaveAndClearSplitQuantifiers(expr);
+        try
+        {
+            using var sw = new StringWriter();
+            var dummyOptions = new DafnyOptions(TextReader.Null, TextWriter.Null, TextWriter.Null);
+            dummyOptions.ApplyDefaultOptions();
+            var printer = new Printer(sw, dummyOptions, PrintModes.Everything);
+            printer.PrintExpression(expr, false);
+            return sw.ToString().Trim();
+        }
+        finally
+        {
+            RestoreSplitQuantifiers(saved);
+        }
+    }
+
+    // Bypass setters (which invoke SplitQuantifierToExpression and can NPE). Write the backing fields directly.
+    static readonly System.Reflection.FieldInfo? _splitQuantField =
+        typeof(QuantifierExpr).GetField("_SplitQuantifier",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
+    static readonly System.Reflection.FieldInfo? _splitQuantExprField =
+        typeof(QuantifierExpr).GetField("<SplitQuantifierExpression>k__BackingField",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
+
+    static List<(QuantifierExpr q, object? split, object? splitExpr)> SaveAndClearSplitQuantifiers(Expression root)
+    {
+        var saved = new List<(QuantifierExpr, object?, object?)>();
+        void Walk(Expression e)
+        {
+            if (e == null) return;
+            if (e is QuantifierExpr q)
+            {
+                var prevList = _splitQuantField?.GetValue(q);
+                var prevExpr = _splitQuantExprField?.GetValue(q);
+                if (prevList != null || prevExpr != null)
+                {
+                    saved.Add((q, prevList, prevExpr));
+                    _splitQuantField?.SetValue(q, null);
+                    _splitQuantExprField?.SetValue(q, null);
+                }
+            }
+            foreach (var sub in e.SubExpressions) Walk(sub);
+        }
+        Walk(root);
+        return saved;
+    }
+
+    static void RestoreSplitQuantifiers(List<(QuantifierExpr q, object? split, object? splitExpr)> saved)
+    {
+        foreach (var (q, split, splitExpr) in saved)
+        {
+            _splitQuantField?.SetValue(q, split);
+            _splitQuantExprField?.SetValue(q, splitExpr);
+        }
     }
 
     /// <summary>

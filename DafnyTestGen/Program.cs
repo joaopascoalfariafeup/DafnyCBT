@@ -769,15 +769,15 @@ class Program
                 continue;
             foreach (var outName in outputNames)
             {
-                // outName == expr (outName on left)
-                var m = Regex.Match(ensStr, @"^" + Regex.Escape(outName) + @"\s*==\s*(.+)$");
+                // outName == expr (outName on left). Require `==` NOT followed by `>` (avoid `==>` implication).
+                var m = Regex.Match(ensStr, @"^" + Regex.Escape(outName) + @"\s*==(?!>)\s*(.+)$");
                 if (m.Success && !specExpects.ContainsKey(outName))
                 {
                     specExpects[outName] = m.Groups[1].Value.Trim();
                     continue;
                 }
                 // expr == outName (outName on right)
-                m = Regex.Match(ensStr, @"^(.+?)\s*==\s*" + Regex.Escape(outName) + @"$");
+                m = Regex.Match(ensStr, @"^(.+?)\s*==(?!>)\s*" + Regex.Escape(outName) + @"$");
                 if (m.Success && !specExpects.ContainsKey(outName))
                     specExpects[outName] = m.Groups[1].Value.Trim();
             }

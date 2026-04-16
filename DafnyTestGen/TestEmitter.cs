@@ -6,6 +6,18 @@ namespace DafnyTestGen;
 static class TestEmitter
 {
     /// <summary>
+    /// Substitutes generic type parameter names (e.g. T) with concrete types (e.g. int) in an
+    /// expression string. Uses word boundaries to avoid collateral substitutions.
+    /// </summary>
+    internal static string ApplyTypeParamMap(string expr, Dictionary<string, string> typeParamMap)
+    {
+        if (string.IsNullOrEmpty(expr) || typeParamMap == null || typeParamMap.Count == 0) return expr;
+        foreach (var (tp, concrete) in typeParamMap)
+            expr = Regex.Replace(expr, $@"\b{Regex.Escape(tp)}\b", concrete);
+        return expr;
+    }
+
+    /// <summary>
     /// Extracts "free variables" from an expression string — identifiers that are NOT
     /// member accesses (not preceded by '.') and not Dafny keywords.
     /// E.g., "elems[..size]" → {"elems", "size"}, "a.Length" → {"a"}, "a[k + 1]" → {"a", "k"}
@@ -737,16 +749,16 @@ static class TestEmitter
 
             // Show the test condition as a comment (skip spec-only literals like fresh())
             foreach (var pre in preClauses)
-                sb.AppendLine($"  //   PRE:  {DnfEngine.ExprToString(pre)}");
+                sb.AppendLine($"  //   PRE:  {ApplyTypeParamMap(DnfEngine.ExprToString(pre), typeParamMap)}");
             foreach (var lit in literals)
                 if (!TypeUtils.IsSpecOnlyLiteral(lit))
-                    sb.AppendLine($"  //   POST: {lit}");
+                    sb.AppendLine($"  //   POST: {ApplyTypeParamMap(lit, typeParamMap)}");
             // Full postconditions for check-mode fallback (ensures always hold, unlike per-clause POST literals)
             foreach (var ens in method.Ens)
             {
                 var ensStr = DnfEngine.ExprToString(ens.E);
                 if (!TypeUtils.IsSpecOnlyLiteral(ensStr))
-                    sb.AppendLine($"  //   ENSURES: {ensStr}");
+                    sb.AppendLine($"  //   ENSURES: {ApplyTypeParamMap(ensStr, typeParamMap)}");
             }
 
             sb.AppendLine("  {");
@@ -1114,6 +1126,7 @@ static class TestEmitter
                 .Select(lit => StripTriggerAttributes(lit))    // triggers are ghost — strip before old() handling
                 .Select(lit => ReplaceOldReferences(lit, oldCaptures, arrayParamNames))
                 .Select(lit => StripRemainingOld(lit))          // fallback for any remaining old()
+                .Select(lit => ApplyTypeParamMap(lit, typeParamMap))
                 .ToList();
 
             // For class methods, replace bare field references with obj.field in expects
@@ -1277,6 +1290,7 @@ static class TestEmitter
                 if (specExpects != null && specExpects.TryGetValue(outp.Name, out var specExpr)
                     && !(trustZ3Values && !hasUninterpFuncs))
                 {
+                    specExpr = ApplyTypeParamMap(specExpr, typeParamMap);
                     // For class methods, qualify unqualified field references with "obj."
                     if (classInfo != null)
                     {
@@ -1443,6 +1457,52 @@ static class TestEmitter
                     else
                     {
                         sb.AppendLine($"    // expect {outp.Name}[..] == {seqLiteral}; // (one valid value — not uniquely determined by spec)");
+                    }
+                }
+                else if (trustZ3Values && TypeUtils.IsSupportedNestedSeqType(typeStr)
+                         && values.TryGetValue(outp.Name + "_len", out var outerLenStrO) && int.TryParse(outerLenStrO, out var outerLenO) && outerLenO >= 0)
+                {
+                    // Nested seq<seq<T>> or seq<string> output: reconstruct from per-inner-seq Z3 values.
+                    var outerElemType = TypeUtils.GetSeqElementType(typeStr);
+                    bool isStringType = outerElemType == "string" || typeStr == "seq<string>";
+                    var innerElemType = isStringType ? "char" :
+                        TypeUtils.IsSeqType(outerElemType) ? TypeUtils.GetSeqElementType(outerElemType) : "int";
+                    var innerSeqStrs = new List<string>();
+                    for (int i = 0; i < outerLenO; i++)
+                    {
+                        int innerLen = 0;
+                        if (values.TryGetValue($"{outp.Name}_{i}_len", out var innerLenStr))
+                            int.TryParse(innerLenStr, out innerLen);
+                        string[] innerElems;
+                        if (values.TryGetValue($"{outp.Name}_{i}_elems", out var innerElemsStr))
+                            innerElems = innerElemsStr.Split(',');
+                        else
+                            innerElems = Enumerable.Range(0, innerLen).Select(_ => "0").ToArray();
+                        if (isStringType)
+                        {
+                            var chars = innerElems.Take(innerLen).Select(e =>
+                            {
+                                if (int.TryParse(e, out var code) && code >= 32 && code < 127 && code != '"' && code != '\\')
+                                    return ((char)code).ToString();
+                                return "?";
+                            });
+                            innerSeqStrs.Add($"\"{string.Join("", chars)}\"");
+                        }
+                        else
+                        {
+                            var formatted = innerElems.Take(innerLen).Select(e => FormatScalarValue(e.Trim(), innerElemType, enumDatatypes));
+                            innerSeqStrs.Add($"[{string.Join(", ", formatted)}]");
+                        }
+                    }
+                    var nestedLiteral = outerLenO == 0 ? "[]" : $"[{string.Join(", ", innerSeqStrs)}]";
+                    if (isUnique)
+                    {
+                        sb.AppendLine($"    expect {outp.Name} == {nestedLiteral};");
+                        coveredOutputs.Add(outp.Name);
+                    }
+                    else
+                    {
+                        sb.AppendLine($"    // expect {outp.Name} == {nestedLiteral}; // (one valid value — not uniquely determined by spec)");
                     }
                 }
                 else if (trustZ3Values && TypeUtils.IsSeqType(typeStr) && values.TryGetValue(outp.Name + "_len", out var lenStr)
