@@ -19,7 +19,22 @@ static class DafnyParser
     internal static async Task<Microsoft.Dafny.Program?> ParseProgram(string source, Uri uri, DafnyOptions options, ErrorReporter reporter)
     {
         var result = await ProgramParser.Parse(source, uri, reporter);
-        return result?.Program;
+        var prog = result?.Program;
+        if (prog != null)
+        {
+            // Resolve so AST has IdentifierExpr/FunctionCallExpr instead of unresolved NameSegment/ApplySuffix.
+            // Enables Substituter-based function inlining (FunctionInliner).
+            try
+            {
+                var resolver = new ProgramResolver(prog);
+                await resolver.Resolve(System.Threading.CancellationToken.None);
+            }
+            catch
+            {
+                // Resolve is best-effort; parsing-only path stays valid for the rest of the pipeline.
+            }
+        }
+        return prog;
     }
 
     internal static IEnumerable<TopLevelDecl> AllTopLevelDecls(Microsoft.Dafny.Program program)

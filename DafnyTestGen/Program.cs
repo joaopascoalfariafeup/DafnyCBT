@@ -8,7 +8,7 @@ namespace DafnyTestGen;
 class Program
 {
     static bool TrustUnknownUniqueness = true;
-    static int UniquenessRounds = 1;
+    static int UniquenessRounds = 2;
 
     static async Task<int> Main(string[] args)
     {
@@ -800,10 +800,39 @@ class Program
             predsToInline = inlinablePredicates
                 .Where(p => !smtBuiltins.Contains(p.name))
                 .ToList();
-            if (predsToInline.Count > 0)
+        }
+
+        // AST-level inlining of functions/predicates in ensures.
+        // Preserves node types (ITEExpr, BinaryExpr(Or/And), ExistsExpr, ...), so DNF
+        // decomposition operates on real AST nodes instead of re-parsing strings.
+        // Tracks per-expression whether inlining changed the tree; unchanged expressions
+        // fall through to the string-level fallback.
+        var astInlined = new bool[dnfEnsures.Count];
+        if (program != null)
+        {
+            var astInlinable = FunctionInliner.CollectInlinable(program, skipNames: smtBuiltins);
+            if (astInlinable.Count > 0)
             {
-                dnfEnsures = dnfEnsures
-                    .Select(e => InlineExpr(e, predsToInline)).ToList();
+                for (int i = 0; i < dnfEnsures.Count; i++)
+                {
+                    var before = DnfEngine.ExprToString(dnfEnsures[i]);
+                    dnfEnsures[i] = FunctionInliner.InlineExpression(program, dnfEnsures[i], astInlinable);
+                    var after = DnfEngine.ExprToString(dnfEnsures[i]);
+                    astInlined[i] = before != after;
+                }
+            }
+        }
+
+        // Fallback string-level inlining: only for expressions the AST pass left unchanged
+        // (e.g., resolver failed, or all calls were to non-inlinable functions).
+        // Running string inline on already-AST-inlined trees would wrap them in LeafExpression
+        // and destroy the AST node structure DNF needs.
+        if (predsToInline != null && predsToInline.Count > 0)
+        {
+            for (int i = 0; i < dnfEnsures.Count; i++)
+            {
+                if (!astInlined[i])
+                    dnfEnsures[i] = InlineExpr(dnfEnsures[i], predsToInline);
             }
         }
 
