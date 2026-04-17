@@ -845,6 +845,42 @@ class Program
             }
         }
 
+        // Detect uninterpreted constructs reachable from postcondition. Set/map/seq
+        // comprehensions (e.g. AsSet body `set k | ... :: a[k]`) leave Z3 free to pick
+        // arbitrary output model values. Outputs pinned on such arbitrary values break
+        // subsumption pruning — a prior test's model `count=0` can conflict with a new tier
+        // `count=1` even when concrete execution gives identical results.
+        // Check: (a) inlined ensures text, (b) bodies of any inlinable function called from
+        // ensures (AsSet may not be inlined by Substituter but its body still drives post).
+        // Comprehension detection: `set/iset/map/imap KEYWORD ... | ... :: ...` pattern.
+        // Handles type annotations, triggers `{:...}`, and multi-var binders.
+        static bool IsComprehension(string s)
+        {
+            if (!Regex.IsMatch(s, @"\b(set|iset|map|imap)\s+\w")) return false;
+            int barIdx = s.IndexOf('|');
+            int colonColonIdx = s.IndexOf("::", StringComparison.Ordinal);
+            return barIdx >= 0 && colonColonIdx > barIdx;
+        }
+        bool flagComprehension = false;
+        foreach (var e in dnfEnsures)
+        {
+            if (IsComprehension(DnfEngine.ExprToString(e))) { flagComprehension = true; break; }
+        }
+        if (!flagComprehension && inlinablePredicates != null)
+        {
+            var ensTextAll = string.Join(" ", ensuresClauses.Select(e => DnfEngine.ExprToString(e)));
+            foreach (var p in inlinablePredicates)
+            {
+                if (IsComprehension(p.body) && Regex.IsMatch(ensTextAll, $@"\b{Regex.Escape(p.name)}\b"))
+                { flagComprehension = true; break; }
+            }
+        }
+        if (flagComprehension && !hasNonInlinableFuncs)
+        {
+            Console.WriteLine($"  Note: postcondition reaches set/map comprehension — subsumption uses input-only pin");
+            hasNonInlinableFuncs = true;
+        }
+
         // Compute DNF on un-inlined ensures for expect emission (preserves predicate names).
         // Use CrossProductPruned to keep clause structure aligned with dnfExprs — otherwise
         // the position-based inlined→original mapping below misaligns and literals get lost.
@@ -1725,10 +1761,18 @@ class Program
         // Build a positive SMT conjunction pinning a prior test case's inputs + outputs.
         // Used for subsumption pruning: if a new (clause, tier) goal is satisfied under
         // this pin, a prior test case already covers it and we can skip calling Z3 for it.
+        // When postcondition has uninterpreted functions / set comprehensions / untranslated
+        // pieces, Z3's output model values are arbitrary (e.g. count=0 for |AsSet([2])|).
+        // Pinning them would reject valid subsumption. Drop outputs from pin in that case —
+        // input-only match is sufficient for deterministic-by-spec methods.
         string? BuildModelPin(Dictionary<string, string> values)
         {
             var eqParts = BuildEqParts(values, inputs);
-            eqParts.AddRange(BuildEqParts(values, outputs));
+            bool outputsUnreliable = hasNonInlinableFuncs
+                || SmtTranslator._uninterpFuncs.Count > 0
+                || SmtTranslator._hasUntranslatedPost;
+            if (!outputsUnreliable)
+                eqParts.AddRange(BuildEqParts(values, outputs));
             if (eqParts.Count == 0) return null;
             return eqParts.Count == 1 ? eqParts[0] : $"(and {string.Join(" ", eqParts)})";
         }
@@ -1928,7 +1972,7 @@ class Program
                 bool hasQuant = s.Contains("forall") || s.Contains("exists")
                     || quantifiedPredicates.Any(p => Regex.IsMatch(s, @"\b" + Regex.Escape(p) + @"\b"));
                 if (!hasQuant) continue;
-                foreach (var (name, type) in inputs)
+                foreach (var (name, type) in inputs.Concat(outputs))
                 {
                     if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type)
                         && !TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type)
@@ -1942,7 +1986,8 @@ class Program
             {
                 foreach (var collName in quantifiedCollections)
                 {
-                    var input = inputs.First(v => v.Name == collName);
+                    var inputOrOutput = inputs.Concat(outputs).First(v => v.Name == collName);
+                    var input = inputOrOutput; // local alias; may be an output too
                     string sizeGe2, sizeEq1, sizeEq0;
                     if (TypeUtils.IsArrayType(input.Type) || TypeUtils.IsSeqType(input.Type))
                     {

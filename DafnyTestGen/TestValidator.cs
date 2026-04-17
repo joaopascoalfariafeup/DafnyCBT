@@ -449,12 +449,18 @@ static class TestValidator
 
                 var checkLine = $"{indent}CheckExpect({expr}, {testId});";
 
-                // Detect `var == ExprWithFuncCall` and emit VAL print for the variable
-                var valPrint = TryMakeValPrint(expr, testId, indent, stringOutputNames, arrayOutputNames);
+                // Detect `var == ExprWithFuncCall` and emit VAL print for the variable.
+                // Only for output vars — immutable inputs are already pinned at declaration,
+                // so capturing their value and injecting `expect input == N` yields a tautology.
+                var lhsEqMatch = Regex.Match(expr, @"^(\w+)\s*==");
+                bool lhsIsOutput = lhsEqMatch.Success && outputNames != null
+                    && outputNames.Contains(lhsEqMatch.Groups[1].Value);
+                var valPrint = lhsIsOutput
+                    ? TryMakeValPrint(expr, testId, indent, stringOutputNames, arrayOutputNames)
+                    : null;
                 if (valPrint != null)
                 {
-                    var eqMatch = Regex.Match(expr, @"^(\w+)\s*==");
-                    if (eqMatch.Success) capturedOutputs.Add(eqMatch.Groups[1].Value);
+                    capturedOutputs.Add(lhsEqMatch.Groups[1].Value);
                     return valPrint + "\n" + checkLine;
                 }
 
@@ -872,10 +878,37 @@ static class TestValidator
             }
         }
 
-        // (Previously: injected `expect var == <runtime value>;` before postcondition expects
-        // when no explicit var-equality expect existed. Removed: the emitter already decided
-        // not to emit a concrete-value expect in non-unique cases — a runtime-value injection
-        // here would pin the output to an arbitrary satisfying value and cause false failures.)
+        // When an output has no explicit `expect name == ...` (e.g. postcondition is
+        // `AllPrime(f) && ProdF(f)==n`, not `f == expr`) AND we're in the PASS branch —
+        // implementation output already satisfied the postcondition at runtime — inject
+        // `expect name == observed; // observed from implementation` as a supplemental
+        // pin. Tagged with a marker comment so users can review and loosen if the spec
+        // admits alternative valid outputs. Skipped when forceReplace (rescued) since
+        // those paths already replaced the RHS directly.
+        if (!forceReplace)
+        {
+            foreach (var (varName, value) in vars)
+            {
+                if (!IsValidDafnyLiteral(value)) continue;
+                var escName = Regex.Escape(varName);
+                bool hasEq = Regex.IsMatch(result, $@"^[ \t]*expect\s+{escName}\s*(\[\.\.\])?\s*==", RegexOptions.Multiline);
+                if (hasEq) continue;
+                // Inject before the closing brace of the test block. The test block is the
+                // nearest `}` after the method call line for this test. Use a regex that
+                // finds the first `  }` after an `expect` line and inserts above it.
+                var inject = $"    expect {varName} == {value}; // observed from implementation";
+                // Test-block body (from CheckAndSplitTests) starts after `  {\n` and ends
+                // BEFORE `  }` — so it does NOT include the closing brace. We append the
+                // injected line after the last `expect ...;` line.
+                var lastExpectMatch = Regex.Matches(result, @"^[ \t]*expect\s+[^\n]*$", RegexOptions.Multiline)
+                    .Cast<Match>().LastOrDefault();
+                if (lastExpectMatch != null)
+                {
+                    var insertAt = lastExpectMatch.Index + lastExpectMatch.Length;
+                    result = result.Substring(0, insertAt) + "\r\n" + inject + result.Substring(insertAt);
+                }
+            }
+        }
 
         return result;
     }

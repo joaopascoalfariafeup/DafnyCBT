@@ -1798,10 +1798,20 @@ static class TestEmitter
                 if (!mentionsAnyOutput || !mentionsOnlyCoveredOutputs)
                 {
                     var litMatch = Regex.Match(lit, @"^(\w+)\s*==\s*(?![>=])(.+)$", RegexOptions.Singleline);
-                    if (litMatch.Success && rhsCaptures.TryGetValue(litMatch.Groups[1].Value, out var checkVar))
-                        sb.AppendLine($"    expect {litMatch.Groups[1].Value} == {checkVar};");
-                    else if (litMatch.Success && rhsInline.TryGetValue(litMatch.Groups[1].Value, out var inlineRhs))
-                        sb.AppendLine($"    expect {litMatch.Groups[1].Value} == {inlineRhs};");
+                    var lhsName = litMatch.Success ? litMatch.Groups[1].Value : null;
+                    // Skip entirely when LHS is an immutable input: input is pinned at declaration,
+                    // so the literal is either a tautology (after RHS substitution) or redundant with
+                    // an equivalent output-LHS postcondition (e.g. ProdF(f) == n already covers
+                    // n == f[0] * ProdF(f[1..])).
+                    bool lhsIsImmutableInput = lhsName != null
+                        && method.Ins.Any(i => i.Name == lhsName)
+                        && (mutableNames == null || !mutableNames.Contains(lhsName));
+                    if (lhsIsImmutableInput)
+                        continue;
+                    if (litMatch.Success && rhsCaptures.TryGetValue(lhsName!, out var checkVar))
+                        sb.AppendLine($"    expect {lhsName} == {checkVar};");
+                    else if (litMatch.Success && rhsInline.TryGetValue(lhsName!, out var inlineRhs))
+                        sb.AppendLine($"    expect {lhsName} == {inlineRhs};");
                     else
                         sb.AppendLine($"    expect {lit};");
                 }
