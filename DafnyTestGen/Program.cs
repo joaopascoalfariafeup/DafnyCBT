@@ -42,7 +42,7 @@ class Program
         maxTestsOpt.AddAlias("-x");
         var timeoutOpt = new Option<int>("--timeout", () => 60, "Timeout in seconds for test generation per method (0 = unlimited, default: 60)");
         var trustUnknownOpt = new Option<bool>("--trust-unknown", () => true, "Trust Z3 output values when uniqueness check returns 'unknown' (default: true)");
-        var uniquenessRoundsOpt = new Option<int>("--uniqueness-rounds", () => 1, "Max rounds of uniqueness checking to enumerate all valid outputs (default: 1). When all valid outputs are enumerated, emit expect out == v1 || out == v2 || ...;");
+        var uniquenessRoundsOpt = new Option<int>("--uniqueness-rounds", () => 4, "Max rounds of uniqueness checking to enumerate all valid outputs (default: 4). When all valid outputs are enumerated, emit expect out == v1 || out == v2 || ...;");
         uniquenessRoundsOpt.AddAlias("-u");
         var skipBodylessOpt = new Option<bool>("--skip-bodyless", "Skip bodyless methods instead of generating spec-only tests (inputs only, call/expects commented)");
         skipBodylessOpt.AddAlias("-p");
@@ -1632,6 +1632,16 @@ class Program
                     {
                         var smtLen = TypeUtils.IsArrayType(type) ? $"{prefix}_len" : $"(seq.len {prefix})";
                         eqParts.Add($"(= {smtLen} {lenVal})");
+                        // Pin individual elements too — otherwise subsumption lets Z3 pick
+                        // alternative element contents (e.g. multi-witness clause falsely satisfied
+                        // by inventing new duplicates at same length).
+                        if (values.TryGetValue(prefix + "_elems", out var elemsStr) && int.TryParse(lenVal, out var len))
+                        {
+                            var seqName = TypeUtils.SeqSmtName(prefix, type);
+                            var elems = elemsStr.Split(',');
+                            for (int i = 0; i < Math.Min(len, elems.Length); i++)
+                                eqParts.Add($"(= (seq.nth {seqName} {i}) {elems[i]})");
+                        }
                     }
                 }
                 else if (TypeUtils.IsSetType(type))

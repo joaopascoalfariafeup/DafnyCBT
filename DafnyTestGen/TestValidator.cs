@@ -627,6 +627,11 @@ static class TestValidator
         HashSet<string>? stringOutputNames = null,
         HashSet<string>? arrayOutputNames = null)
     {
+        // Skip disjunctive expects (e.g. `index == 0 || index == 1` from alt-enumeration).
+        // RHS captured by the regex below would include `|| ...`, producing a type-incorrect
+        // probe like `print "RHSVAL:...=", (0 || index == 1), ...`.
+        if (expr.Contains("||")) return null;
+
         // Match: varName == <expr>
         var m = Regex.Match(expr, @"^(\w+)\s*==\s*(.+)$");
         if (!m.Success) return null;
@@ -811,6 +816,12 @@ static class TestValidator
                 var eq = m.Groups[3].Value;
                 var rhs = m.Groups[4].Value;
                 var semi = m.Groups[5].Value;
+
+                // Skip disjunctive expects (alt-enumeration: `var == v1 || var == v2`).
+                // The spec admits multiple valid outputs — collapsing to a single observed
+                // value would make the test brittle to alternative-but-valid implementations.
+                if (rhs.Contains("||"))
+                    return m.Value;
 
                 // Replace if we captured the runtime value AND it's a valid injectable literal.
                 // Don't replace if RHS is already the same simple literal (nothing to gain)

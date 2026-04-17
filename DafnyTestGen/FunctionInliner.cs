@@ -72,6 +72,34 @@ internal class FunctionInliningSubstituter : Substituter
             }
         }
 
+        // Beta-reduce: ApplyExpr whose Function (after substitution) is a LambdaExpr.
+        // Happens when an inlined predicate's formal (e.g., `f: T -> E`) was substituted
+        // by an actual lambda argument, and the body contains `f(x)` as ApplyExpr.
+        if (inner is ApplyExpr apply)
+        {
+            var substFn = this.Substitute(apply.Function);
+            var unwrapped = substFn;
+            while (true)
+            {
+                if (unwrapped is ConcreteSyntaxExpression cse2 && cse2.ResolvedExpression != null)
+                    unwrapped = cse2.ResolvedExpression;
+                else if (unwrapped is ParensExpression pe)
+                    unwrapped = pe.E;
+                else
+                    break;
+            }
+            if (unwrapped is LambdaExpr lambda)
+            {
+                var substArgs = apply.Args.Select(a => this.Substitute(a)).ToList();
+                var lambdaSubMap = new Dictionary<IVariable, Expression>();
+                for (int i = 0; i < lambda.BoundVars.Count && i < substArgs.Count; i++)
+                    lambdaSubMap[lambda.BoundVars[i]] = substArgs[i];
+                var lambdaSub = new FunctionInliningSubstituter(_program, lambdaSubMap, _inlinable, _currentlyInlining, _maxDepth);
+                var reduced = lambdaSub.Substitute(lambda.Term);
+                return new ParensExpression(lambda.Term.Origin, reduced);
+            }
+        }
+
         return base.Substitute(expr);
     }
 }
