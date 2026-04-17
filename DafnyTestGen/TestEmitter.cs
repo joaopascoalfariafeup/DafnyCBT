@@ -730,7 +730,7 @@ static class TestEmitter
             ? $"{methodName}<{string.Join(", ", methodTypeArgs.Select(tp => typeParamMap.TryGetValue(tp, out var t) ? t : "int"))}>"
             : methodName;
 
-        sb.AppendLine($"method GeneratedTests_{methodName}()");
+        sb.AppendLine($"method TestsFor{methodName}()");
         sb.AppendLine("{");
 
         // Collect array parameter names for old() capture handling

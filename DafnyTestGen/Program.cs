@@ -27,8 +27,12 @@ class Program
         simpleOpt.AddAlias("-s");
         var tiersOpt = new Option<int>("--tiers", () => 4, "Number of size tiers for seq/array boundary analysis (default: 4, i.e. lengths 0..3)");
         tiersOpt.AddAlias("-t");
-        var checkOpt = new Option<bool>("--check", "Validate each test case by running Dafny (--no-verify), split output into Passing/Failing methods");
+        var checkOpt = new Option<bool>("--check", () => true, "Validate each test case by running Dafny (--no-verify); separates failing cases in the emitted tests (default: true)");
         checkOpt.AddAlias("-c");
+        var noCheckOpt = new Option<bool>("--no-check", "Disable validation (overrides --check)");
+        var groupingOpt = new Option<string>("--grouping", () => "by-method", "Test grouping: 'by-method' (one TestsFor<M> method per source method, default) or 'by-status' (Passing/Failing split across all)");
+        groupingOpt.AddAlias("-g");
+        groupingOpt.FromAmong("by-method", "by-status");
         var repeatOpt = new Option<int>("--repeat", () => 1, "Number of distinct test cases to generate per condition (default: 1)");
         repeatOpt.AddAlias("-r");
         var minTestsOpt = new Option<int>("--min-tests", () => 4, "Minimum test count for progressive auto strategy (default: 4, 0 to disable)");
@@ -45,7 +49,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -59,6 +63,8 @@ class Program
             var simple = ctx.ParseResult.GetValueForOption(simpleOpt);
             var tiers = ctx.ParseResult.GetValueForOption(tiersOpt);
             var check = ctx.ParseResult.GetValueForOption(checkOpt);
+            if (ctx.ParseResult.GetValueForOption(noCheckOpt)) check = false;
+            var grouping = ctx.ParseResult.GetValueForOption(groupingOpt) ?? "by-method";
             var repeat = ctx.ParseResult.GetValueForOption(repeatOpt);
             var minTests = ctx.ParseResult.GetValueForOption(minTestsOpt);
             var z3PathCli = ctx.ParseResult.GetValueForOption(z3PathOpt);
@@ -111,7 +117,7 @@ class Program
                 if (files.Count > 1)
                     Console.WriteLine($"{'='} Processing: {file.Name} {'=',40}");
 
-                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat, minTests, z3Path, maxTests, timeout, skipBodyless);
+                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat, minTests, z3Path, maxTests, timeout, skipBodyless, grouping);
 
                 if (files.Count > 1)
                     Console.WriteLine();
@@ -154,7 +160,7 @@ class Program
         return new List<FileInfo>();
     }
 
-    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1, int minTests = 4, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool skipBodyless = false)
+    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1, int minTests = 4, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool skipBodyless = false, string grouping = "by-method")
     {
         if (!file.Exists)
         {
@@ -521,7 +527,7 @@ class Program
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
-                generatedTestMethods.Add($"GeneratedTests_{method.Name}");
+                generatedTestMethods.Add($"TestsFor{method.Name}");
 
                 if (first)
                 {
@@ -531,7 +537,7 @@ class Program
                 else
                 {
                     // For subsequent methods, only append the GeneratedTests method (skip the source header)
-                    var marker = $"method GeneratedTests_{method.Name}()";
+                    var marker = $"method TestsFor{method.Name}()";
                     var idx = testCode.IndexOf(marker);
                     if (idx >= 0)
                     {
@@ -579,12 +585,15 @@ class Program
         else if (check)
         {
             // Validate each test case by running Dafny, then split into Passing/Failing
-            var checkedCode = await TestValidator.CheckAndSplitTests(allTestCode.ToString(), source, outputPath);
+            var checkedCode = await TestValidator.CheckAndSplitTests(allTestCode.ToString(), source, outputPath, grouping);
             File.WriteAllText(outputPath, checkedCode);
         }
         else
         {
-            File.WriteAllText(outputPath, allTestCode.ToString());
+            var code = allTestCode.ToString();
+            if (grouping == "by-status")
+                code = TestValidator.ReformatToByStatus(code);
+            File.WriteAllText(outputPath, code);
         }
         Console.WriteLine($"[DafnyTestGen] Tests written to: {outputPath}");
     }
@@ -1230,28 +1239,14 @@ class Program
             preCombinations.Add(("", preDnfExprs[0], new List<Expression>()));
         }
 
-        // Build boundary tiers per precondition combination (always compute when progressive or boundary)
-        var boundaryTiersPerPre = new Dictionary<int, List<(string tierLabel, List<string> tierConstraints)>>();
-        var outputTiers = new List<(string tierLabel, List<string> tierConstraints, string? dafnyKey)>();
-        if (boundary || progressive)
-        {
-            for (int pi = 0; pi < preCombinations.Count; pi++)
-            {
-                var preLitStrings = preCombinations[pi].preLits.Select(EKey).ToList();
-                boundaryTiersPerPre[pi] = BoundaryAnalysis.BuildBoundaryTiers(inputs, preClauses, method, verbose, tierCount, preLitStrings, mutableNames, enumDatatypes);
-            }
-            if (boundary)
-                Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
-            // Build output boundary tiers for scalar outputs and mutable scalar fields
-            var mutableFieldsList = classInfo?.Fields?.Where(f => mutableNames.Contains(f.Name)).ToList();
-            var postLitStrings = method.Ens.Select(e => DnfEngine.ExprToString(e.E)).ToList();
-            outputTiers = BoundaryAnalysis.BuildOutputTiers(outputs, mutableNames, mutableFieldsList, verbose, postLitStrings, enumDatatypes, inputs);
-        }
+        // Phase 2 / 2b are now built per (pi, ci) inline via ComputeRefinedBoundaries /
+        // ComputeCategoricalTiers — no precomputed global tier maps.
+        var mutableFieldsList = classInfo?.Fields?.Where(f => mutableNames.Contains(f.Name)).ToList();
+        var postLitStrings = method.Ens.Select(e => DnfEngine.ExprToString(e.E)).ToList();
 
-        // Helper: build schedule entries for a given mode.
+        // Helper: build baseline (Phase 1) schedule entries — one per (pi, ci), no pins.
         void BuildScheduleEntries(
-            List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule,
-            bool useBoundary)
+            List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule)
         {
             for (int pi = 0; pi < preCombinations.Count; pi++)
             {
@@ -1260,9 +1255,6 @@ class Program
                 foreach (var excl in preExclusions)
                     fullPreLits.Add(DnfEngine.Negate(excl));
                 var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
-                var bTiers = useBoundary && boundaryTiersPerPre.ContainsKey(pi)
-                    ? boundaryTiersPerPre[pi]
-                    : new List<(string, List<string>)>();
 
                 for (int ci = 0; ci < dnfExprs.Count; ci++)
                 {
@@ -1270,20 +1262,152 @@ class Program
                     var label = $"{fullPreLabel}{{{ci + 1}}}";
                     int simpleMask = 1 << ci;
                     var exclusions = new List<Expression>();
+                    schedule.Add((label, clause, fullPreLits, exclusions, new List<string>(), simpleMask, pi));
+                }
+            }
+        }
 
-                    if (useBoundary && bTiers.Count > 0)
+        // Helper: emit Phase 2 single-fault refined-range boundary entries per (pi, ci, var, boundary).
+        // Returns the set of "pi|ci|varName=value" keys for Phase 2b dedup.
+        HashSet<string> EmitPhase2Entries(
+            List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule)
+        {
+            var emitted = new HashSet<string>();
+            for (int pi = 0; pi < preCombinations.Count; pi++)
+            {
+                var (preLabel, preLits, preExclusions) = preCombinations[pi];
+                var fullPreLits = new List<Expression>(preLits);
+                foreach (var excl in preExclusions) fullPreLits.Add(DnfEngine.Negate(excl));
+                var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
+                var preLitStrings = preLits.Select(EKey).ToList();
+
+                for (int ci = 0; ci < dnfExprs.Count; ci++)
+                {
+                    var clause = dnfExprs[ci];
+                    var clauseLitStrings = clause.Select(EKey).ToList();
+                    var classLits = preLitStrings.Concat(clauseLitStrings).ToList();
+                    int simpleMask = 1 << ci;
+                    var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}";
+
+                    void EmitPins(string vname, string vtype, BoundaryAnalysis.VarKind kind)
                     {
-                        // Add base entry first (for UNSAT pruning of boundary tiers)
-                        schedule.Add((label, clause, fullPreLits, exclusions, new List<string>(), simpleMask, pi));
-                        foreach (var (tierLabel, tierConstraints) in bTiers)
-                            schedule.Add(($"{label}/B{tierLabel}", clause, fullPreLits, exclusions, tierConstraints, simpleMask, pi));
+                        var pins = BoundaryAnalysis.ComputeRefinedBoundaries(
+                            vname, vtype, classLits, inputs, mutableNames, enumDatatypes, kind);
+                        foreach (var (tlabel, tconstraints, dkey) in pins)
+                        {
+                            // Syntactic prune: pin already implied by clause literal.
+                            if (dkey != null && classLits.Contains(dkey)) continue;
+                            // Syntactic prune: pin contradicted by a clause literal (UNSAT).
+                            if (dkey != null)
+                            {
+                                var neg = DnfEngine.NegateOperatorInLiteral(dkey);
+                                if (neg != null && classLits.Contains(neg)) continue;
+                            }
+                            schedule.Add(($"{clauseLabel}/B{tlabel}",
+                                clause, fullPreLits, new List<Expression>(), tconstraints, simpleMask, pi));
+                            emitted.Add($"{pi}|{ci}|{tlabel}");
+                        }
                     }
-                    else
+
+                    foreach (var (vname, vtype) in inputs)
                     {
-                        schedule.Add((label, clause, fullPreLits, exclusions, new List<string>(), simpleMask, pi));
+                        if (mutableNames.Contains(vname)) continue; // mutable pre-state handled as post-state below
+                        EmitPins(vname, vtype, BoundaryAnalysis.VarKind.Input);
+                    }
+                    foreach (var (vname, vtype) in outputs)
+                        EmitPins(vname, vtype, BoundaryAnalysis.VarKind.Output);
+                    if (mutableFieldsList != null)
+                    {
+                        foreach (var (fname, ftype) in mutableFieldsList)
+                            EmitPins(fname, ftype, BoundaryAnalysis.VarKind.MutablePost);
                     }
                 }
             }
+            return emitted;
+        }
+
+        // Helper: emit Phase 2b single-fault categorical (type/size coverage) entries per (pi, ci, var, tier).
+        // Skips tiers already covered by Phase 2 (via phase2Keys), or redundant/contradictory w.r.t. clause.
+        (int added, int pruned) EmitPhase2bEntries(
+            List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule,
+            HashSet<string> phase2Keys)
+        {
+            int added = 0;
+            int pruned = 0;
+            for (int pi = 0; pi < preCombinations.Count; pi++)
+            {
+                var (preLabel, preLits, preExclusions) = preCombinations[pi];
+                var fullPreLits = new List<Expression>(preLits);
+                foreach (var excl in preExclusions) fullPreLits.Add(DnfEngine.Negate(excl));
+                var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
+                var preLitStrings = preLits.Select(EKey).ToList();
+
+                for (int ci = 0; ci < dnfExprs.Count; ci++)
+                {
+                    var clause = dnfExprs[ci];
+                    var clauseLitStrings = clause.Select(EKey).ToList();
+                    var classLits = preLitStrings.Concat(clauseLitStrings).ToList();
+                    int simpleMask = 1 << ci;
+                    var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}";
+
+                    void EmitCats(string vname, string vtype, BoundaryAnalysis.VarKind kind)
+                    {
+                        var tiers = BoundaryAnalysis.ComputeCategoricalTiers(
+                            vname, vtype, classLits, mutableNames, enumDatatypes, kind);
+                        foreach (var (tlabel, tconstraints, dkey) in tiers)
+                        {
+                            var key = $"{pi}|{ci}|{tlabel}";
+                            if (phase2Keys.Contains(key)) { pruned++; continue; }
+                            if (dkey != null && classLits.Contains(dkey)) { pruned++; continue; }
+                            if (dkey != null)
+                            {
+                                var neg = DnfEngine.NegateOperatorInLiteral(dkey);
+                                if (neg != null && classLits.Contains(neg)) { pruned++; continue; }
+                            }
+                            schedule.Add(($"{clauseLabel}/O{tlabel}",
+                                clause, fullPreLits, new List<Expression>(), tconstraints, simpleMask, pi));
+                            added++;
+                        }
+                    }
+
+                    foreach (var (vname, vtype) in inputs)
+                    {
+                        if (mutableNames.Contains(vname)) continue;
+                        EmitCats(vname, vtype, BoundaryAnalysis.VarKind.Input);
+                    }
+                    foreach (var (vname, vtype) in outputs)
+                        EmitCats(vname, vtype, BoundaryAnalysis.VarKind.Output);
+                    if (mutableFieldsList != null)
+                    {
+                        foreach (var (fname, ftype) in mutableFieldsList)
+                            EmitCats(fname, ftype, BoundaryAnalysis.VarKind.MutablePost);
+                    }
+
+                    // Mutation tiers for mutable inputs (arrays/seqs) and mutable fields.
+                    void EmitMutation(string vname, string vtype)
+                    {
+                        var muts = BoundaryAnalysis.ComputeMutationTiers(vname, vtype, postLitStrings, mutableNames);
+                        foreach (var (tlabel, tconstraints, _) in muts)
+                        {
+                            schedule.Add(($"{clauseLabel}/O{tlabel}",
+                                clause, fullPreLits, new List<Expression>(), tconstraints, simpleMask, pi));
+                            added++;
+                        }
+                    }
+                    foreach (var (vname, vtype) in inputs)
+                    {
+                        if (!mutableNames.Contains(vname)) continue;
+                        if (!TypeUtils.IsArrayType(vtype) && !TypeUtils.IsSeqType(vtype)) continue;
+                        EmitMutation(vname, vtype);
+                    }
+                    if (mutableFieldsList != null)
+                    {
+                        foreach (var (fname, ftype) in mutableFieldsList)
+                            EmitMutation(fname, ftype);
+                    }
+                }
+            }
+            return (added, pruned);
         }
 
         // Helper: solve one SMT query and return parsed values (or null).
@@ -1771,7 +1895,7 @@ class Program
             // so we solve them all directly — no tier escalation needed.
             Console.WriteLine($"  Phase 1: {n} {(usedFdnf ? "FDNF" : "DNF")} clauses");
 
-            BuildScheduleEntries(testSchedule, useBoundary: false);
+            BuildScheduleEntries(testSchedule);
 
             // Phase 1 extras: for any array/seq input referenced inside a pre- or post-
             // quantifier (forall/exists, directly or via inlined predicate), force explicit
@@ -1880,88 +2004,35 @@ class Program
             if (!verbose) Console.Write("\r                          \r"); // clear progress line
             Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
 
-            if (testCases.Count < minTests && boundaryTiersPerPre.Count > 0
+            HashSet<string> phase2Keys = new HashSet<string>();
+            if (testCases.Count < minTests && (boundary || progressive)
                 && n <= 10 && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
             {
-                // --- Phase 2: add boundary tiers ---
+                // --- Phase 2: single-fault refined-range BVA (per clause, per variable) ---
                 int phase2Start = testSchedule.Count;
-                BuildScheduleEntries(testSchedule, useBoundary: true);
-                // Keep only boundary-tier entries (base entries are already in Phase 1)
-                for (int i = testSchedule.Count - 1; i >= phase2Start; i--)
-                {
-                    if (testSchedule[i].extraConstraints.Count == 0)
-                        testSchedule.RemoveAt(i);
-                }
+                phase2Keys = EmitPhase2Entries(testSchedule);
                 int newEntries = testSchedule.Count - phase2Start;
-                Console.WriteLine($"  Phase 2: adding boundary analysis ({newEntries} new entries)");
-
-                await SolveRange(testSchedule, phase2Start, testSchedule.Count, testSchedule.Count,
-                    testCases, baseConditionExclusions, knownUnsatLiteralMasks, minTests,
-                    enableSubsumption: true);
-                if (!verbose) Console.Write("\r                          \r");
-                Console.WriteLine($"  Phase 2 complete: {testCases.Count} test(s)");
+                if (newEntries > 0)
+                {
+                    Console.WriteLine($"  Phase 2: refined-range BVA ({newEntries} new entries)");
+                    await SolveRange(testSchedule, phase2Start, testSchedule.Count, testSchedule.Count,
+                        testCases, baseConditionExclusions, knownUnsatLiteralMasks, minTests,
+                        enableSubsumption: true);
+                    if (!verbose) Console.Write("\r                          \r");
+                    Console.WriteLine($"  Phase 2 complete: {testCases.Count} test(s)");
+                }
             }
 
-            if (testCases.Count < minTests && outputTiers.Count > 0
+            if (testCases.Count < minTests
                 && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
             {
-                // --- Phase 2b: output boundary tiers ---
+                // --- Phase 2b: single-fault type/size coverage + mutation tiers ---
                 int phase2bStart = testSchedule.Count;
-                int prunedByImplication = 0;
-                // Add output tier entries for each singleton postcondition combination
-                for (int pi = 0; pi < preCombinations.Count; pi++)
-                {
-                    var (preLabel, preLits, preExclusions) = preCombinations[pi];
-                    var fullPreLits = new List<Expression>(preLits);
-                    foreach (var excl in preExclusions)
-                        fullPreLits.Add(DnfEngine.Negate(excl));
-                    var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
-
-                    for (int ci = 0; ci < dnfExprs.Count; ci++)
-                    {
-                        var clause = dnfExprs[ci];
-                        int simpleMask = 1 << ci;
-                        var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}";
-
-                        var exclusions = new List<Expression>();
-
-                        // Collect Dafny-form literal keys from this clause's conjuncts + pre literals.
-                        // Used to prune output tiers whose constraint is already implied (redundant)
-                        // or contradicted (UNSAT) by the clause, so we don't waste Z3 calls on them.
-                        var clauseLitKeys = new HashSet<string>();
-                        foreach (var c in clause)
-                            clauseLitKeys.Add(DnfEngine.ExprToString(c));
-                        foreach (var p in fullPreLits)
-                            clauseLitKeys.Add(DnfEngine.ExprToString(p));
-
-                        foreach (var (tierLabel, tierConstraints, dafnyKey) in outputTiers)
-                        {
-                            if (dafnyKey != null)
-                            {
-                                if (clauseLitKeys.Contains(dafnyKey))
-                                {
-                                    // Tier literal already in clause → redundant, Z3 would return same model.
-                                    prunedByImplication++;
-                                    continue;
-                                }
-                                var neg = DnfEngine.NegateOperatorInLiteral(dafnyKey);
-                                if (neg != null && clauseLitKeys.Contains(neg))
-                                {
-                                    // Tier literal contradicts clause → UNSAT, skip.
-                                    prunedByImplication++;
-                                    continue;
-                                }
-                            }
-                            testSchedule.Add(($"{clauseLabel}/O{tierLabel}",
-                                clause, fullPreLits, exclusions, tierConstraints, simpleMask, pi));
-                        }
-                    }
-                }
-                int phase2bEntries = testSchedule.Count - phase2bStart;
+                var (phase2bEntries, prunedByImplication) = EmitPhase2bEntries(testSchedule, phase2Keys);
                 if (phase2bEntries > 0)
                 {
                     var prunedNote = prunedByImplication > 0 ? $", {prunedByImplication} pruned" : "";
-                    Console.WriteLine($"  Phase 2b: adding output boundary ({phase2bEntries} new entries{prunedNote})");
+                    Console.WriteLine($"  Phase 2b: type/size coverage ({phase2bEntries} new entries{prunedNote})");
                     await SolveRange(testSchedule, phase2bStart, testSchedule.Count, testSchedule.Count,
                         testCases, baseConditionExclusions, knownUnsatLiteralMasks, minTests,
                         enableSubsumption: true);
@@ -2018,16 +2089,21 @@ class Program
         }
         else
         {
-            // Non-progressive: build schedule with the given flags and solve all at once
-            BuildScheduleEntries(testSchedule, useBoundary: boundary);
+            // Non-progressive: build schedule and solve all at once
+            BuildScheduleEntries(testSchedule);
+            if (boundary)
+            {
+                var keys = EmitPhase2Entries(testSchedule);
+                EmitPhase2bEntries(testSchedule, keys);
+            }
             SortScheduleByPopcount(testSchedule, 0, testSchedule.Count);
             if (allCombinations)
             {
                 int n = dnfExprs.Count;
                 Console.WriteLine($"  FDNF mode: {n} clauses");
             }
-            if (boundary && boundaryTiersPerPre.Count > 0)
-                Console.WriteLine($"  Boundary mode: {boundaryTiersPerPre[0].Count} boundary tiers generated");
+            if (boundary)
+                Console.WriteLine($"  Boundary mode: single-fault BVA + type/size coverage enabled");
 
             await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count, testCases, baseConditionExclusions, knownUnsatLiteralMasks);
 

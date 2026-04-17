@@ -5,6 +5,287 @@ namespace DafnyTestGen;
 
 static class BoundaryAnalysis
 {
+    internal enum VarKind { Input, Output, MutablePost }
+
+    /// <summary>
+    /// Single-fault refined-range boundaries (Phase 2) for one variable under one DNF clause.
+    /// Scope: int/nat scalars (inputs and outputs). Returns empty if the variable is
+    /// pinned to a single value by classLiterals (skip rule — Phase 1 baseline covers it),
+    /// if no bound is derivable, or if the type is not supported by this phase.
+    /// Each returned entry is one SMT pin (single-fault: only this variable constrained).
+    /// </summary>
+    internal static List<(string tierLabel, List<string> smtConstraints, string? dafnyKey)>
+        ComputeRefinedBoundaries(
+            string varName, string varType,
+            List<string> classLiterals,
+            List<(string Name, string Type)> inputs,
+            HashSet<string> mutableNames,
+            Dictionary<string, List<string>>? enumDatatypes,
+            VarKind kind)
+    {
+        var result = new List<(string, List<string>, string?)>();
+
+        // Post-state view: strip old() wrappers so classLiterals describe the world
+        // after the method runs. old(v) constraints on the pre-state are not boundaries
+        // for the post-state variable; they'll be picked up on the corresponding input
+        // variable when Phase 2 iterates inputs.
+        var cleanLits = classLiterals.Select(StripOldWrappers).ToList();
+
+        if (varType == "int" || varType == "nat" || varType == "T")
+        {
+            string smtName = kind == VarKind.MutablePost ? $"{varName}_post" : varName;
+
+            // Skip rule: classLiterals pin the variable to a single value.
+            if (IsEqualityPinned(varName, cleanLits)) return result;
+
+            var (lo, hi) = ExtractBounds(varName, cleanLits);
+            var relUpperExprs = ExtractRelationalBounds(varName, cleanLits, inputs, mutableNames);
+            var relLowerExprs = ExtractRelationalLowerBounds(varName, cleanLits, inputs, mutableNames);
+
+            // Nat floor (0).
+            if (varType == "nat")
+                lo = lo.HasValue ? Math.Max(lo.Value, 0) : 0;
+
+            // Disequality tightening: !=N at lo/hi bumps the bound inward.
+            var neqNums = ExtractDisequalities(varName, cleanLits);
+            while (lo.HasValue && neqNums.Contains(lo.Value)) lo = lo.Value + 1;
+            while (hi.HasValue && neqNums.Contains(hi.Value)) hi = hi.Value - 1;
+
+            // Degenerate range after tightening — pinned, skip.
+            if (lo.HasValue && hi.HasValue && lo.Value == hi.Value) return result;
+            if (lo.HasValue && hi.HasValue && lo.Value > hi.Value) return result; // UNSAT clause
+
+            // Numeric endpoints + interior.
+            var numVals = new SortedSet<int>();
+            if (lo.HasValue)
+            {
+                numVals.Add(lo.Value);
+                if (!hi.HasValue || lo.Value + 1 <= hi.Value) numVals.Add(lo.Value + 1);
+            }
+            if (hi.HasValue)
+            {
+                numVals.Add(hi.Value);
+                if (!lo.HasValue || hi.Value - 1 >= lo.Value) numVals.Add(hi.Value - 1);
+            }
+
+            foreach (var v in numVals)
+            {
+                var smtVal = v < 0 ? $"(- {-v})" : v.ToString();
+                result.Add(($"{varName}={v}", new List<string> { $"(= {smtName} {smtVal})" }, $"{varName} == {v}"));
+            }
+
+            // Symbolic relational upper bounds: emit =rel and =rel-1.
+            foreach (var rel in relUpperExprs)
+            {
+                result.Add(($"{varName}={rel}", new List<string> { $"(= {smtName} {rel})" }, null));
+                result.Add(($"{varName}={rel}-1", new List<string> { $"(= {smtName} (- {rel} 1))" }, null));
+            }
+            // Symbolic relational lower bounds: emit =rel and =rel+1.
+            foreach (var rel in relLowerExprs)
+            {
+                result.Add(($"{varName}={rel}", new List<string> { $"(= {smtName} {rel})" }, null));
+                result.Add(($"{varName}={rel}+1", new List<string> { $"(= {smtName} (+ {rel} 1))" }, null));
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Checks whether classLiterals contain a top-level equality literal pinning varName
+    /// to a concrete value (constant, other variable, or expression).
+    /// Patterns: "{name} == ...", "... == {name}".
+    /// </summary>
+    static bool IsEqualityPinned(string varName, List<string> literals)
+    {
+        var esc = Regex.Escape(varName);
+        foreach (var lit in literals)
+        {
+            if (Regex.IsMatch(lit, $@"^\s*{esc}\s*==\s*.+$")) return true;
+            if (Regex.IsMatch(lit, $@"^.+\s*==\s*{esc}\s*$")) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Extracts integer values N such that classLiterals imply varName != N.
+    /// Patterns: "{name} != N", "N != {name}", "!({name} == N)", "!(N == {name})".
+    /// </summary>
+    static HashSet<int> ExtractDisequalities(string varName, List<string> literals)
+    {
+        var result = new HashSet<int>();
+        var esc = Regex.Escape(varName);
+        var numPat = @"(-?\d+)";
+        foreach (var lit in literals)
+        {
+            foreach (Match m in Regex.Matches(lit, $@"\b{esc}\b\s*!=\s*{numPat}"))
+                if (int.TryParse(m.Groups[1].Value, out var v)) result.Add(v);
+            foreach (Match m in Regex.Matches(lit, $@"{numPat}\s*!=\s*\b{esc}\b"))
+                if (int.TryParse(m.Groups[1].Value, out var v)) result.Add(v);
+            foreach (Match m in Regex.Matches(lit, $@"!\s*\(\s*{esc}\s*==\s*{numPat}\s*\)"))
+                if (int.TryParse(m.Groups[1].Value, out var v)) result.Add(v);
+            foreach (Match m in Regex.Matches(lit, $@"!\s*\(\s*{numPat}\s*==\s*{esc}\s*\)"))
+                if (int.TryParse(m.Groups[1].Value, out var v)) result.Add(v);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Extracts relational LOWER bounds on a variable (SMT-side expressions).
+    /// Mirror of ExtractRelationalBounds (which returns upper bounds).
+    /// Patterns: "varName >= other", "other <= varName", "varName > other", "other < varName",
+    /// and the length/cardinality variants "varName >= other.Length", "|other| <= varName" etc.
+    /// </summary>
+    internal static List<string> ExtractRelationalLowerBounds(
+        string varName, List<string> preClauses,
+        List<(string Name, string Type)> inputs,
+        HashSet<string>? mutableNames = null)
+    {
+        var result = new List<string>();
+        var scalarVars = inputs.Where(v => v.Name != varName &&
+            (v.Type == "int" || v.Type == "nat" || v.Type == "real")).Select(v => v.Name).ToList();
+        var arraySeqVars = inputs
+            .Where(v => TypeUtils.IsArrayType(v.Type) || TypeUtils.IsSeqType(v.Type))
+            .Select(v => v.Name).ToList();
+
+        foreach (var pre in preClauses)
+        {
+            foreach (var other in scalarVars)
+            {
+                if (Regex.IsMatch(pre, $@"{Regex.Escape(varName)}\s*>=\s*{Regex.Escape(other)}\b(?!\.)") ||
+                    Regex.IsMatch(pre, $@"\b{Regex.Escape(other)}\b\s*<=\s*{Regex.Escape(varName)}"))
+                {
+                    if (!result.Contains(other)) result.Add(other);
+                }
+            }
+            foreach (var other in arraySeqVars)
+            {
+                var smtBase = (mutableNames != null && mutableNames.Contains(other)) ? $"{other}_pre" : other;
+                var smtLen = smtBase + "_len";
+                if (result.Contains(smtLen)) continue;
+                if (Regex.IsMatch(pre, $@"{Regex.Escape(varName)}\s*>=?\s*{Regex.Escape(other)}\.Length") ||
+                    Regex.IsMatch(pre, $@"{Regex.Escape(varName)}\s*>=?\s*\|{Regex.Escape(other)}\|") ||
+                    Regex.IsMatch(pre, $@"{Regex.Escape(other)}\.Length\s*<=?\s*{Regex.Escape(varName)}") ||
+                    Regex.IsMatch(pre, $@"\|{Regex.Escape(other)}\|\s*<=?\s*{Regex.Escape(varName)}"))
+                {
+                    result.Add(smtLen);
+                }
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Phase 3 single-fault categorical tiers for one variable.
+    /// Type-based defaults: nat/int 0/1/&gt;=2, seq/set size 0/1/&gt;=2, enum per-ctor, bool true/false.
+    /// Dedupe-key (dafnyKey) used by caller to prune against clause literals.
+    /// Input vs output handled via smtName (caller supplies; kind only affects mutable-post naming).
+    /// </summary>
+    internal static List<(string tierLabel, List<string> smtConstraints, string? dafnyKey)>
+        ComputeCategoricalTiers(
+            string varName, string varType,
+            List<string> classLiterals,
+            HashSet<string> mutableNames,
+            Dictionary<string, List<string>>? enumDatatypes,
+            VarKind kind)
+    {
+        var result = new List<(string, List<string>, string?)>();
+        // Skip mutables as inputs here — their mutation tiers are handled separately.
+        string smtScalar = kind == VarKind.MutablePost ? $"{varName}_post"
+            : (kind == VarKind.Input && mutableNames.Contains(varName)) ? $"{varName}_pre"
+            : varName;
+
+        if (varType == "nat" || varType == "T")
+        {
+            result.Add(($"{varName}=0", new List<string> { $"(= {smtScalar} 0)" }, $"{varName} == 0"));
+            result.Add(($"{varName}=1", new List<string> { $"(= {smtScalar} 1)" }, $"{varName} == 1"));
+            result.Add(($"{varName}>=2", new List<string> { $"(>= {smtScalar} 2)" }, $"{varName} >= 2"));
+        }
+        else if (varType == "int")
+        {
+            result.Add(($"{varName}=0", new List<string> { $"(= {smtScalar} 0)" }, $"{varName} == 0"));
+            result.Add(($"{varName}>0", new List<string> { $"(> {smtScalar} 0)" }, $"{varName} > 0"));
+            result.Add(($"{varName}<0", new List<string> { $"(< {smtScalar} 0)" }, $"{varName} < 0"));
+        }
+        else if (varType == "bool")
+        {
+            result.Add(($"{varName}=true", new List<string> { $"(= {smtScalar} true)" }, varName));
+            result.Add(($"{varName}=false", new List<string> { $"(= {smtScalar} false)" }, $"!{varName}"));
+        }
+        else if (varType == "real")
+        {
+            result.Add(($"{varName}=0", new List<string> { $"(= {smtScalar} 0.0)" }, $"{varName} == 0.0"));
+            result.Add(($"{varName}>0", new List<string> { $"(> {smtScalar} 0.0)" }, $"{varName} > 0.0"));
+            result.Add(($"{varName}<0", new List<string> { $"(< {smtScalar} 0.0)" }, $"{varName} < 0.0"));
+        }
+        else if (enumDatatypes != null && enumDatatypes.TryGetValue(varType, out var enumCtors))
+        {
+            for (int i = 0; i < enumCtors.Count; i++)
+                result.Add(($"{varName}={enumCtors[i]}", new List<string> { $"(= {smtScalar} {i})" }, $"{varName} == {enumCtors[i]}"));
+        }
+        else if (TypeUtils.IsSeqType(varType) || TypeUtils.IsArrayType(varType))
+        {
+            var smtBase = (kind == VarKind.Input && mutableNames.Contains(varName)) ? $"{varName}_pre"
+                : (kind == VarKind.MutablePost) ? $"{varName}_post" : varName;
+            var smtSeq = TypeUtils.SeqSmtName(smtBase, varType);
+            result.Add(($"|{varName}|=0", new List<string> { $"(= (seq.len {smtSeq}) 0)" }, $"|{varName}| == 0"));
+            result.Add(($"|{varName}|=1", new List<string> { $"(= (seq.len {smtSeq}) 1)" }, $"|{varName}| == 1"));
+            result.Add(($"|{varName}|>=2", new List<string> { $"(>= (seq.len {smtSeq}) 2)" }, $"|{varName}| >= 2"));
+        }
+        else if (TypeUtils.IsSetType(varType) || TypeUtils.IsMultisetType(varType) || TypeUtils.IsMapType(varType))
+        {
+            var smtBase = (kind == VarKind.Input && mutableNames.Contains(varName)) ? $"{varName}_pre"
+                : (kind == VarKind.MutablePost) ? $"{varName}_post" : varName;
+            result.Add(($"|{varName}|=0", new List<string> { $"(= {smtBase}_card 0)" }, $"|{varName}| == 0"));
+            result.Add(($"|{varName}|=1", new List<string> { $"(= {smtBase}_card 1)" }, $"|{varName}| == 1"));
+            result.Add(($"|{varName}|>=2", new List<string> { $"(>= {smtBase}_card 2)" }, $"|{varName}| >= 2"));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Phase 3 mutation tiers for a mutable variable: x==old(x) vs x!=old(x).
+    /// Applies when the variable appears both as post-state and inside old(...) in postconditions.
+    /// </summary>
+    internal static List<(string tierLabel, List<string> smtConstraints, string? dafnyKey)>
+        ComputeMutationTiers(
+            string varName, string varType,
+            List<string> postLiterals,
+            HashSet<string> mutableNames)
+    {
+        var result = new List<(string, List<string>, string?)>();
+        if (!mutableNames.Contains(varName)) return result;
+        if (!AppearsInPostState(varName, postLiterals)) return result;
+        if (!AppearsInOldWrapper(varName, postLiterals)) return result;
+
+        if (TypeUtils.IsArrayType(varType) || TypeUtils.IsSeqType(varType))
+        {
+            var elemType = TypeUtils.GetSeqElementType(varType);
+            string eqExpr;
+            if (TypeUtils.IsTupleType(elemType))
+            {
+                var comps = TypeUtils.GetTupleComponentTypes(elemType);
+                var parts = new List<string>();
+                for (int ci = 0; ci < comps.Count; ci++)
+                    parts.Add($"(= {varName}_pre_seq_{ci} {varName}_post_seq_{ci})");
+                eqExpr = parts.Count == 1 ? parts[0] : "(and " + string.Join(" ", parts) + ")";
+            }
+            else
+            {
+                eqExpr = $"(= {varName}_pre_seq {varName}_post_seq)";
+            }
+            result.Add(($"{varName}≠old", new List<string> { $"(not {eqExpr})" }, null));
+            result.Add(($"{varName}=old", new List<string> { eqExpr }, null));
+        }
+        else if (!TypeUtils.IsSetType(varType) && !TypeUtils.IsMultisetType(varType) && !TypeUtils.IsMapType(varType))
+        {
+            // Scalar mutable field post vs pre.
+            result.Add(($"{varName}≠old", new List<string> { $"(not (= {varName}_post {varName}_pre))" }, null));
+            result.Add(($"{varName}=old", new List<string> { $"(= {varName}_post {varName}_pre)" }, null));
+        }
+        return result;
+    }
+
     /// <summary>
     /// Builds boundary value tiers for each input parameter.
     /// For int params: extracts bounds from preconditions and generates boundary values.

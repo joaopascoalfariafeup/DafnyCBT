@@ -38,17 +38,17 @@ static class TestValidator
     ///      with the test index as argument — no recompilation needed.
     /// </summary>
     internal static async Task<string> CheckAndSplitTests(
-        string generatedCode, string originalSource, string outputPath)
+        string generatedCode, string originalSource, string outputPath, string grouping = "by-method")
     {
         var dafnyPath = Z3Runner.FindDafnyPath();
         Console.WriteLine($"[DafnyTestGen] Checking tests with: {dafnyPath}");
 
-        // ── Extract source header (everything before "method GeneratedTests_") ──
+        // ── Extract source header (everything before the first "method TestsFor<Name>()") ──
         var genMethodMatch = Regex.Match(
-            generatedCode, @"^method GeneratedTests_\w+\(\)\s*$", RegexOptions.Multiline);
+            generatedCode, @"^method TestsFor\w+\(\)\s*$", RegexOptions.Multiline);
         if (!genMethodMatch.Success)
         {
-            Console.Error.WriteLine("[DafnyTestGen] Could not find GeneratedTests method in output");
+            Console.Error.WriteLine("[DafnyTestGen] Could not find TestsFor method in output");
             return generatedCode;
         }
         var sourceHeader = generatedCode.Substring(0, genMethodMatch.Index);
@@ -57,13 +57,29 @@ static class TestValidator
         sourceHeader = Regex.Replace(sourceHeader, @"\bmethod\s+Main\s*\(\s*\)", "method OriginalMain()");
         sourceHeader = Regex.Replace(sourceHeader, @"\bMain\s*\(\s*\)\s*;", "OriginalMain();");
 
-        // ── Extract individual test-case blocks ─────────────────────────────────
-        var testBlocks = new List<(string comment, string body)>();
+        // ── Extract individual test-case blocks, tracking source method ─────────
+        var testBlocks = new List<(string comment, string body, string sourceMethod)>();
+        var wrapperPattern = new Regex(
+            @"^method TestsFor(\w+)\(\)\s*\r?\n\{\r?\n(.*?)\n\}\s*$",
+            RegexOptions.Multiline | RegexOptions.Singleline);
         var blockPattern = new Regex(
             @"(  // Test case[^\r\n]*\r?\n(?:  //[^\r\n]*\r?\n)*)  \{\r?\n(.*?)  \}",
             RegexOptions.Singleline);
-        foreach (Match m in blockPattern.Matches(generatedCode))
-            testBlocks.Add((m.Groups[1].Value.TrimEnd(), m.Groups[2].Value));
+        var sourceMethodOrder = new List<string>();
+        foreach (Match w in wrapperPattern.Matches(generatedCode))
+        {
+            var srcMethod = w.Groups[1].Value;
+            if (!sourceMethodOrder.Contains(srcMethod)) sourceMethodOrder.Add(srcMethod);
+            foreach (Match m in blockPattern.Matches(w.Groups[2].Value))
+                testBlocks.Add((m.Groups[1].Value.TrimEnd(), m.Groups[2].Value, srcMethod));
+        }
+        // Fallback: older single-wrapper format (no per-wrapper scan hit) — group under "Main".
+        if (testBlocks.Count == 0)
+        {
+            foreach (Match m in blockPattern.Matches(generatedCode))
+                testBlocks.Add((m.Groups[1].Value.TrimEnd(), m.Groups[2].Value, "Main"));
+            if (testBlocks.Count > 0) sourceMethodOrder.Add("Main");
+        }
 
         if (testBlocks.Count == 0)
         {
@@ -96,7 +112,8 @@ static class TestValidator
             var testFile = Path.Combine(tempDir, "check_all.dfy");
             var runnerBase = Path.Combine(tempDir, "runner");
 
-            WriteCheckFile(testFile, sourceHeader, testBlocks, arrayOutputNames);
+            var checkFileBlocks = testBlocks.Select(t => (t.comment, t.body)).ToList();
+            WriteCheckFile(testFile, sourceHeader, checkFileBlocks, arrayOutputNames);
 
             // ── Phase 1: compile once ────────────────────────────────────────────
             var (buildExited, buildCode, buildOut, buildErr) = await RunProcess(
@@ -191,12 +208,15 @@ static class TestValidator
             }
 
             // ── Report and split ────────────────────────────────────────────────
-            var passingBlocks = new List<(string comment, string body)>();
-            var failingBlocks = new List<(string comment, string body)>();
+            // Each classified block remembers its source method for by-method grouping.
+            var classified = new List<(string comment, string body, string sourceMethod, bool failing)>();
             int skippedCount = 0;
+            int passingCount = 0;
+            int failingCount = 0;
 
             for (int i = 0; i < testBlocks.Count; i++)
             {
+                var (comment, body, src) = testBlocks[i];
                 if (skippedIds.Contains(i))
                 {
                     skippedCount++;
@@ -204,38 +224,43 @@ static class TestValidator
                 }
                 else if (failedIds.Contains(i))
                 {
-                    // Annotate the body's `expect out == rhs;` lines with captured
-                    // expected/actual values so the commented-out failing expect is
-                    // self-explanatory in the emitted Failing() method.
                     var annotatedBody = AnnotateFailingExpects(
-                        testBlocks[i].body,
+                        body,
                         capturedVals.GetValueOrDefault(i),
                         capturedRhsVals.GetValueOrDefault(i));
-                    failingBlocks.Add((testBlocks[i].comment, annotatedBody));
+                    classified.Add((comment, annotatedBody, src, true));
+                    failingCount++;
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: FAIL");
                 }
                 else if (wrongValIds.Contains(i))
                 {
-                    // Z3's concrete value was wrong but postconditions passed → rescue
-                    // Inject the actual runtime value captured via VAL markers (forceReplace
-                    // overrides the Z3 literal even though it looks like a simple scalar)
-                    passingBlocks.Add((testBlocks[i].comment,
-                        InjectCapturedValues(testBlocks[i].body, i, capturedVals, arrayOutputNames, forceReplace: true)));
+                    classified.Add((comment,
+                        InjectCapturedValues(body, i, capturedVals, arrayOutputNames, forceReplace: true),
+                        src, false));
+                    passingCount++;
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS (rescued — Z3 value corrected by runtime)");
                 }
                 else
                 {
-                    passingBlocks.Add((testBlocks[i].comment,
-                        InjectCapturedValues(testBlocks[i].body, i, capturedVals, arrayOutputNames)));
+                    classified.Add((comment,
+                        InjectCapturedValues(body, i, capturedVals, arrayOutputNames),
+                        src, false));
+                    passingCount++;
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS");
                 }
             }
 
-            var resultMsg = $"[DafnyTestGen] Results: {passingBlocks.Count} passing, {failingBlocks.Count} failing";
+            var resultMsg = $"[DafnyTestGen] Results: {passingCount} passing, {failingCount} failing";
             if (skippedCount > 0) resultMsg += $", {skippedCount} skipped (precondition violated)";
             Console.WriteLine(resultMsg);
 
-            return EmitSplitTests(sourceHeader, passingBlocks, failingBlocks);
+            if (grouping == "by-status")
+            {
+                var passing = classified.Where(c => !c.failing).Select(c => (c.comment, c.body)).ToList();
+                var failing = classified.Where(c => c.failing).Select(c => (c.comment, c.body)).ToList();
+                return EmitSplitTests(sourceHeader, passing, failing);
+            }
+            return EmitByMethodTests(sourceHeader, classified, sourceMethodOrder);
         }
         finally
         {
@@ -992,6 +1017,97 @@ static class TestValidator
         sb.AppendLine("{");
         sb.AppendLine("  Passing();");
         sb.AppendLine("  Failing();");
+        sb.AppendLine("}");
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Reformats an already-emitted per-method test file (with TestsFor&lt;M&gt;() wrappers
+    /// and Main) into a single Passing()/Failing() split. Used when the user requests
+    /// grouping=by-status without --check. All tests are treated as passing since no
+    /// validation happened.
+    /// </summary>
+    internal static string ReformatToByStatus(string generatedCode)
+    {
+        var genMethodMatch = Regex.Match(
+            generatedCode, @"^method TestsFor\w+\(\)\s*$", RegexOptions.Multiline);
+        if (!genMethodMatch.Success) return generatedCode;
+        var sourceHeader = generatedCode.Substring(0, genMethodMatch.Index);
+
+        var wrapperPattern = new Regex(
+            @"^method TestsFor\w+\(\)\s*\r?\n\{\r?\n(.*?)\n\}\s*$",
+            RegexOptions.Multiline | RegexOptions.Singleline);
+        var blockPattern = new Regex(
+            @"(  // Test case[^\r\n]*\r?\n(?:  //[^\r\n]*\r?\n)*)  \{\r?\n(.*?)  \}",
+            RegexOptions.Singleline);
+
+        var passing = new List<(string comment, string body)>();
+        foreach (Match w in wrapperPattern.Matches(generatedCode))
+            foreach (Match m in blockPattern.Matches(w.Groups[1].Value))
+                passing.Add((m.Groups[1].Value.TrimEnd(), m.Groups[2].Value));
+
+        return EmitSplitTests(sourceHeader, passing, new List<(string, string)>());
+    }
+
+    static string EmitByMethodTests(
+        string sourceHeader,
+        List<(string comment, string body, string sourceMethod, bool failing)> classified,
+        List<string> sourceMethodOrder)
+    {
+        var sb = new StringBuilder();
+        sb.Append(sourceHeader);
+
+        var grouped = classified
+            .GroupBy(c => c.sourceMethod)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var emittedMethods = new List<string>();
+
+        foreach (var srcMethod in sourceMethodOrder)
+        {
+            if (!grouped.TryGetValue(srcMethod, out var blocks)) continue;
+            var methodName = $"TestsFor{srcMethod}";
+            emittedMethods.Add(methodName);
+
+            sb.AppendLine($"method {methodName}()");
+            sb.AppendLine("{");
+            if (blocks.Count == 0)
+                sb.AppendLine("  // (no tests)");
+            foreach (var (comment, body, _, failing) in blocks)
+            {
+                if (failing)
+                    sb.AppendLine("  // FAILING: expects commented out; see VAL/RHS annotations below");
+                sb.AppendLine(comment);
+                sb.AppendLine("  {");
+                foreach (var line in body.Split('\n').Select(l => l.TrimEnd()))
+                {
+                    if (line.Length == 0) continue;
+                    if (failing)
+                    {
+                        var trimmed = line.TrimStart();
+                        if (trimmed.StartsWith("expect "))
+                        {
+                            sb.AppendLine(line.Replace("expect ", "// expect "));
+                            continue;
+                        }
+                    }
+                    sb.AppendLine(line);
+                }
+                sb.AppendLine("  }");
+                sb.AppendLine();
+            }
+            sb.AppendLine("}");
+            sb.AppendLine();
+        }
+
+        sb.AppendLine("method Main()");
+        sb.AppendLine("{");
+        foreach (var m in emittedMethods)
+        {
+            sb.AppendLine($"  {m}();");
+            sb.AppendLine($"  print \"{m}: all non-failing tests passed!\\n\";");
+        }
         sb.AppendLine("}");
 
         return sb.ToString();
