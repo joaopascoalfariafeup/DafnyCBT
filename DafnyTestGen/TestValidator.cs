@@ -837,7 +837,6 @@ static class TestValidator
                     IsValidDafnyLiteral(value) &&
                     (forceReplace || !IsSimpleScalarLiteral(rhs.Trim())))
                 {
-                    System.Console.Error.WriteLine($"[DIAG-RX] replacing -> {value}");
                     // Array outputs need [..] to convert to sequence for comparison
                     var lhs = (arrayOutputNames != null && arrayOutputNames.Contains(varName))
                         ? $"{varName}[..]" : varName;

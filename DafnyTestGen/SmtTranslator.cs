@@ -68,6 +68,12 @@ static class SmtTranslator
     internal static Dictionary<string, List<string>> _enumDatatypes = new();
     internal static Dictionary<string, (string dtName, int ordinal)> _enumConstructors = new();
 
+    // Anti-trivial bias: bias Z3 away from special values (0, 1) when the spec
+    // otherwise allows many solutions. Soft-asserts are ignored when hard constraints
+    // force a specific value, so correctness is preserved. Toggled by --no-bias CLI.
+    internal static bool AntiTrivialBiasEnabled = false;
+    internal static int AntiTrivialBiasSeed = 0;
+
     internal static string BuildSmt2Query(
         List<(string Name, string Type)> inputs,
         List<(string Name, string Type)> outputs,
@@ -78,12 +84,21 @@ static class SmtTranslator
         List<Expression>? exclusions = null,
         List<string>? extraConstraints = null,
         List<Expression>? preLiterals = null,
-        HashSet<string>? mutableNames = null)
+        HashSet<string>? mutableNames = null,
+        bool skipBias = false)
     {
         mutableNames ??= new HashSet<string>();
 
+        bool biasOn = AntiTrivialBiasEnabled && !skipBias;
+
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("(set-option :produce-models true)");
+        if (biasOn)
+        {
+            sb.AppendLine("(set-option :smt.arith.random_initial_value true)");
+            sb.AppendLine($"(set-option :smt.random-seed {AntiTrivialBiasSeed})");
+            sb.AppendLine($"(set-option :sat.random-seed {AntiTrivialBiasSeed})");
+        }
         sb.AppendLine("(set-logic ALL)");
 
         // Set operation macros (sets encoded as (Array Int Bool))
@@ -690,6 +705,7 @@ static class SmtTranslator
                 assertions.AppendLine($"; Skipped specification-only literal: {litStr}");
                 continue;
             }
+            ResetExprToSmtBudget();
             var smtExpr = ExprToSmt(literal, inputsAndOutputs, mutableNames, isPostContext: true);
             if (smtExpr != null)
                 assertions.AppendLine($"(assert {smtExpr})");
@@ -835,6 +851,13 @@ static class SmtTranslator
                 sb.AppendLine($"(assert {constraint})");
         }
 
+        if (biasOn)
+        {
+            sb.AppendLine();
+            sb.AppendLine("; Anti-trivial bias: soft-prefer non-special (0/1) values");
+            EmitAntiTrivialBias(sb, inputs, mutableNames);
+        }
+
         sb.AppendLine();
         sb.AppendLine("(check-sat)");
         sb.AppendLine("(get-model)");
@@ -844,6 +867,63 @@ static class SmtTranslator
         // Post-process: rewrite nested seq references to flat encoding.
         var smtText = RewriteNestedSeqRefs(sb.ToString(), inputs, outputs);
         return smtText;
+    }
+
+    /// <summary>
+    /// Emits soft-assert constraints that bias Z3 away from absorbing/neutral values (0, 1).
+    /// Uses weight 2 for 0 (absorbing for multiplication), weight 1 for 1 (neutral).
+    /// Covers primitive scalars (int/nat) and plain seq/array element positions 0..BIAS_POS-1.
+    /// Skips enums, chars, bools, tuples, sets, maps, multisets, datatypes, nested seqs.
+    /// </summary>
+    private const int BIAS_POS = 3;
+    internal static void EmitAntiTrivialBias(
+        System.Text.StringBuilder sb,
+        List<(string Name, string Type)> inputs,
+        HashSet<string> mutableNames)
+    {
+        foreach (var (name, type) in inputs)
+        {
+            // Primitive scalars
+            if (type == "int" || type == "nat")
+            {
+                var sym = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                sb.AppendLine($"(assert-soft (not (= {sym} 0)) :weight 2)");
+                sb.AppendLine($"(assert-soft (not (= {sym} 1)) :weight 1)");
+                continue;
+            }
+
+            // Plain seq<int> / seq<nat> (not nested, not tuple elements)
+            if (TypeUtils.IsSeqType(type))
+            {
+                var elem = TypeUtils.GetSeqElementType(type);
+                if (elem != "int" && elem != "nat") continue;
+                if (TypeUtils.IsSupportedNestedSeqType(type)) continue;
+                if (TypeUtils.IsTupleType(elem)) continue;
+                sb.AppendLine($"(assert-soft (not (= (seq.len {name}) 0)) :weight 1)");
+                for (int k = 0; k < BIAS_POS; k++)
+                {
+                    sb.AppendLine($"(assert-soft (=> (> (seq.len {name}) {k}) (not (= (seq.nth {name} {k}) 0))) :weight 2)");
+                    sb.AppendLine($"(assert-soft (=> (> (seq.len {name}) {k}) (not (= (seq.nth {name} {k}) 1))) :weight 1)");
+                }
+                continue;
+            }
+
+            // array<int> / array<nat>
+            if (TypeUtils.IsArrayType(type))
+            {
+                var rawElem = type.StartsWith("array<") ? type.Substring(6, type.Length - 7) : "int";
+                if (rawElem != "int" && rawElem != "nat") continue;
+                if (TypeUtils.IsTupleType(rawElem)) continue;
+                var seqSym = mutableNames.Contains(name) ? $"{name}_pre_seq" : $"{name}_seq";
+                sb.AppendLine($"(assert-soft (not (= (seq.len {seqSym}) 0)) :weight 1)");
+                for (int k = 0; k < BIAS_POS; k++)
+                {
+                    sb.AppendLine($"(assert-soft (=> (> (seq.len {seqSym}) {k}) (not (= (seq.nth {seqSym} {k}) 0))) :weight 2)");
+                    sb.AppendLine($"(assert-soft (=> (> (seq.len {seqSym}) {k}) (not (= (seq.nth {seqSym} {k}) 1))) :weight 1)");
+                }
+                continue;
+            }
+        }
     }
 
     /// <summary>
@@ -1013,7 +1093,49 @@ static class SmtTranslator
     /// Falls back to string-based DafnyExprToSmt for LeafExpression nodes
     /// (produced by predicate inlining) and unrecognized AST patterns.
     /// </summary>
+    [System.ThreadStatic] private static int _exprToSmtDepth;
+    [System.ThreadStatic] private static long _exprToSmtCalls;
+    [System.ThreadStatic] private static long _exprToSmtBudget;
+    private const int MAX_EXPR_TO_SMT_DEPTH = 400;
+    private const long MAX_EXPR_TO_SMT_CALLS = 2_000_000;
+
     internal static string? ExprToSmt(Expression expr,
+        List<(string Name, string Type)> inputs,
+        HashSet<string> mutableNames,
+        bool isPostContext,
+        bool insideOld = false)
+    {
+        _exprToSmtCalls++;
+        _exprToSmtBudget++;
+        if (_exprToSmtBudget > MAX_EXPR_TO_SMT_CALLS)
+        {
+            System.Console.Error.WriteLine($"  [GUARD] ExprToSmt call budget exceeded — bailing out");
+            System.Console.Error.Flush();
+            return null;
+        }
+        if (++_exprToSmtDepth > MAX_EXPR_TO_SMT_DEPTH)
+        {
+            _exprToSmtDepth--;
+            System.Console.Error.WriteLine($"  [GUARD] ExprToSmt depth exceeded {MAX_EXPR_TO_SMT_DEPTH} — bailing out");
+            return null;
+        }
+        try
+        {
+            return ExprToSmtImpl(expr, inputs, mutableNames, isPostContext, insideOld);
+        }
+        finally
+        {
+            _exprToSmtDepth--;
+        }
+    }
+
+    internal static void ResetExprToSmtBudget()
+    {
+        _exprToSmtBudget = 0;
+        _exprToSmtCalls = 0;
+    }
+
+    private static string? ExprToSmtImpl(Expression expr,
         List<(string Name, string Type)> inputs,
         HashSet<string> mutableNames,
         bool isPostContext,
@@ -2144,7 +2266,26 @@ static class SmtTranslator
     /// Translates a Dafny expression string to an SMT2 expression string.
     /// Handles common patterns. Also populates _wfGuards with side constraints.
     /// </summary>
+    [System.ThreadStatic] private static int _dafnyExprToSmtDepth;
+    private const int MAX_DAFNY_EXPR_TO_SMT_DEPTH = 200;
+    private const int MAX_DAFNY_EXPR_TO_SMT_LEN = 20_000;
+
     internal static string? DafnyExprToSmt(string dafnyExpr, List<(string Name, string Type)> inputs)
+    {
+        if (dafnyExpr.Length > MAX_DAFNY_EXPR_TO_SMT_LEN) return null;
+        if (_dafnyExprToSmtDepth > MAX_DAFNY_EXPR_TO_SMT_DEPTH) return null;
+        _dafnyExprToSmtDepth++;
+        try
+        {
+            return DafnyExprToSmtImpl(dafnyExpr, inputs);
+        }
+        finally
+        {
+            _dafnyExprToSmtDepth--;
+        }
+    }
+
+    private static string? DafnyExprToSmtImpl(string dafnyExpr, List<(string Name, string Type)> inputs)
     {
         var expr = dafnyExpr.Trim();
 
@@ -2561,6 +2702,27 @@ static class SmtTranslator
             var valName = arrAccess.Groups[3].Value;
             // For the array model, we can assert this directly
             return $"(= (seq.nth {arrName}_seq {idxName}) {valName})";
+        }
+
+        // Handle bounded slice: x [!]in a[lo..hi] or x [!]in a[..][lo..hi] (both bounds explicit)
+        // Must be tried before the generic in/!in patterns, which only match single-bound slices.
+        foreach (var op in new[] { "!in", "in" })
+        {
+            var boundedSliceMatch = Regex.Match(expr, $@"^(.+?)\s+{op}\s+(\w+)(\[\.\.\])?\[(.+?)\s*\.\.\s*(.+?)\]$");
+            if (boundedSliceMatch.Success)
+            {
+                var lhsSmt = DafnyExprToSmt(boundedSliceMatch.Groups[1].Value.Trim(), inputs);
+                var seqNm = boundedSliceMatch.Groups[2].Value;
+                var loSmt = DafnyExprToSmt(boundedSliceMatch.Groups[4].Value, inputs);
+                var hiSmt = DafnyExprToSmt(boundedSliceMatch.Groups[5].Value, inputs);
+                if (lhsSmt != null && loSmt != null && hiSmt != null && seqNm != "Repr")
+                {
+                    var isArr = inputs.Any(v => v.Name == seqNm && TypeUtils.IsArrayType(v.Type));
+                    var smtSeqName = isArr ? $"{seqNm}_seq" : seqNm;
+                    var body = ExpandSeqContainsBounded(smtSeqName, lhsSmt, hiSmt, loSmt);
+                    return op == "!in" ? $"(not {body})" : body;
+                }
+            }
         }
 
         // Handle !in pattern: x !in S (set) or x !in a[..] or x !in a[..len] or x !in a[lo..] or x !in s

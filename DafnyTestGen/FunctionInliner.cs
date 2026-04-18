@@ -16,7 +16,8 @@ internal class FunctionInliningSubstituter : Substituter
 {
     private readonly Dictionary<string, Function> _inlinable;
     private readonly int _maxDepth;
-    private readonly HashSet<string> _currentlyInlining;
+    private readonly Dictionary<string, int> _inliningDepth;
+    private readonly HashSet<string> _recursive;
     private readonly Microsoft.Dafny.Program _program;
 
     internal FunctionInliningSubstituter(Microsoft.Dafny.Program program, Dictionary<string, Function> inlinable, int maxDepth = 2)
@@ -25,23 +26,28 @@ internal class FunctionInliningSubstituter : Substituter
         _program = program;
         _inlinable = inlinable;
         _maxDepth = maxDepth;
-        _currentlyInlining = new HashSet<string>();
+        _inliningDepth = new Dictionary<string, int>();
+        _recursive = FunctionInliner.ComputeRecursive(inlinable);
     }
 
-    // Used by InnerParamSubstituter to share the in-progress set.
+    // Used by InnerParamSubstituter to share the in-progress depth map.
     internal FunctionInliningSubstituter(
         Microsoft.Dafny.Program program,
         Dictionary<IVariable, Expression> substMap,
         Dictionary<string, Function> inlinable,
-        HashSet<string> currentlyInlining,
-        int maxDepth)
+        Dictionary<string, int> inliningDepth,
+        int maxDepth,
+        HashSet<string> recursive)
         : base(null, substMap, new Dictionary<TypeParameter, DafnyType>(), null, program.SystemModuleManager)
     {
         _program = program;
         _inlinable = inlinable;
         _maxDepth = maxDepth;
-        _currentlyInlining = currentlyInlining;
+        _inliningDepth = inliningDepth;
+        _recursive = recursive;
     }
+
+    private int EffectiveMaxDepth(string name) => _recursive.Contains(name) ? 1 : _maxDepth;
 
     public override Expression Substitute(Expression expr)
     {
@@ -50,25 +56,28 @@ internal class FunctionInliningSubstituter : Substituter
         while (inner is ConcreteSyntaxExpression cse && cse.ResolvedExpression != null)
             inner = cse.ResolvedExpression;
 
-        if (inner is FunctionCallExpr fce && _inlinable.TryGetValue(fce.Function.Name, out var func) && func.Body != null
-            && !_currentlyInlining.Contains(func.Name) && _currentlyInlining.Count < _maxDepth)
+        if (inner is FunctionCallExpr fce && _inlinable.TryGetValue(fce.Function.Name, out var func) && func.Body != null)
         {
-            // Substitute the args first (they may themselves contain inlinable calls).
-            var substitutedArgs = fce.Args.Select(a => this.Substitute(a)).ToList();
-            var subMap = new Dictionary<IVariable, Expression>();
-            for (int i = 0; i < func.Ins.Count && i < substitutedArgs.Count; i++)
-                subMap[func.Ins[i]] = substitutedArgs[i];
+            _inliningDepth.TryGetValue(func.Name, out var depth);
+            if (depth < EffectiveMaxDepth(func.Name))
+            {
+                // Substitute the args first (they may themselves contain inlinable calls).
+                var substitutedArgs = fce.Args.Select(a => this.Substitute(a)).ToList();
+                var subMap = new Dictionary<IVariable, Expression>();
+                for (int i = 0; i < func.Ins.Count && i < substitutedArgs.Count; i++)
+                    subMap[func.Ins[i]] = substitutedArgs[i];
 
-            var innerSub = new FunctionInliningSubstituter(_program, subMap, _inlinable, _currentlyInlining, _maxDepth);
-            _currentlyInlining.Add(func.Name);
-            try
-            {
-                var inlined = innerSub.Substitute(func.Body);
-                return new ParensExpression(func.Body.Origin, inlined);
-            }
-            finally
-            {
-                _currentlyInlining.Remove(func.Name);
+                var innerSub = new FunctionInliningSubstituter(_program, subMap, _inlinable, _inliningDepth, _maxDepth, _recursive);
+                _inliningDepth[func.Name] = depth + 1;
+                try
+                {
+                    var inlined = innerSub.Substitute(func.Body);
+                    return new ParensExpression(func.Body.Origin, inlined);
+                }
+                finally
+                {
+                    _inliningDepth[func.Name] = depth;
+                }
             }
         }
 
@@ -94,7 +103,7 @@ internal class FunctionInliningSubstituter : Substituter
                 var lambdaSubMap = new Dictionary<IVariable, Expression>();
                 for (int i = 0; i < lambda.BoundVars.Count && i < substArgs.Count; i++)
                     lambdaSubMap[lambda.BoundVars[i]] = substArgs[i];
-                var lambdaSub = new FunctionInliningSubstituter(_program, lambdaSubMap, _inlinable, _currentlyInlining, _maxDepth);
+                var lambdaSub = new FunctionInliningSubstituter(_program, lambdaSubMap, _inlinable, _inliningDepth, _maxDepth, _recursive);
                 var reduced = lambdaSub.Substitute(lambda.Term);
                 return new ParensExpression(lambda.Term.Origin, reduced);
             }
@@ -106,6 +115,39 @@ internal class FunctionInliningSubstituter : Substituter
 
 internal static class FunctionInliner
 {
+    /// <summary>
+    /// Detect which inlinable functions are self-recursive (body mentions own name).
+    /// Used to cap inlining depth at 1 for recursive functions to avoid exponential blow-up.
+    /// </summary>
+    internal static HashSet<string> ComputeRecursive(Dictionary<string, Function> inlinable)
+    {
+        var result = new HashSet<string>();
+        foreach (var kvp in inlinable)
+        {
+            var name = kvp.Key;
+            var body = kvp.Value.Body;
+            if (body != null && MentionsCall(body, name))
+                result.Add(name);
+        }
+        return result;
+    }
+
+    private static bool MentionsCall(Expression expr, string name)
+    {
+        var stack = new Stack<Expression>();
+        stack.Push(expr);
+        while (stack.Count > 0)
+        {
+            var e = stack.Pop();
+            if (e == null) continue;
+            if (e is FunctionCallExpr fce && fce.Function != null && fce.Function.Name == name)
+                return true;
+            foreach (var sub in e.SubExpressions)
+                stack.Push(sub);
+        }
+        return false;
+    }
+
     /// <summary>
     /// Collect non-bodyless functions/predicates in the program. Keyed by name (last wins on collision).
     /// </summary>

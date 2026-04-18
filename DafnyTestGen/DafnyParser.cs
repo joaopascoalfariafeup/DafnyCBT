@@ -295,16 +295,16 @@ static class DafnyParser
     {
         var result = literal;
         const int maxInlinedLength = 50_000; // safety limit to prevent exponential growth
-        for (int pass = 0; pass < 2; pass++) // 2 passes: inline 1st-level, then 2nd-level; 3rd-level stays uninterpreted
+        const int maxPasses = 2; // up to 2 levels for non-recursive funcs; recursive funcs capped at 1 level.
+        for (int pass = 0; pass < maxPasses; pass++)
         {
             var changed = false;
             foreach (var (name, paramNames, body, _) in predicates)
             {
-                // In pass 2, skip recursive predicates/functions: further expanding a recursive
-                // call only adds deeper uninterpreted residuals without contributing useful
-                // constraints — the structural branches introduced by pass 1 are sufficient.
                 bool isRecursive = Regex.IsMatch(body, @"\b" + Regex.Escape(name) + @"\s*\(");
-                if (pass == 1 && isRecursive) continue;
+                // Recursive funcs: only inline once (pass 0). Further passes would just deepen the unrolling.
+                // Non-recursive funcs: inline across passes so nested non-recursive calls expand.
+                if (pass > 0 && isRecursive) continue;
 
                 // Find occurrences of name(args...) — search forward past each replacement
                 // to avoid re-inlining calls introduced by the replacement (recursive functions).

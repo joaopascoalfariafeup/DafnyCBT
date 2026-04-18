@@ -46,10 +46,12 @@ class Program
         uniquenessRoundsOpt.AddAlias("-u");
         var skipBodylessOpt = new Option<bool>("--skip-bodyless", "Skip bodyless methods instead of generating spec-only tests (inputs only, call/expects commented)");
         skipBodylessOpt.AddAlias("-p");
+        var noBiasOpt = new Option<bool>("--no-bias", "Disable anti-trivial bias (soft-asserts steering Z3 away from 0/1 and randomized seed). Default: bias ON.");
+        noBiasOpt.AddAlias("-nb");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -73,6 +75,10 @@ class Program
             TrustUnknownUniqueness = ctx.ParseResult.GetValueForOption(trustUnknownOpt);
             UniquenessRounds = ctx.ParseResult.GetValueForOption(uniquenessRoundsOpt);
             var skipBodyless = ctx.ParseResult.GetValueForOption(skipBodylessOpt);
+            var antiTrivialBias = !ctx.ParseResult.GetValueForOption(noBiasOpt);
+            SmtTranslator.AntiTrivialBiasEnabled = antiTrivialBias;
+            if (!antiTrivialBias)
+                Console.WriteLine("[DafnyTestGen] Anti-trivial bias: OFF");
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
             var z3Path = Z3Runner.FindZ3Path(z3PathCli);
@@ -336,6 +342,9 @@ class Program
         {
             Console.WriteLine();
             Console.WriteLine($"[DafnyTestGen] Processing method: {method.Name}");
+
+            // Deterministic per-method Z3 random seed (for anti-trivial bias)
+            SmtTranslator.AntiTrivialBiasSeed = (int)((uint)method.Name.GetHashCode() % 100000U);
 
             // Check for unsupported parameter types
             var allParams = method.Ins.Concat(method.Outs).ToList();
@@ -931,8 +940,6 @@ class Program
             ).ToList();
         }
         bool hasDisjunctivePre = preDnfExprs.Count > 1;
-        if (hasDisjunctivePre)
-            Console.WriteLine($"  Disjunctive precondition: {preDnfExprs.Count} branches");
 
         // Prune clauses that contradict preconditions (post-post contradictions
         // are already caught by CrossProductPruned; this catches pre-post contradictions).
@@ -1268,40 +1275,53 @@ class Program
         if (hasDisjunctivePre)
         {
             int pm = preDnfExprs.Count;
-            int preTotalComb = (1 << pm) - 1;
-            Console.WriteLine($"  Disjunctive precondition: {pm} branches -> {preTotalComb} combinations");
-
-            for (int mask = 1; mask <= preTotalComb; mask++)
+            if (allCombinations)
             {
-                var included = new List<int>();
-                for (int bit = 0; bit < pm; bit++)
-                    if ((mask & (1 << bit)) != 0)
-                        included.Add(bit);
+                // FDNF mode: enumerate all 2^pm - 1 non-empty truth combinations.
+                int preTotalComb = (1 << pm) - 1;
+                Console.WriteLine($"  Disjunctive precondition: {pm} branches -> {preTotalComb} combinations (FDNF)");
 
-                var label = "P{" + string.Join(",", included.Select(i => (i + 1).ToString())) + "}";
-
-                var mergedPreLits = new List<Expression>();
-                var mergedKeys = new HashSet<string>();
-                foreach (var idx in included)
-                    foreach (var lit in preDnfExprs[idx])
-                        if (mergedKeys.Add(EKey(lit)))
-                            mergedPreLits.Add(lit);
-
-                // Build per-clause exclusions for preconditions
-                var preExclusions = new List<Expression>();
-                for (int bit = 0; bit < pm; bit++)
+                for (int mask = 1; mask <= preTotalComb; mask++)
                 {
-                    if ((mask & (1 << bit)) != 0) continue;
-                    var clauseLits = preDnfExprs[bit]
-                        .Where(lit => !preCommonKeys.Contains(EKey(lit)) && !mergedKeys.Contains(EKey(lit)))
-                        .ToList();
-                    if (clauseLits.Count == 1)
-                        preExclusions.Add(clauseLits[0]);
-                    else if (clauseLits.Count > 1)
-                        preExclusions.Add(ConjoinExprs(clauseLits));
-                }
+                    var included = new List<int>();
+                    for (int bit = 0; bit < pm; bit++)
+                        if ((mask & (1 << bit)) != 0)
+                            included.Add(bit);
 
-                preCombinations.Add((label, mergedPreLits, preExclusions));
+                    var label = "P{" + string.Join(",", included.Select(i => (i + 1).ToString())) + "}";
+
+                    var mergedPreLits = new List<Expression>();
+                    var mergedKeys = new HashSet<string>();
+                    foreach (var idx in included)
+                        foreach (var lit in preDnfExprs[idx])
+                            if (mergedKeys.Add(EKey(lit)))
+                                mergedPreLits.Add(lit);
+
+                    var preExclusions = new List<Expression>();
+                    for (int bit = 0; bit < pm; bit++)
+                    {
+                        if ((mask & (1 << bit)) != 0) continue;
+                        var clauseLits = preDnfExprs[bit]
+                            .Where(lit => !preCommonKeys.Contains(EKey(lit)) && !mergedKeys.Contains(EKey(lit)))
+                            .ToList();
+                        if (clauseLits.Count == 1)
+                            preExclusions.Add(clauseLits[0]);
+                        else if (clauseLits.Count > 1)
+                            preExclusions.Add(ConjoinExprs(clauseLits));
+                    }
+
+                    preCombinations.Add((label, mergedPreLits, preExclusions));
+                }
+            }
+            else
+            {
+                // DNF mode: one combination per branch, no exclusions (each branch covers ≥1 disjunct).
+                Console.WriteLine($"  Disjunctive precondition: {pm} branches");
+                for (int idx = 0; idx < pm; idx++)
+                {
+                    var label = "P{" + (idx + 1) + "}";
+                    preCombinations.Add((label, preDnfExprs[idx], new List<Expression>()));
+                }
             }
         }
         else
@@ -1521,7 +1541,7 @@ class Program
                     // no tier extra constraints) — otherwise tier literals that pin the output
                     // (e.g. index == 0 from an output-boundary tier) would make uniqueness trivially
                     // hold, producing false-positive "unique" verdicts and wrong concrete expects.
-                    var specSmt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, dnfEnsures, method, false, null, null, preLits, mutableNames);
+                    var specSmt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, dnfEnsures, method, false, null, null, preLits, mutableNames, skipBias: true);
                     var uQuery = SmtTranslator.BuildUniquenessQuery(specSmt, inputs, outputs, values, mutableNames);
                     if (!string.IsNullOrEmpty(uQuery) && !TimedOut())
                     {
