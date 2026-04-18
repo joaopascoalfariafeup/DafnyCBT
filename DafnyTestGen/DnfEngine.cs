@@ -304,11 +304,17 @@ static class DnfEngine
                     var negThenEq = new LeafExpression($"{ExprToString(eqOther)} {negCmpOp} {ExprToString(eqIte.Thn)}");
                     var negElseEq = new LeafExpression($"{ExprToString(eqOther)} {negCmpOp} {ExprToString(eqIte.Els)}");
                     var condFdnf = ExprToDnfInner(eqIte.Test);
+                    // Recurse into branches so nested ITE (e.g., countTrue's 3-branch body)
+                    // decomposes into further clauses instead of becoming a single leaf.
+                    var thenEqFdnf = ExprToDnfInner(thenEq);
+                    var elseEqFdnf = ExprToDnfInner(elseEq);
+                    var negThenEqFdnf = ExprToDnfInner(negThenEq);
+                    var negElseEqFdnf = ExprToDnfInner(negElseEq);
                     // ITE branches are mutually exclusive (C and !C), so skip "both true" case.
-                    var thenArmPos = CrossProduct(condFdnf.pos, new List<List<Expression>> { new() { thenEq } });
-                    var elseArmPos = CrossProduct(condFdnf.neg, new List<List<Expression>> { new() { elseEq } });
-                    var thenArmNeg = CrossProduct(condFdnf.pos, new List<List<Expression>> { new() { negThenEq } });
-                    var elseArmNeg = CrossProduct(condFdnf.neg, new List<List<Expression>> { new() { negElseEq } });
+                    var thenArmPos = CrossProduct(condFdnf.pos, thenEqFdnf.pos);
+                    var elseArmPos = CrossProduct(condFdnf.neg, elseEqFdnf.pos);
+                    var thenArmNeg = CrossProduct(condFdnf.pos, negThenEqFdnf.pos);
+                    var elseArmNeg = CrossProduct(condFdnf.neg, negElseEqFdnf.pos);
                     var pos = new List<List<Expression>>(thenArmPos);
                     pos.AddRange(elseArmPos);
                     var neg = new List<List<Expression>>(thenArmNeg);

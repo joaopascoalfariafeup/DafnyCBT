@@ -947,11 +947,46 @@ class Program
         }
 
         // Check for unsolvable patterns after predicate inlining.
+        // Strip function-call args first: patterns inside uninterpreted-function calls
+        // are opaque to Z3, so don't trigger the fallback. Repeatedly elide innermost `(...)`
+        // until stable, then match against the residue.
+        static string StripFnCallArgs(string s)
+        {
+            var innerParen = new Regex(@"\w+\(([^()]*)\)");
+            while (true)
+            {
+                var next = innerParen.Replace(s, m => m.Value.Substring(0, m.Value.IndexOf('(') + 1) + ")");
+                if (next == s) return s;
+                s = next;
+            }
+        }
+        // Collapse V[..][X] chains: V[..] is the array-to-seq identity, so V[..][X]
+        // is semantically V[X] (element or slice). Removes spurious double-slice hits
+        // after function inlining where a formal `s: seq<T>` gets substituted by `a[..]`.
+        // Also normalizes |V[..]| → |V| since length is preserved by array-to-seq.
+        static string CollapseArrayToSeqChain(string s)
+        {
+            var chain = new Regex(@"(\w+)\[\.\.\]\[");
+            var lenChain = new Regex(@"\|(\w+)\[\.\.\]\|");
+            while (true)
+            {
+                var next = chain.Replace(s, "$1[");
+                next = lenChain.Replace(next, "|$1|");
+                if (next == s) return s;
+                s = next;
+            }
+        }
         var allInlinedLiterals = dnfExprs.SelectMany(c => c).Select(e => DnfEngine.ExprToString(e))
             .Concat(preDnfExprs.SelectMany(c => c).Select(e => DnfEngine.ExprToString(e)));
         var varSliceMultiset = new Regex(@"multiset\([^)]*\[\.\.(?!\])[^)]*\)");
-        var doubleSlice = new Regex(@"\w+\[\.\.?\][^=]*\[\.\.(?!\])");
-        if (allInlinedLiterals.Any(lit => varSliceMultiset.IsMatch(lit) || doubleSlice.IsMatch(lit)))
+        // Match ADJACENT bracket groups only: V[...][...] — the truly problematic nested
+        // slice pattern. After CollapseArrayToSeqChain this only fires on cases the
+        // translator genuinely can't handle (e.g. output-slice-slice like r[..][..k]).
+        var doubleSlice = new Regex(@"\w+\[[^\]]*\]\[\.\.");
+        if (allInlinedLiterals.Any(lit => {
+            var r = CollapseArrayToSeqChain(StripFnCallArgs(lit));
+            return varSliceMultiset.IsMatch(r) || doubleSlice.IsMatch(r);
+        }))
         {
             Console.WriteLine($"  Note: postconditions contain unsolvable SMT patterns (multiset/variable-indexed slices)");
             Console.WriteLine($"  Falling back to precondition-only test generation with postcondition runtime checks");
@@ -1671,7 +1706,26 @@ class Program
                         // Pin individual elements too — otherwise subsumption lets Z3 pick
                         // alternative element contents (e.g. multi-witness clause falsely satisfied
                         // by inventing new duplicates at same length).
-                        if (values.TryGetValue(prefix + "_elems", out var elemsStr) && int.TryParse(lenVal, out var len))
+                        if (TypeUtils.IsSupportedNestedSeqType(type) && int.TryParse(lenVal, out var outerLen))
+                        {
+                            // Nested seq<seq<T>>: pin each inner seq's len + elements via flat keys.
+                            var seqName = TypeUtils.SeqSmtName(prefix, type);
+                            for (int i = 0; i < outerLen; i++)
+                            {
+                                if (values.TryGetValue($"{prefix}_{i}_len", out var innerLenVal))
+                                {
+                                    eqParts.Add($"(= (seq.len (seq.nth {seqName} {i})) {innerLenVal})");
+                                    if (values.TryGetValue($"{prefix}_{i}_elems", out var innerElemsStr)
+                                        && int.TryParse(innerLenVal, out var innerLen) && innerLen > 0)
+                                    {
+                                        var innerElems = innerElemsStr.Split(',');
+                                        for (int j = 0; j < Math.Min(innerLen, innerElems.Length); j++)
+                                            eqParts.Add($"(= (seq.nth (seq.nth {seqName} {i}) {j}) {innerElems[j]})");
+                                    }
+                                }
+                            }
+                        }
+                        else if (values.TryGetValue(prefix + "_elems", out var elemsStr) && int.TryParse(lenVal, out var len))
                         {
                             var seqName = TypeUtils.SeqSmtName(prefix, type);
                             var elems = elemsStr.Split(',');
@@ -2003,12 +2057,28 @@ class Program
                         sizeEq1 = $"(= {collName}_card 1)";
                         sizeEq0 = $"(= {collName}_card 0)";
                     }
-                    var tiers = new (string label, List<string> cs)[]
+                    var tiers = new List<(string label, List<string> cs)>
                     {
                         ($"|{collName}|>=2", new List<string> { sizeGe2 }),
                         ($"|{collName}|=1",  new List<string> { sizeEq1 }),
                         ($"|{collName}|=0",  new List<string> { sizeEq0 }),
                     };
+                    // Nested seq<seq<T>> / seq<string>: also tier inner length at index 0,
+                    // guarded by outer non-empty. Without this, Z3 picks empty inner seqs
+                    // to vacuously satisfy nested forall (e.g. forall i :: 0<=i<|a| ==>
+                    // forall j :: 0<=j<|a[i]| ==> P(a[i][j])).
+                    if (TypeUtils.IsSupportedNestedSeqType(input.Type))
+                    {
+                        var seqName = TypeUtils.SeqSmtName(collName, input.Type);
+                        var outerGe1 = $"(>= (seq.len {seqName}) 1)";
+                        var innerLen0 = $"(seq.len (seq.nth {seqName} 0))";
+                        tiers.Add(($"|{collName}[0]|>=2",
+                            new List<string> { outerGe1, $"(>= {innerLen0} 2)" }));
+                        tiers.Add(($"|{collName}[0]|=1",
+                            new List<string> { outerGe1, $"(= {innerLen0} 1)" }));
+                        tiers.Add(($"|{collName}[0]|=0",
+                            new List<string> { outerGe1, $"(= {innerLen0} 0)" }));
+                    }
                     var collPattern = @"\b" + Regex.Escape(collName) + @"\b";
                     bool LitHasPositiveForall(Expression lit)
                     {
@@ -2121,7 +2191,11 @@ class Program
                     var inputExclusions = baseConditionExclusions.ContainsKey(baseKey)
                         ? baseConditionExclusions[baseKey] : new List<string>();
                     int found = inputExclusions.Count;
-                    int needed = effectiveRepeat - found;
+                    // Repeat budget per base: at least (effectiveRepeat - found) more, plus enough
+                    // to reach minTests overall when prior phases emitted tier solutions that
+                    // filled `found` but left the global total short.
+                    int shortfall = Math.Max(0, minTests - testCases.Count);
+                    int needed = Math.Max(effectiveRepeat - found, shortfall);
 
                     for (int rep = 0; rep < needed; rep++)
                     {

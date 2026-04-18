@@ -365,7 +365,8 @@ static class TestValidator
             // Extract output variable names from method call pattern: "var x := Method(...);"
             // or "var x, y := Method(...);"
             HashSet<string>? outputNames = null;
-            var callMatch = Regex.Match(testBlocks[i].body, @"var\s+([\w,\s]+):=\s*\w+\(");
+            // Match both plain calls `Method(` and generic calls `Method<T>(`.
+            var callMatch = Regex.Match(testBlocks[i].body, @"var\s+([\w,\s]+):=\s*\w+\s*(?:<[^>]*>)?\s*\(");
             if (callMatch.Success)
             {
                 outputNames = new HashSet<string>(
@@ -836,6 +837,7 @@ static class TestValidator
                     IsValidDafnyLiteral(value) &&
                     (forceReplace || !IsSimpleScalarLiteral(rhs.Trim())))
                 {
+                    System.Console.Error.WriteLine($"[DIAG-RX] replacing -> {value}");
                     // Array outputs need [..] to convert to sequence for comparison
                     var lhs = (arrayOutputNames != null && arrayOutputNames.Contains(varName))
                         ? $"{varName}[..]" : varName;
