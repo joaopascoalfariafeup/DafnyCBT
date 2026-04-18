@@ -839,6 +839,24 @@ static class SmtTranslator
         sb.AppendLine("(check-sat)");
         sb.AppendLine("(get-model)");
 
+        EmitGetValueQueries(sb, inputs, outputs, mutableNames);
+
+        // Post-process: rewrite nested seq references to flat encoding.
+        var smtText = RewriteNestedSeqRefs(sb.ToString(), inputs, outputs);
+        return smtText;
+    }
+
+    /// <summary>
+    /// Emits (get-value ...) queries after (get-model) so Z3 produces the
+    /// ((func) value) format that TypeUtils.ParseZ3Model expects. Used by both
+    /// BuildSmt2Query and BuildUniquenessQuery so uniqueness-alt-enum models parse.
+    /// </summary>
+    internal static void EmitGetValueQueries(
+        System.Text.StringBuilder sb,
+        List<(string Name, string Type)> inputs,
+        List<(string Name, string Type)> outputs,
+        HashSet<string> mutableNames)
+    {
         // Explicitly request scalar output values (get-model may omit them)
         foreach (var (name, type) in outputs)
         {
@@ -960,24 +978,28 @@ static class SmtTranslator
             }
         }
 
-        // Post-process: rewrite nested seq references to flat encoding.
-        // Replace (seq.nth varName K) â†’ varName_K and (seq.len varName) â†’ varName_len
-        // for all nested seq<seq<T>> / seq<string> parameters.
-        var smtText = sb.ToString();
+    }
+
+    /// <summary>
+    /// Rewrites nested seq references to flat encoding in an already-built SMT
+    /// query string. Used by both BuildSmt2Query and BuildUniquenessQuery so that
+    /// (seq.nth name K) and (seq.len name) in emitted queries match the flat
+    /// {name}_K / {name}_len aliases used by the rest of the translator.
+    /// </summary>
+    internal static string RewriteNestedSeqRefs(string smtText,
+        List<(string Name, string Type)> inputs,
+        List<(string Name, string Type)> outputs)
+    {
         foreach (var (name, type) in inputs.Concat(outputs))
         {
             if (TypeUtils.IsSupportedNestedSeqType(type))
             {
                 var smtName = TypeUtils.SeqSmtName(name, type);
-                // Replace (seq.nth smtName K) with smtName_K for concrete indices K=0..MAX_SEQ_LEN-1
-                // Must process BEFORE (seq.len smtName) to avoid partial matches
                 for (int k = MAX_SEQ_LEN - 1; k >= 0; k--)
                     smtText = smtText.Replace($"(seq.nth {smtName} {k})", $"{smtName}_{k}");
-                // Replace (seq.len smtName) with smtName_len
                 smtText = smtText.Replace($"(seq.len {smtName})", $"{smtName}_len");
             }
         }
-
         return smtText;
     }
 
@@ -3181,7 +3203,11 @@ static class SmtTranslator
         sb.AppendLine(blockClause);
         sb.AppendLine("(check-sat)");
         sb.AppendLine("(get-model)");
-        return sb.ToString();
+
+        EmitGetValueQueries(sb, inputs, outputs, mutableNames);
+
+        var smtText = RewriteNestedSeqRefs(sb.ToString(), inputs, outputs);
+        return smtText;
     }
 
     /// <summary>

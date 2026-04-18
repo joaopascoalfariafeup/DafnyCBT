@@ -517,7 +517,7 @@ static class TestValidator
             {
                 // Insert VAL prints right after the method call (last "var ... :=" line)
                 result = Regex.Replace(result,
-                    @"(^[ \t]*var\s+\w+\s*:=\s*\w+\([^)]*\);\s*$)",
+                    @"(^[ \t]*var\s+\w+\s*:=\s*\w+\s*(?:<[^>]*>)?\s*\([^)]*\);\s*$)",
                     m2 =>
                     {
                         var sb2 = new System.Text.StringBuilder(m2.Value);

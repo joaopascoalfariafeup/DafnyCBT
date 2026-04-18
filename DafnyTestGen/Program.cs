@@ -1558,9 +1558,12 @@ class Program
                             bool exhausted = false;
                             for (int round = 2; round <= UniquenessRounds && !exhausted && !TimedOut(); round++)
                             {
-                                sb2.AppendLine("(check-sat)");
-                                sb2.AppendLine("(get-model)");
-                                var roundResult = await Z3Runner.RunZ3(z3Path, sb2.ToString());
+                                var sbRound = new System.Text.StringBuilder(sb2.ToString());
+                                sbRound.AppendLine("(check-sat)");
+                                sbRound.AppendLine("(get-model)");
+                                SmtTranslator.EmitGetValueQueries(sbRound, inputs, outputs, mutableNames);
+                                var roundQuery = SmtTranslator.RewriteNestedSeqRefs(sbRound.ToString(), inputs, outputs);
+                                var roundResult = await Z3Runner.RunZ3(z3Path, roundQuery);
                                 var roundLines = roundResult.Split('\n').Select(l => l.Trim()).ToList();
 
                                 if (roundLines.Any(l => l == "unsat"))
@@ -1575,10 +1578,6 @@ class Program
                                     if (roundVals.Count > 0)
                                     {
                                         altList.Add(roundVals);
-                                        // Strip check-sat/get-model, add new blocking clause
-                                        var cs2 = sb2.ToString().LastIndexOf("(check-sat)");
-                                        if (cs2 >= 0)
-                                            sb2 = new System.Text.StringBuilder(sb2.ToString().Substring(0, cs2));
                                         var newBlock = SmtTranslator.BuildOutputBlockingClause(inputs, outputs, roundVals, mutableNames);
                                         if (!string.IsNullOrEmpty(newBlock))
                                             sb2.AppendLine(newBlock);
