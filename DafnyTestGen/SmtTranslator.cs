@@ -876,7 +876,7 @@ static class SmtTranslator
     /// Skips enums, chars, bools, tuples, sets, maps, multisets, datatypes, nested seqs.
     /// </summary>
     private const int BIAS_POS = 3;
-    private const int BIAS_MAX = 20;   // prefer |scalar| <= BIAS_MAX
+    private const int BIAS_MAX = 10;   // prefer |scalar| <= BIAS_MAX
     private const int BIAS_LEN = 8;    // prefer seq/array length <= BIAS_LEN
     internal static void EmitAntiTrivialBias(
         System.Text.StringBuilder sb,
@@ -3293,6 +3293,18 @@ static class SmtTranslator
         // Strip everything from the last (check-sat) onward
         var checkIdx = originalQuery.LastIndexOf("(check-sat)");
         if (checkIdx < 0) return "";
+
+        // Skip uniqueness enumeration when the spec references residual
+        // uninterpreted user-defined functions (recursive calls not fully
+        // inlined). Z3 can freely assign values to such calls, fabricating
+        // spurious alternative outputs that do not reflect real semantics.
+        // Any declare-fun with non-empty argument list is an uninterpreted
+        // user fn (variable declarations use empty arg lists).
+        foreach (Match dm in Regex.Matches(originalQuery, @"\(declare-fun\s+\S+\s+\(([^)]*)\)\s"))
+        {
+            if (!string.IsNullOrWhiteSpace(dm.Groups[1].Value))
+                return "";
+        }
         var sb = new System.Text.StringBuilder(originalQuery.Substring(0, checkIdx));
 
         // Fix input values to pin the specific scenario Z3 chose
@@ -3545,8 +3557,11 @@ static class SmtTranslator
         mutableNames ??= new HashSet<string>();
         if (postLiterals.Count == 0) return null;
 
-        // Build the base SMT (ins + outs1 + pre + outs1 asserts). Bias OFF — bias toward
-        // 0/1 would skew relevance verdicts (same reasoning as uniqueness check).
+        // Build the base SMT (ins + outs1 + pre + outs1 asserts). Bias ON —
+        // soft asserts don't change SAT/UNSAT (only preferred model), and
+        // EmitAntiTrivialBias only biases inputs, so outs2 is never skewed.
+        // Keeps ins magnitudes in range (BIAS_MAX) so uniqueness enumeration
+        // can afterward enumerate alternative outs within a reasonable budget.
         var baseSmt = BuildSmt2Query(
             inputs, outputs, preLiterals, postLiterals, method,
             verbose: false,
@@ -3554,10 +3569,32 @@ static class SmtTranslator
             extraConstraints: null,
             preLiterals: preLiterals,
             mutableNames: mutableNames,
-            skipBias: true);
+            skipBias: false);
 
         var checkIdx = baseSmt.LastIndexOf("(check-sat)");
         if (checkIdx < 0) return null;
+
+        // Skip Phase 1r if Q_last references any residual uninterpreted
+        // user-defined function (recursive call not fully inlined). Z3 can
+        // assign arbitrary values to such calls, producing spurious SAT on
+        // ¬Q_last(outs2) that does not reflect real semantics.
+        var uninterpFns = new HashSet<string>();
+        foreach (Match dm in Regex.Matches(baseSmt, @"\(declare-fun\s+(\S+)\s+\(([^)]*)\)\s"))
+        {
+            if (!string.IsNullOrWhiteSpace(dm.Groups[2].Value))
+                uninterpFns.Add(dm.Groups[1].Value);
+        }
+        if (uninterpFns.Count > 0)
+        {
+            var lastLitDafny = DnfEngine.ExprToString(postLiterals[postLiterals.Count - 1]);
+            foreach (var fn in uninterpFns)
+            {
+                // Match fn(args) or fn<T,...>(args) — recursive/generic residual calls.
+                if (Regex.IsMatch(lastLitDafny, @"\b" + Regex.Escape(fn) + @"\s*(<[^>]*>)?\s*\("))
+                    return null;
+            }
+        }
+
         var sb = new System.Text.StringBuilder(baseSmt.Substring(0, checkIdx));
 
         sb.AppendLine();
