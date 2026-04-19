@@ -9,6 +9,7 @@ class Program
 {
     static bool TrustUnknownUniqueness = true;
     static int UniquenessRounds = 2;
+    static bool RelevanceCheckEnabled = true;
 
     static async Task<int> Main(string[] args)
     {
@@ -48,10 +49,12 @@ class Program
         skipBodylessOpt.AddAlias("-p");
         var noBiasOpt = new Option<bool>("--no-bias", "Disable anti-trivial bias (soft-asserts steering Z3 away from 0/1 and randomized seed). Default: bias ON.");
         noBiasOpt.AddAlias("-nb");
+        var noRelevanceOpt = new Option<bool>("--no-relevance", "Disable per-literal relevance check (Phase 1r). Default: relevance ON.");
+        noRelevanceOpt.AddAlias("-nr");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -79,6 +82,10 @@ class Program
             SmtTranslator.AntiTrivialBiasEnabled = antiTrivialBias;
             if (!antiTrivialBias)
                 Console.WriteLine("[DafnyTestGen] Anti-trivial bias: OFF");
+            var relevanceEnabled = !ctx.ParseResult.GetValueForOption(noRelevanceOpt);
+            RelevanceCheckEnabled = relevanceEnabled;
+            if (!relevanceEnabled)
+                Console.WriteLine("[DafnyTestGen] Relevance check (Phase 1r): OFF");
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
             var z3Path = Z3Runner.FindZ3Path(z3PathCli);
@@ -1335,6 +1342,34 @@ class Program
         var mutableFieldsList = classInfo?.Fields?.Where(f => mutableNames.Contains(f.Name)).ToList();
         var postLitStrings = method.Ens.Select(e => DnfEngine.ExprToString(e.E)).ToList();
 
+        // Helper: decide whether Phase 1r relevance check is safe for this clause.
+        // Safe iff: clause has ≥2 literals, last literal references an output (or
+        // mutable post-state), and every output-side var of the last literal also
+        // appears in some earlier literal (so guards remain intact under negation).
+        bool IsSafeRelevanceCandidate(
+            List<Expression> clause,
+            List<(string Name, string Type)> ins,
+            List<(string Name, string Type)> outs,
+            HashSet<string> mutables)
+        {
+            if (clause.Count < 2) return false;
+            var lastStr = DnfEngine.ExprToString(clause[clause.Count - 1]);
+            var outNames = outs.Select(o => o.Name)
+                .Concat(ins.Where(i => mutables.Contains(i.Name)).Select(i => i.Name))
+                .Distinct().ToList();
+            bool refsOutput = outNames.Any(n => Regex.IsMatch(lastStr, @"\b" + Regex.Escape(n) + @"\b"));
+            if (!refsOutput) return false;
+            var earlierText = string.Join(" && ",
+                clause.Take(clause.Count - 1).Select(DnfEngine.ExprToString));
+            foreach (var n in outNames)
+            {
+                if (!Regex.IsMatch(lastStr, @"\b" + Regex.Escape(n) + @"\b")) continue;
+                if (!Regex.IsMatch(earlierText, @"\b" + Regex.Escape(n) + @"\b"))
+                    return false;
+            }
+            return true;
+        }
+
         // Helper: build baseline (Phase 1) schedule entries — one per (pi, ci), no pins.
         void BuildScheduleEntries(
             List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule)
@@ -2147,6 +2182,70 @@ class Program
 
             if (!verbose) Console.Write("\r                          \r"); // clear progress line
             Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
+
+            // --- Phase 1r: per-literal relevance check ---
+            // For each clause Q1 ∧ ... ∧ Qm, prove Q_last is non-redundant by finding
+            // (ins, outs1, outs2) with outs1 satisfying full clause, outs2 satisfying
+            // clause minus Q_last with ¬Q_last, and outs1 ≠ outs2. Forces Z3 to pick an
+            // ins where Q_last actually bites (e.g., arr containing duplicates of elem).
+            if (RelevanceCheckEnabled && !TimedOut())
+            {
+                int relAdded = 0, relUnsat = 0, relSkipped = 0;
+                for (int pi = 0; pi < preCombinations.Count; pi++)
+                {
+                    if (TimedOut()) break;
+                    var (preLabel, preLits, preExclusions) = preCombinations[pi];
+                    var fullPreLits = new List<Expression>(preLits);
+                    foreach (var excl in preExclusions) fullPreLits.Add(DnfEngine.Negate(excl));
+                    var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
+                    for (int ci = 0; ci < dnfExprs.Count; ci++)
+                    {
+                        if (TimedOut()) break;
+                        if (maxTests > 0 && testCases.Count >= maxTests) break;
+                        var clause = dnfExprs[ci];
+                        if (!IsSafeRelevanceCandidate(clause, inputs, outputs, mutableNames))
+                        { relSkipped++; continue; }
+                        var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}/Rel";
+                        var smt = SmtTranslator.BuildRelevanceQuery(
+                            inputs, outputs, fullPreLits, clause, method, mutableNames);
+                        if (smt == null) { relSkipped++; continue; }
+                        if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel}...");
+                        var z3Result = await Z3Runner.RunZ3(z3Path, smt);
+                        var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
+                        if (lines.Any(l => l == "sat"))
+                        {
+                            var values = TypeUtils.ParseZ3Model(z3Result, allVars);
+                            if (values.Count > 0)
+                            {
+                                var specSmt = SmtTranslator.BuildSmt2Query(
+                                    inputs, outputs, preClauses, dnfEnsures, method, false,
+                                    null, null, fullPreLits, mutableNames, skipBias: true);
+                                var uQuery = SmtTranslator.BuildUniquenessQuery(
+                                    specSmt, inputs, outputs, values, mutableNames);
+                                bool isUnique = false;
+                                if (!string.IsNullOrEmpty(uQuery) && !TimedOut())
+                                {
+                                    var uResult = await Z3Runner.RunZ3(z3Path, uQuery);
+                                    var uLines = uResult.Split('\n').Select(l => l.Trim()).ToList();
+                                    isUnique = uLines.Any(l => l == "unsat");
+                                    bool isUnknown = !isUnique && uLines.Any(l => l == "unknown");
+                                    values["__unique__"] = (isUnique || (isUnknown && TrustUnknownUniqueness)) ? "true" : "false";
+                                }
+                                testCases.Add((clauseLabel, values, clause));
+                                relAdded++;
+                                if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: SAT — added test case");
+                            }
+                        }
+                        else if (lines.Any(l => l == "unsat"))
+                        {
+                            relUnsat++;
+                            if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: UNSAT (last literal redundant)");
+                        }
+                    }
+                }
+                if (relAdded > 0 || relUnsat > 0 || relSkipped > 0)
+                    Console.WriteLine($"  Phase 1r: relevance ({relAdded} added, {relUnsat} redundant, {relSkipped} skipped)");
+            }
 
             HashSet<string> phase2Keys = new HashSet<string>();
             if (testCases.Count < minTests && (boundary || progressive)
