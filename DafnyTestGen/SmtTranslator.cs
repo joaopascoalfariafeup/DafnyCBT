@@ -3552,14 +3552,20 @@ static class SmtTranslator
         List<Expression> preLiterals,
         List<Expression> postLiterals,
         Method method,
-        HashSet<string>? mutableNames = null)
+        HashSet<string>? mutableNames = null,
+        List<int>? safeIndices = null)
     {
         mutableNames ??= new HashSet<string>();
         if (postLiterals.Count == 0) return null;
 
+        // Default: negate only the last literal (backwards-compat).
+        var indices = safeIndices != null && safeIndices.Count > 0
+            ? safeIndices
+            : new List<int> { postLiterals.Count - 1 };
+
         // Build the base SMT (ins + outs1 + pre + outs1 asserts). Bias ON —
         // soft asserts don't change SAT/UNSAT (only preferred model), and
-        // EmitAntiTrivialBias only biases inputs, so outs2 is never skewed.
+        // EmitAntiTrivialBias only biases inputs, so outs_i is never skewed.
         // Keeps ins magnitudes in range (BIAS_MAX) so uniqueness enumeration
         // can afterward enumerate alternative outs within a reasonable budget.
         var baseSmt = BuildSmt2Query(
@@ -3574,10 +3580,10 @@ static class SmtTranslator
         var checkIdx = baseSmt.LastIndexOf("(check-sat)");
         if (checkIdx < 0) return null;
 
-        // Skip Phase 1r if Q_last references any residual uninterpreted
-        // user-defined function (recursive call not fully inlined). Z3 can
-        // assign arbitrary values to such calls, producing spurious SAT on
-        // ¬Q_last(outs2) that does not reflect real semantics.
+        // Drop any safe index whose literal references a residual uninterpreted
+        // user-defined function (recursive call not fully inlined). Z3 can assign
+        // arbitrary values to such calls, producing spurious SAT on the ¬Qi(outs_i)
+        // side that doesn't reflect real semantics. Other safe indices proceed.
         var uninterpFns = new HashSet<string>();
         foreach (Match dm in Regex.Matches(baseSmt, @"\(declare-fun\s+(\S+)\s+\(([^)]*)\)\s"))
         {
@@ -3586,46 +3592,59 @@ static class SmtTranslator
         }
         if (uninterpFns.Count > 0)
         {
-            var lastLitDafny = DnfEngine.ExprToString(postLiterals[postLiterals.Count - 1]);
-            foreach (var fn in uninterpFns)
+            var filtered = new List<int>();
+            foreach (var idx in indices)
             {
-                // Match fn(args) or fn<T,...>(args) — recursive/generic residual calls.
-                if (Regex.IsMatch(lastLitDafny, @"\b" + Regex.Escape(fn) + @"\s*(<[^>]*>)?\s*\("))
-                    return null;
+                var litDafny = DnfEngine.ExprToString(postLiterals[idx]);
+                bool hasUninterp = false;
+                foreach (var fn in uninterpFns)
+                {
+                    if (Regex.IsMatch(litDafny, @"\b" + Regex.Escape(fn) + @"\s*(<[^>]*>)?\s*\("))
+                    { hasUninterp = true; break; }
+                }
+                if (!hasUninterp) filtered.Add(idx);
             }
+            if (filtered.Count == 0) return null;
+            indices = filtered;
         }
 
         var sb = new System.Text.StringBuilder(baseSmt.Substring(0, checkIdx));
-
-        sb.AppendLine();
-        sb.AppendLine("; ─── Phase 1r: shadow output (outs2) declarations ───");
-        if (!EmitOutputAltDeclarations(sb, inputs, outputs, mutableNames))
-            return null;  // unsupported output type encountered
-
-        sb.AppendLine();
-        sb.AppendLine("; ─── Phase 1r: shadow assertions over outs2 (clause minus Q_last + ¬Q_last) ───");
-        var altRenameMap = BuildOutputAltRenameMap(inputs, outputs, mutableNames);
-        if (altRenameMap.Count == 0) return null;
         var inputsAndOutputs = inputs.Concat(outputs).ToList();
-        int last = postLiterals.Count - 1;
-        for (int j = 0; j < postLiterals.Count; j++)
-        {
-            var lit = postLiterals[j];
-            var litStr = DnfEngine.ExprToString(lit);
-            if (TypeUtils.IsSpecOnlyLiteral(litStr)) continue;
-            ResetExprToSmtBudget();
-            var smtExpr = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true);
-            if (smtExpr == null) return null;  // cannot form well-formed alt block
-            smtExpr = ApplyOutputAltRenames(smtExpr, altRenameMap);
-            if (j == last) smtExpr = $"(not {smtExpr})";
-            sb.AppendLine($"(assert {smtExpr})");
-        }
 
-        sb.AppendLine();
-        sb.AppendLine("; ─── Phase 1r: outs1 ≠ outs2 ───");
-        var ineq = BuildOutputInequalityClause(inputs, outputs, mutableNames);
-        if (ineq == null) return null;
-        sb.AppendLine(ineq);
+        // Emit one shadow output block per safe index; each block negates exactly
+        // one literal (Qidx) while keeping the others intact.
+        foreach (var idx in indices)
+        {
+            var suffix = $"alt{idx}";
+            sb.AppendLine();
+            sb.AppendLine($"; ─── Relevance: shadow output for Q{idx + 1} (outs_{suffix}) ───");
+            if (!EmitOutputAltDeclarations(sb, inputs, outputs, mutableNames, suffix))
+                return null;
+
+            var renameMap = BuildOutputAltRenameMap(inputs, outputs, mutableNames, suffix);
+            if (renameMap.Count == 0) return null;
+
+            sb.AppendLine();
+            sb.AppendLine($"; ─── Relevance: shadow assertions for Q{idx + 1} (clause minus Q{idx + 1} + ¬Q{idx + 1}) ───");
+            for (int j = 0; j < postLiterals.Count; j++)
+            {
+                var lit = postLiterals[j];
+                var litStr = DnfEngine.ExprToString(lit);
+                if (TypeUtils.IsSpecOnlyLiteral(litStr)) continue;
+                ResetExprToSmtBudget();
+                var smtExpr = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true);
+                if (smtExpr == null) return null;
+                smtExpr = ApplyOutputAltRenames(smtExpr, renameMap);
+                if (j == idx) smtExpr = $"(not {smtExpr})";
+                sb.AppendLine($"(assert {smtExpr})");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine($"; ─── Relevance: outs ≠ outs_{suffix} ───");
+            var ineq = BuildOutputInequalityClause(inputs, outputs, mutableNames, suffix);
+            if (ineq == null) return null;
+            sb.AppendLine(ineq);
+        }
 
         sb.AppendLine();
         sb.AppendLine("(check-sat)");
@@ -3645,27 +3664,28 @@ static class SmtTranslator
         System.Text.StringBuilder sb,
         List<(string Name, string Type)> inputs,
         List<(string Name, string Type)> outputs,
-        HashSet<string> mutableNames)
+        HashSet<string> mutableNames,
+        string suffix = "alt")
     {
-        // Outputs (return values): full _alt mirror
+        // Outputs (return values): full mirror with suffix
         foreach (var (name, type) in outputs)
         {
-            if (!EmitOneOutputAlt(sb, name, type, isMutablePost: false)) return false;
+            if (!EmitOneOutputAlt(sb, name, type, isMutablePost: false, suffix)) return false;
         }
-        // Mutable inputs: only the post-state side (_post_alt)
+        // Mutable inputs: only the post-state side
         foreach (var (name, type) in inputs)
         {
             if (!mutableNames.Contains(name)) continue;
-            if (!EmitOneOutputAlt(sb, name, type, isMutablePost: true)) return false;
+            if (!EmitOneOutputAlt(sb, name, type, isMutablePost: true, suffix)) return false;
         }
         return true;
     }
 
-    private static bool EmitOneOutputAlt(System.Text.StringBuilder sb, string name, string type, bool isMutablePost)
+    private static bool EmitOneOutputAlt(System.Text.StringBuilder sb, string name, string type, bool isMutablePost, string suffix = "alt")
     {
         // For mutables, the SMT base name is "{name}_post"; for return outputs it's "{name}".
         var baseName = isMutablePost ? $"{name}_post" : name;
-        var altName = $"{baseName}_alt";
+        var altName = $"{baseName}_{suffix}";
 
         // Class outputs: not supported
         if (type.EndsWith("?") || (!TypeUtils.IsSeqType(type) && !TypeUtils.IsArrayType(type)
@@ -3782,55 +3802,56 @@ static class SmtTranslator
     private static Dictionary<string, string> BuildOutputAltRenameMap(
         List<(string Name, string Type)> inputs,
         List<(string Name, string Type)> outputs,
-        HashSet<string> mutableNames)
+        HashSet<string> mutableNames,
+        string suffix = "alt")
     {
         var map = new Dictionary<string, string>();
         foreach (var (name, type) in outputs)
-            AddOutputAltKeys(map, name, type, isMutablePost: false);
+            AddOutputAltKeys(map, name, type, isMutablePost: false, suffix);
         foreach (var (name, type) in inputs)
         {
             if (!mutableNames.Contains(name)) continue;
-            AddOutputAltKeys(map, name, type, isMutablePost: true);
+            AddOutputAltKeys(map, name, type, isMutablePost: true, suffix);
         }
         return map;
     }
 
-    private static void AddOutputAltKeys(Dictionary<string, string> map, string name, string type, bool isMutablePost)
+    private static void AddOutputAltKeys(Dictionary<string, string> map, string name, string type, bool isMutablePost, string suffix = "alt")
     {
         var baseName = isMutablePost ? $"{name}_post" : name;
         if (TypeUtils.IsTupleType(type))
         {
             var comps = TypeUtils.GetTupleComponentTypes(type);
-            for (int i = 0; i < comps.Count; i++) map[$"{baseName}_{i}"] = $"{baseName}_alt_{i}";
+            for (int i = 0; i < comps.Count; i++) map[$"{baseName}_{i}"] = $"{baseName}_{suffix}_{i}";
             return;
         }
         if (TypeUtils.IsArrayType(type))
         {
-            map[$"{baseName}_seq"] = $"{baseName}_alt_seq";
-            map[$"{baseName}_len"] = $"{baseName}_alt_len";
+            map[$"{baseName}_seq"] = $"{baseName}_{suffix}_seq";
+            map[$"{baseName}_len"] = $"{baseName}_{suffix}_len";
             return;
         }
         if (TypeUtils.IsSeqType(type))
         {
-            map[baseName] = $"{baseName}_alt";
-            map[$"{baseName}_len"] = $"{baseName}_alt_len";
+            map[baseName] = $"{baseName}_{suffix}";
+            map[$"{baseName}_len"] = $"{baseName}_{suffix}_len";
             return;
         }
         if (TypeUtils.IsSetType(type))
         {
-            map[baseName] = $"{baseName}_alt";
+            map[baseName] = $"{baseName}_{suffix}";
             return;
         }
         if (TypeUtils.IsMultisetType(type))
         {
-            map[baseName] = $"{baseName}_alt";
+            map[baseName] = $"{baseName}_{suffix}";
             var elemType = TypeUtils.GetMultisetElementType(type);
             var universe = TypeUtils.GetElementUniverse(elemType);
-            for (int i = 0; i < universe.Length; i++) map[$"{baseName}_e{i}"] = $"{baseName}_alt_e{i}";
+            for (int i = 0; i < universe.Length; i++) map[$"{baseName}_e{i}"] = $"{baseName}_{suffix}_e{i}";
             return;
         }
         // Scalar
-        map[baseName] = $"{baseName}_alt";
+        map[baseName] = $"{baseName}_{suffix}";
     }
 
     /// <summary>
@@ -3853,25 +3874,26 @@ static class SmtTranslator
     private static string? BuildOutputInequalityClause(
         List<(string Name, string Type)> inputs,
         List<(string Name, string Type)> outputs,
-        HashSet<string> mutableNames)
+        HashSet<string> mutableNames,
+        string suffix = "alt")
     {
         var disjuncts = new List<string>();
         foreach (var (name, type) in outputs)
-            CollectIneqTerms(disjuncts, name, type, isMutablePost: false);
+            CollectIneqTerms(disjuncts, name, type, isMutablePost: false, suffix);
         foreach (var (name, type) in inputs)
         {
             if (!mutableNames.Contains(name)) continue;
-            CollectIneqTerms(disjuncts, name, type, isMutablePost: true);
+            CollectIneqTerms(disjuncts, name, type, isMutablePost: true, suffix);
         }
         if (disjuncts.Count == 0) return null;
         var inner = disjuncts.Count == 1 ? disjuncts[0] : $"(or {string.Join(" ", disjuncts)})";
         return $"(assert {inner})";
     }
 
-    private static void CollectIneqTerms(List<string> disjuncts, string name, string type, bool isMutablePost)
+    private static void CollectIneqTerms(List<string> disjuncts, string name, string type, bool isMutablePost, string suffix = "alt")
     {
         var baseName = isMutablePost ? $"{name}_post" : name;
-        var altName = $"{baseName}_alt";
+        var altName = $"{baseName}_{suffix}";
         if (TypeUtils.IsTupleType(type))
         {
             var comps = TypeUtils.GetTupleComponentTypes(type);

@@ -1342,32 +1342,88 @@ class Program
         var mutableFieldsList = classInfo?.Fields?.Where(f => mutableNames.Contains(f.Name)).ToList();
         var postLitStrings = method.Ens.Select(e => DnfEngine.ExprToString(e.E)).ToList();
 
-        // Helper: decide whether Phase 1r relevance check is safe for this clause.
-        // Safe iff: clause has ≥2 literals, last literal references an output (or
-        // mutable post-state), and every output-side var of the last literal also
-        // appears in some earlier literal (so guards remain intact under negation).
-        bool IsSafeRelevanceCandidate(
+        // Returns true if the literal (as Dafny string) matches a "guard" shape —
+        // a bound/length/index-position pin that other literals typically depend
+        // on for well-definedness. Negating a guard can leave subscripts etc.
+        // undefined, so Z3 fabricates spurious SAT models.
+        //
+        // Payload literals (quantifier bodies over full slices, set/multiset/seq
+        // equalities, function-application equalities) return false.
+        bool IsGuardLiteral(string s)
+        {
+            s = s.Trim();
+            while (s.StartsWith("(") && s.EndsWith(")"))
+            {
+                var inner = s.Substring(1, s.Length - 2).Trim();
+                // Only strip outer parens if they balance (avoid mangling "(a) || (b)").
+                int depth = 0; bool outerMatches = true;
+                for (int i = 0; i < inner.Length; i++)
+                {
+                    if (inner[i] == '(') depth++;
+                    else if (inner[i] == ')') { depth--; if (depth < 0) { outerMatches = false; break; } }
+                }
+                if (!outerMatches || depth != 0) break;
+                s = inner;
+            }
+            // Bounds on integer vars
+            if (Regex.IsMatch(s, @"^0\s*<=\s*\w+$")) return true;
+            if (Regex.IsMatch(s, @"^0\s*<\s*\w+$")) return true;
+            if (Regex.IsMatch(s, @"^\w+\s*>=\s*0$")) return true;
+            if (Regex.IsMatch(s, @"^\w+\s*>\s*0$")) return true;
+            // Index upper bound: X < |Y|, X < Y.Length, X <= |Y|-1, X <= Y.Length-1
+            if (Regex.IsMatch(s, @"^\w+\s*<\s*\|[\w\.\[\]]+\|$")) return true;
+            if (Regex.IsMatch(s, @"^\w+\s*<\s*\w+\.Length$")) return true;
+            if (Regex.IsMatch(s, @"^\w+\s*<=\s*\|[\w\.\[\]]+\|\s*-\s*1$")) return true;
+            if (Regex.IsMatch(s, @"^\w+\s*<=\s*\w+\.Length\s*-\s*1$")) return true;
+            // Length/size pins: starts with |X| or X.Length followed by op
+            if (Regex.IsMatch(s, @"^\|[\w\.\[\]]+\|\s*(==|>=|<=|>|<|!=)\s*")) return true;
+            if (Regex.IsMatch(s, @"^\w+\.Length\s*(==|>=|<=|>|<|!=)\s*")) return true;
+            // Negated variants of the same shapes
+            if (s.StartsWith("!"))
+            {
+                var inner = s.Substring(1).Trim();
+                if (inner.StartsWith("(") && inner.EndsWith(")"))
+                    inner = inner.Substring(1, inner.Length - 2).Trim();
+                return IsGuardLiteral(inner);
+            }
+            return false;
+        }
+
+        // For each clause literal Qi, decide whether Qi is safe to negate while
+        // keeping the other literals intact. Returns the list of safe indices.
+        // Empty list → skip relevance check for this clause.
+        //
+        // Qi is safe iff:
+        //   1. clause.Count >= 2
+        //   2. Qi is NOT a guard literal (see IsGuardLiteral)
+        //   3. Qi references at least one output (or mutable-post) variable
+        //   4. every output var in Qi also appears in some other literal Qj (j != i)
+        //      — ensures outs_i is partially constrained, not free
+        List<int> GetSafeRelevanceIndices(
             List<Expression> clause,
             List<(string Name, string Type)> ins,
             List<(string Name, string Type)> outs,
             HashSet<string> mutables)
         {
-            if (clause.Count < 2) return false;
-            var lastStr = DnfEngine.ExprToString(clause[clause.Count - 1]);
+            var result = new List<int>();
+            if (clause.Count < 2) return result;
             var outNames = outs.Select(o => o.Name)
                 .Concat(ins.Where(i => mutables.Contains(i.Name)).Select(i => i.Name))
                 .Distinct().ToList();
-            bool refsOutput = outNames.Any(n => Regex.IsMatch(lastStr, @"\b" + Regex.Escape(n) + @"\b"));
-            if (!refsOutput) return false;
-            var earlierText = string.Join(" && ",
-                clause.Take(clause.Count - 1).Select(DnfEngine.ExprToString));
-            foreach (var n in outNames)
+            var litStrs = clause.Select(DnfEngine.ExprToString).ToList();
+            for (int i = 0; i < clause.Count; i++)
             {
-                if (!Regex.IsMatch(lastStr, @"\b" + Regex.Escape(n) + @"\b")) continue;
-                if (!Regex.IsMatch(earlierText, @"\b" + Regex.Escape(n) + @"\b"))
-                    return false;
+                var s = litStrs[i];
+                if (IsGuardLiteral(s)) continue;
+                var refsHere = outNames.Where(n => Regex.IsMatch(s, @"\b" + Regex.Escape(n) + @"\b")).ToList();
+                if (refsHere.Count == 0) continue;
+                var elsewhereText = string.Join(" && ",
+                    litStrs.Where((_, idx) => idx != i));
+                bool allCovered = refsHere.All(n => Regex.IsMatch(elsewhereText, @"\b" + Regex.Escape(n) + @"\b"));
+                if (!allCovered) continue;
+                result.Add(i);
             }
-            return true;
+            return result;
         }
 
         // Helper: build baseline (Phase 1) schedule entries — one per (pi, ci), no pins.
@@ -2082,15 +2138,30 @@ class Program
                         if (TimedOut()) break;
                         if (maxTests > 0 && testCases.Count >= maxTests) break;
                         var clause = dnfExprs[ci];
-                        if (!IsSafeRelevanceCandidate(clause, inputs, outputs, mutableNames))
-                        { relSkipped++; continue; }
+                        var safeIndices = GetSafeRelevanceIndices(clause, inputs, outputs, mutableNames);
+                        if (safeIndices.Count == 0) { relSkipped++; continue; }
                         var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}/Rel";
                         var smt = SmtTranslator.BuildRelevanceQuery(
-                            inputs, outputs, fullPreLits, clause, method, mutableNames);
+                            inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices);
                         if (smt == null) { relSkipped++; continue; }
-                        if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel}...");
+                        if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel} (safe: [{string.Join(",", safeIndices.Select(i => i + 1))}])...");
                         var z3Result = await Z3Runner.RunZ3(z3Path, smt);
                         var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
+                        // UNSAT with multiple safe indices → at least one is redundant
+                        // here. Fall back to single-literal (last safe index) query to
+                        // still exercise the defining literal when possible.
+                        if (lines.Any(l => l == "unsat") && safeIndices.Count > 1)
+                        {
+                            var fallbackIndices = new List<int> { safeIndices[safeIndices.Count - 1] };
+                            var fbSmt = SmtTranslator.BuildRelevanceQuery(
+                                inputs, outputs, fullPreLits, clause, method, mutableNames, fallbackIndices);
+                            if (fbSmt != null)
+                            {
+                                if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: multi-literal UNSAT — retry with Q{fallbackIndices[0] + 1} only");
+                                z3Result = await Z3Runner.RunZ3(z3Path, fbSmt);
+                                lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
+                            }
+                        }
                         if (lines.Any(l => l == "sat"))
                         {
                             var values = TypeUtils.ParseZ3Model(z3Result, allVars);
@@ -2166,10 +2237,14 @@ class Program
                 {
                     var inputOrOutput = inputs.Concat(outputs).First(v => v.Name == collName);
                     var input = inputOrOutput; // local alias; may be an output too
+                    // Mutable collections: pin the pre-state size (SMT name {name}_pre_seq).
+                    // Using the plain name yields `(seq.len a_seq)` which Z3 treats as a free
+                    // phantom var — the constraint has no effect on the actual `a_pre_seq`.
+                    var effectiveCollName = mutableNames.Contains(collName) ? collName + "_pre" : collName;
                     string sizeGe2, sizeEq1, sizeEq0;
                     if (TypeUtils.IsArrayType(input.Type) || TypeUtils.IsSeqType(input.Type))
                     {
-                        var seqName = TypeUtils.SeqSmtName(collName, input.Type);
+                        var seqName = TypeUtils.SeqSmtName(effectiveCollName, input.Type);
                         sizeGe2 = $"(>= (seq.len {seqName}) 2)";
                         sizeEq1 = $"(= (seq.len {seqName}) 1)";
                         sizeEq0 = $"(= (seq.len {seqName}) 0)";
@@ -2177,9 +2252,9 @@ class Program
                     else
                     {
                         // set/multiset/map use {name}_card
-                        sizeGe2 = $"(>= {collName}_card 2)";
-                        sizeEq1 = $"(= {collName}_card 1)";
-                        sizeEq0 = $"(= {collName}_card 0)";
+                        sizeGe2 = $"(>= {effectiveCollName}_card 2)";
+                        sizeEq1 = $"(= {effectiveCollName}_card 1)";
+                        sizeEq0 = $"(= {effectiveCollName}_card 0)";
                     }
                     var tiers = new List<(string label, List<string> cs)>
                     {
@@ -2193,7 +2268,7 @@ class Program
                     // forall j :: 0<=j<|a[i]| ==> P(a[i][j])).
                     if (TypeUtils.IsSupportedNestedSeqType(input.Type))
                     {
-                        var seqName = TypeUtils.SeqSmtName(collName, input.Type);
+                        var seqName = TypeUtils.SeqSmtName(effectiveCollName, input.Type);
                         var outerGe1 = $"(>= (seq.len {seqName}) 1)";
                         var innerLen0 = $"(seq.len (seq.nth {seqName} 0))";
                         tiers.Add(($"|{collName}[0]|>=2",
@@ -2296,19 +2371,24 @@ class Program
                 int effectiveRepeat = Math.Max(3, (int)Math.Ceiling((double)minTests / Math.Max(testCases.Count, 1)));
                 Console.WriteLine($"  Phase 3: repeats (up to {effectiveRepeat} per condition)");
 
-                var baseConditions = new List<(string baseLabel, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, string baseKey)>();
+                var baseConditions = new List<(string baseLabel, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, List<string> baseExtras, string baseKey)>();
                 var seenBaseKeys = new HashSet<string>();
-                foreach (var (label, literals, preLits, exclusions, _, _, _) in testSchedule)
+                foreach (var (label, literals, preLits, exclusions, extras, _, _) in testSchedule)
                 {
                     var baseKey = ScheduleKey(literals, exclusions, preLits);
                     if (seenBaseKeys.Add(baseKey))
                     {
                         var baseLabel = label.Contains("/B") ? label.Substring(0, label.IndexOf("/B")) : label;
-                        baseConditions.Add((baseLabel, literals, preLits, exclusions, baseKey));
+                        // Preserve tier extras (e.g. |a|>=2) but drop boundary-variant
+                        // extras: if the label contained /B, those extras are boundary
+                        // pins that must not propagate into repeats (they'd fix one
+                        // value, defeating the repeat's diversity purpose).
+                        var baseExtras = label.Contains("/B") ? new List<string>() : new List<string>(extras);
+                        baseConditions.Add((baseLabel, literals, preLits, exclusions, baseExtras, baseKey));
                     }
                 }
 
-                foreach (var (baseLabel, literals, preLits, exclusions, baseKey) in baseConditions)
+                foreach (var (baseLabel, literals, preLits, exclusions, baseExtras, baseKey) in baseConditions)
                 {
                     if (testCases.Count >= minTests || TimedOut()) break;
                     if (maxTests > 0 && testCases.Count >= maxTests) break;
@@ -2326,7 +2406,9 @@ class Program
                         if (testCases.Count >= minTests || TimedOut()) break;
                         if (maxTests > 0 && testCases.Count >= maxTests) break;
                         var repLabel = $"{baseLabel}/R{found + rep + 1}";
-                        var (repValues, _) = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, inputExclusions.ToList());
+                        var combinedExtras = new List<string>(baseExtras);
+                        combinedExtras.AddRange(inputExclusions);
+                        var (repValues, _) = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, combinedExtras);
                         if (repValues != null)
                         {
                             testCases.Add((repLabel, repValues, literals));
@@ -2363,20 +2445,21 @@ class Program
             // Repeat phase
             if (repeat > 1)
             {
-                var baseConditions = new List<(string baseLabel, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, string baseKey)>();
+                var baseConditions = new List<(string baseLabel, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, List<string> baseExtras, string baseKey)>();
                 var seenBaseKeys = new HashSet<string>();
 
-                foreach (var (label, literals, preLits, exclusions, _, _, _) in testSchedule)
+                foreach (var (label, literals, preLits, exclusions, extras, _, _) in testSchedule)
                 {
                     var baseKey = ScheduleKey(literals, exclusions, preLits);
                     if (seenBaseKeys.Add(baseKey))
                     {
                         var baseLabel = label.Contains("/B") ? label.Substring(0, label.IndexOf("/B")) : label;
-                        baseConditions.Add((baseLabel, literals, preLits, exclusions, baseKey));
+                        var baseExtras = label.Contains("/B") ? new List<string>() : new List<string>(extras);
+                        baseConditions.Add((baseLabel, literals, preLits, exclusions, baseExtras, baseKey));
                     }
                 }
 
-                foreach (var (baseLabel, literals, preLits, exclusions, baseKey) in baseConditions)
+                foreach (var (baseLabel, literals, preLits, exclusions, baseExtras, baseKey) in baseConditions)
                 {
                     if (TimedOut()) break;
                     if (maxTests > 0 && testCases.Count >= maxTests) break;
@@ -2390,7 +2473,9 @@ class Program
                     {
                         if (TimedOut() || (maxTests > 0 && testCases.Count >= maxTests)) break;
                         var repLabel = $"{baseLabel}/R{found + rep + 1}";
-                        var (repValues2, _) = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, inputExclusions.ToList());
+                        var combinedExtras = new List<string>(baseExtras);
+                        combinedExtras.AddRange(inputExclusions);
+                        var (repValues2, _) = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, combinedExtras);
                         if (repValues2 != null)
                         {
                             testCases.Add((repLabel, repValues2, literals));
