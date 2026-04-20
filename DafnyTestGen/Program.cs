@@ -1371,6 +1371,10 @@ class Program
         }
 
         // Helper: build baseline (Phase 1) schedule entries — one per (pi, ci), no pins.
+        // (pi, ci) pairs whose clause was already solved via an embedded relevance query.
+        // BuildScheduleEntries skips these so we don't duplicate the per-clause test.
+        var coveredByRelevance = new HashSet<(int pi, int ci)>();
+
         void BuildScheduleEntries(
             List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule)
         {
@@ -1384,6 +1388,7 @@ class Program
 
                 for (int ci = 0; ci < dnfExprs.Count; ci++)
                 {
+                    if (coveredByRelevance.Contains((pi, ci))) continue;
                     var clause = dnfExprs[ci];
                     var label = $"{fullPreLabel}{{{ci + 1}}}";
                     int simpleMask = 1 << ci;
@@ -2057,6 +2062,71 @@ class Program
             // so we solve them all directly — no tier escalation needed.
             Console.WriteLine($"  Phase 1: {n} {(usedFdnf ? "FDNF" : "DNF")} clauses");
 
+            // Per-clause relevance pass (embedded in Phase 1): for each clause, first try
+            // a dual-output relevance query that forces Z3 to pick an ins where the last
+            // literal actually bites. SAT → use that test and mark the (pi,ci) covered so
+            // the plain clause query is skipped. Unsat/unknown/skipped → fall through to
+            // the plain query emitted by BuildScheduleEntries.
+            int relAdded = 0, relUnsat = 0, relSkipped = 0;
+            if (RelevanceCheckEnabled && !TimedOut())
+            {
+                for (int pi = 0; pi < preCombinations.Count; pi++)
+                {
+                    if (TimedOut()) break;
+                    var (preLabel, preLits, preExclusions) = preCombinations[pi];
+                    var fullPreLits = new List<Expression>(preLits);
+                    foreach (var excl in preExclusions) fullPreLits.Add(DnfEngine.Negate(excl));
+                    var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
+                    for (int ci = 0; ci < dnfExprs.Count; ci++)
+                    {
+                        if (TimedOut()) break;
+                        if (maxTests > 0 && testCases.Count >= maxTests) break;
+                        var clause = dnfExprs[ci];
+                        if (!IsSafeRelevanceCandidate(clause, inputs, outputs, mutableNames))
+                        { relSkipped++; continue; }
+                        var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}/Rel";
+                        var smt = SmtTranslator.BuildRelevanceQuery(
+                            inputs, outputs, fullPreLits, clause, method, mutableNames);
+                        if (smt == null) { relSkipped++; continue; }
+                        if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel}...");
+                        var z3Result = await Z3Runner.RunZ3(z3Path, smt);
+                        var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
+                        if (lines.Any(l => l == "sat"))
+                        {
+                            var values = TypeUtils.ParseZ3Model(z3Result, allVars);
+                            if (values.Count > 0)
+                            {
+                                var specSmt = SmtTranslator.BuildSmt2Query(
+                                    inputs, outputs, preClauses, dnfEnsures, method, false,
+                                    null, null, fullPreLits, mutableNames, skipBias: true);
+                                var uQuery = SmtTranslator.BuildUniquenessQuery(
+                                    specSmt, inputs, outputs, values, mutableNames);
+                                bool isUnique = false;
+                                if (!string.IsNullOrEmpty(uQuery) && !TimedOut())
+                                {
+                                    var uResult = await Z3Runner.RunZ3(z3Path, uQuery);
+                                    var uLines = uResult.Split('\n').Select(l => l.Trim()).ToList();
+                                    isUnique = uLines.Any(l => l == "unsat");
+                                    bool isUnknown = !isUnique && uLines.Any(l => l == "unknown");
+                                    values["__unique__"] = (isUnique || (isUnknown && TrustUnknownUniqueness)) ? "true" : "false";
+                                }
+                                testCases.Add((clauseLabel, values, clause));
+                                coveredByRelevance.Add((pi, ci));
+                                relAdded++;
+                                if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: SAT — added test case");
+                            }
+                        }
+                        else if (lines.Any(l => l == "unsat"))
+                        {
+                            relUnsat++;
+                            if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: UNSAT (last literal redundant)");
+                        }
+                    }
+                }
+                if (relAdded > 0 || relUnsat > 0 || relSkipped > 0)
+                    Console.WriteLine($"  Relevance: {relAdded} clause(s) solved via relevance, {relUnsat} redundant, {relSkipped} skipped");
+            }
+
             BuildScheduleEntries(testSchedule);
 
             // Phase 1 extras: for any array/seq input referenced inside a pre- or post-
@@ -2182,70 +2252,6 @@ class Program
 
             if (!verbose) Console.Write("\r                          \r"); // clear progress line
             Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
-
-            // --- Phase 1r: per-literal relevance check ---
-            // For each clause Q1 ∧ ... ∧ Qm, prove Q_last is non-redundant by finding
-            // (ins, outs1, outs2) with outs1 satisfying full clause, outs2 satisfying
-            // clause minus Q_last with ¬Q_last, and outs1 ≠ outs2. Forces Z3 to pick an
-            // ins where Q_last actually bites (e.g., arr containing duplicates of elem).
-            if (RelevanceCheckEnabled && !TimedOut())
-            {
-                int relAdded = 0, relUnsat = 0, relSkipped = 0;
-                for (int pi = 0; pi < preCombinations.Count; pi++)
-                {
-                    if (TimedOut()) break;
-                    var (preLabel, preLits, preExclusions) = preCombinations[pi];
-                    var fullPreLits = new List<Expression>(preLits);
-                    foreach (var excl in preExclusions) fullPreLits.Add(DnfEngine.Negate(excl));
-                    var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
-                    for (int ci = 0; ci < dnfExprs.Count; ci++)
-                    {
-                        if (TimedOut()) break;
-                        if (maxTests > 0 && testCases.Count >= maxTests) break;
-                        var clause = dnfExprs[ci];
-                        if (!IsSafeRelevanceCandidate(clause, inputs, outputs, mutableNames))
-                        { relSkipped++; continue; }
-                        var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}/Rel";
-                        var smt = SmtTranslator.BuildRelevanceQuery(
-                            inputs, outputs, fullPreLits, clause, method, mutableNames);
-                        if (smt == null) { relSkipped++; continue; }
-                        if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel}...");
-                        var z3Result = await Z3Runner.RunZ3(z3Path, smt);
-                        var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
-                        if (lines.Any(l => l == "sat"))
-                        {
-                            var values = TypeUtils.ParseZ3Model(z3Result, allVars);
-                            if (values.Count > 0)
-                            {
-                                var specSmt = SmtTranslator.BuildSmt2Query(
-                                    inputs, outputs, preClauses, dnfEnsures, method, false,
-                                    null, null, fullPreLits, mutableNames, skipBias: true);
-                                var uQuery = SmtTranslator.BuildUniquenessQuery(
-                                    specSmt, inputs, outputs, values, mutableNames);
-                                bool isUnique = false;
-                                if (!string.IsNullOrEmpty(uQuery) && !TimedOut())
-                                {
-                                    var uResult = await Z3Runner.RunZ3(z3Path, uQuery);
-                                    var uLines = uResult.Split('\n').Select(l => l.Trim()).ToList();
-                                    isUnique = uLines.Any(l => l == "unsat");
-                                    bool isUnknown = !isUnique && uLines.Any(l => l == "unknown");
-                                    values["__unique__"] = (isUnique || (isUnknown && TrustUnknownUniqueness)) ? "true" : "false";
-                                }
-                                testCases.Add((clauseLabel, values, clause));
-                                relAdded++;
-                                if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: SAT — added test case");
-                            }
-                        }
-                        else if (lines.Any(l => l == "unsat"))
-                        {
-                            relUnsat++;
-                            if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: UNSAT (last literal redundant)");
-                        }
-                    }
-                }
-                if (relAdded > 0 || relUnsat > 0 || relSkipped > 0)
-                    Console.WriteLine($"  Phase 1r: relevance ({relAdded} added, {relUnsat} redundant, {relSkipped} skipped)");
-            }
 
             HashSet<string> phase2Keys = new HashSet<string>();
             if (testCases.Count < minTests && (boundary || progressive)
