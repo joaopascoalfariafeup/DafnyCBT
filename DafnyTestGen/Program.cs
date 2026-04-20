@@ -10,7 +10,6 @@ class Program
     static bool TrustUnknownUniqueness = true;
     static int UniquenessRounds = 2;
     static bool RelevanceCheckEnabled = true;
-    static bool ForallDecompEnabled = true;
 
     static async Task<int> Main(string[] args)
     {
@@ -52,12 +51,10 @@ class Program
         noBiasOpt.AddAlias("-nb");
         var noRelevanceOpt = new Option<bool>("--no-relevance", "Disable per-literal relevance check (Phase 1r). Default: relevance ON.");
         noRelevanceOpt.AddAlias("-nr");
-        var noForallDecompOpt = new Option<bool>("--no-forall-decomp", "Disable collection size-tier decomposition for clauses containing forall. Default: decomposition ON.");
-        noForallDecompOpt.AddAlias("-nfd");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noForallDecompOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -89,9 +86,6 @@ class Program
             RelevanceCheckEnabled = relevanceEnabled;
             if (!relevanceEnabled)
                 Console.WriteLine("[DafnyTestGen] Relevance check (Phase 1r): OFF");
-            ForallDecompEnabled = !ctx.ParseResult.GetValueForOption(noForallDecompOpt);
-            if (!ForallDecompEnabled)
-                Console.WriteLine("[DafnyTestGen] Forall size-tier decomposition: OFF");
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
             var z3Path = Z3Runner.FindZ3Path(z3PathCli);
@@ -1565,7 +1559,6 @@ class Program
 
                     foreach (var (vname, vtype) in inputs)
                     {
-                        if (mutableNames.Contains(vname)) continue;
                         EmitCats(vname, vtype, BoundaryAnalysis.VarKind.Input);
                     }
                     foreach (var (vname, vtype) in outputs)
@@ -2248,127 +2241,6 @@ class Program
             }
 
             BuildScheduleEntries(testSchedule);
-
-            // Phase 1 extras: for any array/seq input referenced inside a pre- or post-
-            // quantifier (forall/exists, directly or via inlined predicate), force explicit
-            // size={0, 1, ≥2} variants. Z3 naturally minimizes collection length, so without
-            // these, a forall-bearing postcondition like
-            //     forall i :: 0 <= i < a.Length - 1 ==> a[i] <= a[i+1]
-            // would only ever be exercised on length ≤ 1 inputs (vacuously true), missing
-            // the non-trivial case.
-            var quantifiedCollections = new HashSet<string>();
-            // Inlinable predicates whose body contains a quantifier — calls to these
-            // hide a forall/exists and must be treated as quantified for this detection.
-            var quantifiedPredicates = inlinablePredicates == null
-                ? new HashSet<string>()
-                : new HashSet<string>(inlinablePredicates
-                    .Where(p => p.body.Contains("forall") || p.body.Contains("exists"))
-                    .Select(p => p.name));
-            foreach (var expr in preClauses.Concat(dnfEnsures))
-            {
-                var s = DnfEngine.ExprToString(expr);
-                bool hasQuant = s.Contains("forall") || s.Contains("exists")
-                    || quantifiedPredicates.Any(p => Regex.IsMatch(s, @"\b" + Regex.Escape(p) + @"\b"));
-                if (!hasQuant) continue;
-                foreach (var (name, type) in inputs.Concat(outputs))
-                {
-                    if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type)
-                        && !TypeUtils.IsSetType(type) && !TypeUtils.IsMultisetType(type)
-                        && !TypeUtils.IsMapType(type)) continue;
-                    if (Regex.IsMatch(s, @"\b" + Regex.Escape(name) + @"\b"))
-                        quantifiedCollections.Add(name);
-                }
-            }
-
-            if (quantifiedCollections.Count > 0 && ForallDecompEnabled)
-            {
-                foreach (var collName in quantifiedCollections)
-                {
-                    var inputOrOutput = inputs.Concat(outputs).First(v => v.Name == collName);
-                    var input = inputOrOutput; // local alias; may be an output too
-                    // Mutable collections: pin the pre-state size (SMT name {name}_pre_seq).
-                    // Using the plain name yields `(seq.len a_seq)` which Z3 treats as a free
-                    // phantom var — the constraint has no effect on the actual `a_pre_seq`.
-                    var effectiveCollName = mutableNames.Contains(collName) ? collName + "_pre" : collName;
-                    string sizeGe2, sizeEq1, sizeEq0;
-                    if (TypeUtils.IsArrayType(input.Type) || TypeUtils.IsSeqType(input.Type))
-                    {
-                        var seqName = TypeUtils.SeqSmtName(effectiveCollName, input.Type);
-                        sizeGe2 = $"(>= (seq.len {seqName}) 2)";
-                        sizeEq1 = $"(= (seq.len {seqName}) 1)";
-                        sizeEq0 = $"(= (seq.len {seqName}) 0)";
-                    }
-                    else
-                    {
-                        // set/multiset/map use {name}_card
-                        sizeGe2 = $"(>= {effectiveCollName}_card 2)";
-                        sizeEq1 = $"(= {effectiveCollName}_card 1)";
-                        sizeEq0 = $"(= {effectiveCollName}_card 0)";
-                    }
-                    var tiers = new List<(string label, List<string> cs)>
-                    {
-                        ($"|{collName}|>=2", new List<string> { sizeGe2 }),
-                        ($"|{collName}|=1",  new List<string> { sizeEq1 }),
-                        ($"|{collName}|=0",  new List<string> { sizeEq0 }),
-                    };
-                    // Nested seq<seq<T>> / seq<string>: also tier inner length at index 0,
-                    // guarded by outer non-empty. Without this, Z3 picks empty inner seqs
-                    // to vacuously satisfy nested forall (e.g. forall i :: 0<=i<|a| ==>
-                    // forall j :: 0<=j<|a[i]| ==> P(a[i][j])).
-                    if (TypeUtils.IsSupportedNestedSeqType(input.Type))
-                    {
-                        var seqName = TypeUtils.SeqSmtName(effectiveCollName, input.Type);
-                        var outerGe1 = $"(>= (seq.len {seqName}) 1)";
-                        var innerLen0 = $"(seq.len (seq.nth {seqName} 0))";
-                        tiers.Add(($"|{collName}[0]|>=2",
-                            new List<string> { outerGe1, $"(>= {innerLen0} 2)" }));
-                        tiers.Add(($"|{collName}[0]|=1",
-                            new List<string> { outerGe1, $"(= {innerLen0} 1)" }));
-                        tiers.Add(($"|{collName}[0]|=0",
-                            new List<string> { outerGe1, $"(= {innerLen0} 0)" }));
-                    }
-                    var collPattern = @"\b" + Regex.Escape(collName) + @"\b";
-                    bool LitHasPositiveForall(Expression lit)
-                    {
-                        var k = DnfEngine.ExprToString(lit);
-                        if (k.StartsWith("!")) return false;
-                        if (!Regex.IsMatch(k, collPattern)) return false;
-                        if (k.Contains("forall")) return true;
-                        // Hidden behind an inlinable predicate whose body uses forall.
-                        return quantifiedPredicates.Any(p =>
-                            Regex.IsMatch(k, @"\b" + Regex.Escape(p) + @"\b")
-                            && inlinablePredicates!.First(ip => ip.name == p).body.Contains("forall"));
-                    }
-                    for (int pi = 0; pi < preCombinations.Count; pi++)
-                    {
-                        var (preLabel, preLits, preExclusions) = preCombinations[pi];
-                        var fullPreLits = new List<Expression>(preLits);
-                        foreach (var excl in preExclusions)
-                            fullPreLits.Add(DnfEngine.Negate(excl));
-                        var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
-                        // Requires-side forall on this collection applies to every ensures clause.
-                        bool preHasPositiveForall = preLits.Any(LitHasPositiveForall);
-                        for (int ci = 0; ci < dnfExprs.Count; ci++)
-                        {
-                            var clause = dnfExprs[ci];
-                            // Expand size tiers for clauses that contain a positive forall
-                            // referencing this collection, OR when a requires-side forall
-                            // references it (applies to every ensures clause). Negated-forall
-                            // cases are already structurally decomposed via the exists 4-case
-                            // split, so clause-level check skips negated literals.
-                            bool hasPositiveForall = preHasPositiveForall || clause.Any(LitHasPositiveForall);
-                            if (!hasPositiveForall) continue;
-                            int simpleMask = 1 << ci;
-                            var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}";
-                            foreach (var (tLabel, tCs) in tiers)
-                            {
-                                testSchedule.Add(($"{clauseLabel}/Q{tLabel}",
-                                    clause, fullPreLits, new List<Expression>(), tCs, simpleMask, pi));
-                            }
-                        }
-                    }
-                }
-            }
 
             await SolveRange(testSchedule, 0, testSchedule.Count, testSchedule.Count,
                 testCases, baseConditionExclusions, knownUnsatLiteralMasks,

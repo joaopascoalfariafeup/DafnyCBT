@@ -190,7 +190,7 @@ static class BoundaryAnalysis
             VarKind kind)
     {
         var result = new List<(string, List<string>, string?)>();
-        // Skip mutables as inputs here — their mutation tiers are handled separately.
+        // Mutable inputs use _pre suffix for the pre-state SMT name.
         string smtScalar = kind == VarKind.MutablePost ? $"{varName}_post"
             : (kind == VarKind.Input && mutableNames.Contains(varName)) ? $"{varName}_pre"
             : varName;
