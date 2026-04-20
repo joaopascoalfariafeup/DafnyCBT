@@ -894,6 +894,8 @@ static class TestValidator
                 var escName = Regex.Escape(varName);
                 bool hasEq = Regex.IsMatch(result, $@"^[ \t]*expect\s+{escName}\s*(\[\.\.\])?\s*==", RegexOptions.Multiline);
                 if (hasEq) continue;
+                bool hasBool = Regex.IsMatch(result, $@"^[ \t]*expect\s+!?{escName}\s*;", RegexOptions.Multiline);
+                if (hasBool) continue;
                 // Inject before the closing brace of the test block. The test block is the
                 // nearest `}` after the method call line for this test. Use a regex that
                 // finds the first `  }` after an `expect` line and inserts above it.

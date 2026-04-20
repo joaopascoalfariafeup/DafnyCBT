@@ -1768,10 +1768,44 @@ class Program
                         {
                             if (verbose)
                                 Console.WriteLine($"  Combination {solveLabel}: SAT (retry) - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                            values["__z3_fallback__"] = $"drop_exists:{existsLits.Count}";
                             return (values, false);
                         }
                     }
                     if (verbose) Console.WriteLine($"  Combination {solveLabel}: still unknown after exists-retry");
+                }
+                // No-bias retry: soft-asserts + quantifiers often cause UNKNOWN in Z3 optimize module.
+                // Retry with bias off — only meaningful if clause contains quantifiers and bias is on.
+                bool hasQuantifier = lits.Any(l => { var k = EKey(l); return k.Contains("forall ") || k.Contains("exists "); });
+                if (!TimedOut() && hasQuantifier && SmtTranslator.AntiTrivialBiasEnabled)
+                {
+                    if (verbose) Console.WriteLine($"  Combination {solveLabel}: retrying with bias off (quantifier present)...");
+                    var smtNb = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, verbose, excl, extra, preLits, mutableNames, skipBias: true);
+                    if (verbose)
+                    {
+                        Console.WriteLine($"  [DEBUG] No-bias SMT2 query for {solveLabel}:");
+                        Console.WriteLine(smtNb);
+                    }
+                    var resultNb = await Z3Runner.RunZ3(z3Path, smtNb);
+                    if (verbose)
+                        Console.WriteLine($"  [DEBUG] No-bias Z3 output: {resultNb.Substring(0, Math.Min(resultNb.Length, 500))}");
+                    var resultLinesNb = resultNb.Split('\n').Select(l => l.Trim()).ToList();
+                    if (resultLinesNb.Any(l => l == "sat"))
+                    {
+                        var values = TypeUtils.ParseZ3Model(resultNb, allVars);
+                        if (values.Count > 0)
+                        {
+                            if (verbose)
+                                Console.WriteLine($"  Combination {solveLabel}: SAT (no-bias) - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                            return (values, false);
+                        }
+                    }
+                    if (resultLinesNb.Any(l => l == "unsat"))
+                    {
+                        if (verbose) Console.WriteLine($"  Combination {solveLabel}: UNSAT with bias off (skipping)");
+                        return (null, true);
+                    }
+                    if (verbose) Console.WriteLine($"  Combination {solveLabel}: still unknown with bias off");
                 }
                 // Final fallback: try input-only query (no postconditions)
                 if (!TimedOut())
@@ -1794,6 +1828,7 @@ class Program
                         {
                             if (verbose)
                                 Console.WriteLine($"  Combination {solveLabel}: SAT (input-only) - found test inputs: {string.Join(", ", values.Select(kv => $"{kv.Key}={kv.Value}"))}");
+                            values["__z3_fallback__"] = "input_only";
                             return (values, false);
                         }
                     }

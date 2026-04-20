@@ -746,6 +746,22 @@ static class TestEmitter
         foreach (var (label, values, literals) in testCases)
         {
             sb.AppendLine($"  // Test case for combination {label}:");
+            if (values.TryGetValue("__z3_fallback__", out var fbTag))
+            {
+                if (fbTag == "input_only")
+                {
+                    sb.AppendLine("  //   NOTE: Z3 returned UNKNOWN on full query (likely quantifier incompleteness).");
+                    sb.AppendLine("  //         Inputs chosen from preconditions-only fallback; postconditions NOT verified by Z3.");
+                    sb.AppendLine("  //         Expected output values may be spurious — Dafny static check will flag if so.");
+                }
+                else if (fbTag.StartsWith("drop_exists"))
+                {
+                    var parts = fbTag.Split(':');
+                    var n = parts.Length > 1 ? parts[1] : "?";
+                    sb.AppendLine($"  //   NOTE: Z3 returned UNKNOWN on full query; retry dropped {n} exists-quantified postcondition(s).");
+                    sb.AppendLine("  //         Remaining literals still checked; dropped literal(s) not verified by Z3.");
+                }
+            }
 
             // Show the test condition as a comment (skip spec-only literals like fresh())
             foreach (var pre in preClauses)
