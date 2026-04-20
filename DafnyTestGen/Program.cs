@@ -10,6 +10,7 @@ class Program
     static bool TrustUnknownUniqueness = true;
     static int UniquenessRounds = 2;
     static bool RelevanceCheckEnabled = true;
+    static bool ForallDecompEnabled = true;
 
     static async Task<int> Main(string[] args)
     {
@@ -51,10 +52,14 @@ class Program
         noBiasOpt.AddAlias("-nb");
         var noRelevanceOpt = new Option<bool>("--no-relevance", "Disable per-literal relevance check (Phase 1r). Default: relevance ON.");
         noRelevanceOpt.AddAlias("-nr");
+        var noForallDecompOpt = new Option<bool>("--no-forall-decomp", "Disable collection size-tier decomposition for clauses containing forall. Default: decomposition ON.");
+        noForallDecompOpt.AddAlias("-nfd");
+        var noExistsMultiOpt = new Option<bool>("--no-exists-multi", "Disable the 'multiple entries' clause in exists-decomposition (keep left/middle/right only). Default: multi ON.");
+        noExistsMultiOpt.AddAlias("-nem");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noForallDecompOpt, noExistsMultiOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -86,6 +91,12 @@ class Program
             RelevanceCheckEnabled = relevanceEnabled;
             if (!relevanceEnabled)
                 Console.WriteLine("[DafnyTestGen] Relevance check (Phase 1r): OFF");
+            ForallDecompEnabled = !ctx.ParseResult.GetValueForOption(noForallDecompOpt);
+            if (!ForallDecompEnabled)
+                Console.WriteLine("[DafnyTestGen] Forall size-tier decomposition: OFF");
+            DnfEngine.ExistsMultiEnabled = !ctx.ParseResult.GetValueForOption(noExistsMultiOpt);
+            if (!DnfEngine.ExistsMultiEnabled)
+                Console.WriteLine("[DafnyTestGen] Exists multi-entries clause: OFF");
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
             var z3Path = Z3Runner.FindZ3Path(z3PathCli);
@@ -2266,7 +2277,7 @@ class Program
                 }
             }
 
-            if (quantifiedCollections.Count > 0)
+            if (quantifiedCollections.Count > 0 && ForallDecompEnabled)
             {
                 foreach (var collName in quantifiedCollections)
                 {
