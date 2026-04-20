@@ -899,7 +899,10 @@ static class TestValidator
                 // Inject before the closing brace of the test block. The test block is the
                 // nearest `}` after the method call line for this test. Use a regex that
                 // finds the first `  }` after an `expect` line and inserts above it.
-                var inject = $"    expect {varName} == {value}; // observed from implementation";
+                var lhs = (arrayOutputNames != null && arrayOutputNames.Contains(varName))
+                    ? $"{varName}[..]"
+                    : varName;
+                var inject = $"    expect {lhs} == {value}; // observed from implementation";
                 // Test-block body (from CheckAndSplitTests) starts after `  {\n` and ends
                 // BEFORE `  }` — so it does NOT include the closing brace. We append the
                 // injected line after the last `expect ...;` line.
