@@ -13,10 +13,6 @@ static class DnfEngine
     /// Sets the mode: DNF (default) or FDNF. 
     internal static bool UseFdnf { get; set; } = false;
 
-    /// <summary>When true, exists-decomposition emits the "multiple entries" clause.</summary>
-    internal static bool ExistsMultiEnabled { get; set; } = true;
-
-
     /// <summary>
     /// Decomposes a Dafny expression into Disjunctive Normal Form (DNF) or Full DNF (FDNF),
     /// depending on the UseFdnf flag. This is a wrapper around the dual-returning version that
@@ -760,21 +756,6 @@ static class DnfEngine
             new List<Expression> { middleExpr },
             new List<Expression> { rangeGuard, rightProp },
         };
-
-        if (ExistsMultiEnabled)
-        {
-            // Clause 4: multiple entries satisfying the property
-            // exists i, i_2 :: effLo <= i < i_2 <= effHi && property(i) && property(i_2)
-            // This forces at least two distinct positions satisfying the property.
-            var varName = boundVar.Name;
-            var var2Name = varName + "_2";
-            var property2 = SubstituteVar(property, varName, ParseToLeafExpression(var2Name));
-            var multiStr = $"exists {varName}, {var2Name} | " +
-                $"{ExprToString(effectiveLo)} <= {varName} && {varName} < {var2Name} && {var2Name} <= {ExprToString(effectiveHi)} :: " +
-                $"({ExprToString(property)}) && ({ExprToString(property2)})";
-            var multiExpr = ParseToLeafExpression(multiStr);
-            clauses.Add(new List<Expression> { multiExpr });
-        }
 
         return clauses;
     }

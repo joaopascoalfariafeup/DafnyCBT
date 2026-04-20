@@ -54,12 +54,10 @@ class Program
         noRelevanceOpt.AddAlias("-nr");
         var noForallDecompOpt = new Option<bool>("--no-forall-decomp", "Disable collection size-tier decomposition for clauses containing forall. Default: decomposition ON.");
         noForallDecompOpt.AddAlias("-nfd");
-        var noExistsMultiOpt = new Option<bool>("--no-exists-multi", "Disable the 'multiple entries' clause in exists-decomposition (keep left/middle/right only). Default: multi ON.");
-        noExistsMultiOpt.AddAlias("-nem");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noForallDecompOpt, noExistsMultiOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noForallDecompOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -94,9 +92,6 @@ class Program
             ForallDecompEnabled = !ctx.ParseResult.GetValueForOption(noForallDecompOpt);
             if (!ForallDecompEnabled)
                 Console.WriteLine("[DafnyTestGen] Forall size-tier decomposition: OFF");
-            DnfEngine.ExistsMultiEnabled = !ctx.ParseResult.GetValueForOption(noExistsMultiOpt);
-            if (!DnfEngine.ExistsMultiEnabled)
-                Console.WriteLine("[DafnyTestGen] Exists multi-entries clause: OFF");
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
             var z3Path = Z3Runner.FindZ3Path(z3PathCli);
@@ -2187,6 +2182,14 @@ class Program
                         var safeIndices = GetSafeRelevanceIndices(clause, inputs, outputs, mutableNames);
                         if (safeIndices.Count == 0) { relSkipped++; continue; }
                         var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}/Rel";
+                        if (testCases.Count > 0 &&
+                            await IsAlreadyCovered(clause, fullPreLits, new List<Expression>(), new List<string>(), testCases))
+                        {
+                            coveredByRelevance.Add((pi, ci));
+                            relSkipped++;
+                            if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: skipped (subsumed by prior test)");
+                            continue;
+                        }
                         var smt = SmtTranslator.BuildRelevanceQuery(
                             inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices);
                         if (smt == null) { relSkipped++; continue; }
