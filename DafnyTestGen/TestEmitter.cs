@@ -684,13 +684,16 @@ static class TestEmitter
         ClassInfo? classInfo = null,
         List<(string name, List<string> paramNames, string body, bool isClassMember)>? inlinablePredicates = null,
         Dictionary<string, string>? specExpects = null,
-        bool isBodyless = false)
+        bool isBodyless = false,
+        bool preOnlyMode = false)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("// Auto-generated test cases by DafnyTestGen");
         sb.AppendLine($"// Source: {filePath}");
         sb.AppendLine($"// Method: {methodName}");
         sb.AppendLine($"// Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        if (preOnlyMode)
+            sb.AppendLine($"// PRE-ONLY MODE: postconditions ignored — only preconditions and runtime crashes are checked.");
         sb.AppendLine();
 
         // Include original source, removing 'ghost' from fields, constants, functions, and predicates
@@ -745,7 +748,10 @@ static class TestEmitter
 
         foreach (var (label, values, literals) in testCases)
         {
-            sb.AppendLine($"  // Test case for combination {label}:");
+            var displayLabel = preOnlyMode ? $"{label}/PreOnly" : label;
+            sb.AppendLine($"  // Test case for combination {displayLabel}:");
+            if (preOnlyMode)
+                sb.AppendLine("  //   PRE-ONLY: postconditions not enforced (Z3 timeout on full spec).");
             if (values.TryGetValue("__z3_fallback__", out var fbTag))
             {
                 if (fbTag == "input_only")
@@ -1231,11 +1237,13 @@ static class TestEmitter
 
             // Emit precondition checks only for preconditions that could NOT be translated to SMT
             // (e.g., recursive predicates). Translated preconditions are already guaranteed by Z3.
+            // In preOnlyMode, Z3 may have trusted uninterpreted predicates; emit PRE-CHECK for all
+            // preconds so runtime can SKIP tests whose ins violate them.
             foreach (var pre in preClauses)
             {
                 var preStr = DnfEngine.ExprToString(pre);
                 if (TypeUtils.IsSpecOnlyLiteral(preStr)) continue; // skip fresh(), etc.
-                if (SmtTranslator._translatedPreConditions.Contains(preStr)) continue; // Z3 guarantees this
+                if (!preOnlyMode && SmtTranslator._translatedPreConditions.Contains(preStr)) continue; // Z3 guarantees this
                 // For class methods: replace field refs with obj.field, predicates with obj.pred
                 if (classInfo != null)
                 {
@@ -1859,5 +1867,70 @@ static class TestEmitter
         sb.AppendLine("}");
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Feature B: post-processes a test file, wrapping each surviving `expect COND;` line
+    /// with an if-print-expect block so failing expects print runtime values instead of
+    /// the generic Dafny "expectation violation" error. Preserves trailing comments.
+    /// Idempotent-ish: skips `expect false;` / `expect true;` and already-commented lines.
+    /// Must run as the LAST post-processing step (after TestValidator's value injection),
+    /// since wrapping changes line structure and breaks regex-based expect rewrites.
+    /// </summary>
+    public static string WrapExpectsWithDiagnostics(string code)
+    {
+        var sb = new System.Text.StringBuilder();
+        var lineRe = new Regex(@"^([ \t]*)expect\s+(.+?)\s*;\s*(//.*)?\s*$");
+        foreach (var raw in code.Split('\n'))
+        {
+            var line = raw.TrimEnd('\r');
+            var m = lineRe.Match(line);
+            if (!m.Success) { sb.AppendLine(line); continue; }
+            var indent = m.Groups[1].Value;
+            var cond = m.Groups[2].Value.Trim();
+            var trailing = m.Groups[3].Value;
+            // Skip trivial booleans and already-rewritten `expect false;` inside our own wraps
+            if (cond == "false" || cond == "true") { sb.AppendLine(line); continue; }
+            int eqPos = FindTopLevelDoubleEquals(cond);
+            var escCond = cond.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            string printStmt;
+            if (eqPos > 0)
+            {
+                var lhs = cond.Substring(0, eqPos).Trim();
+                var rhs = cond.Substring(eqPos + 2).Trim();
+                printStmt = $"print \"FAIL: expected {escCond}; got LHS=\", {lhs}, \", RHS=\", {rhs}, \"\\n\";";
+            }
+            else
+            {
+                printStmt = $"print \"FAIL: {escCond}\\n\";";
+            }
+            sb.AppendLine($"{indent}if (!({cond})) {{");
+            sb.AppendLine($"{indent}  {printStmt}");
+            var tail = string.IsNullOrEmpty(trailing) ? "" : " " + trailing;
+            sb.AppendLine($"{indent}  expect false;{tail}");
+            sb.AppendLine($"{indent}}}");
+        }
+        return sb.ToString();
+    }
+
+    // Locates the first top-level `==` position in a Dafny expression string.
+    // Rejects `==>`, `<==`, `<==>`, and `===`. Returns -1 if none found.
+    private static int FindTopLevelDoubleEquals(string s)
+    {
+        int depth = 0;
+        for (int i = 0; i + 1 < s.Length; i++)
+        {
+            char c = s[i];
+            if (c == '(' || c == '[' || c == '{') depth++;
+            else if (c == ')' || c == ']' || c == '}') depth--;
+            else if (depth == 0 && c == '=' && s[i + 1] == '=')
+            {
+                char prev = i > 0 ? s[i - 1] : ' ';
+                char next = i + 2 < s.Length ? s[i + 2] : ' ';
+                if (prev == '<' || prev == '=' || next == '>' || next == '=') continue;
+                return i;
+            }
+        }
+        return -1;
     }
 }

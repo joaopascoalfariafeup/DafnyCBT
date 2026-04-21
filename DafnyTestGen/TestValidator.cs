@@ -148,6 +148,9 @@ static class TestValidator
             var skippedIds = ParseSkipMarkers(batchOut);
             var capturedVals = ParseValMarkers(batchOut);
             var capturedRhsVals = ParseRhsValMarkers(batchOut);
+            var capturedExpVals = ParseExpValMarkers(batchOut);
+            var capturedOuts = ParseOutMarkers(batchOut);
+            var stderrByTestId = new Dictionary<int, string>();
             var wrongValIds = new HashSet<int>();
             ParseWrongValMarkers(batchOut, wrongValIds);
 
@@ -168,8 +171,10 @@ static class TestValidator
 
                 foreach (var idx in incompleteIds.OrderBy(x => x))
                 {
-                    var (reExited, reCode, reOut, _) = await RunProcess(
+                    var (reExited, reCode, reOut, reErr) = await RunProcess(
                         runExe, $"{runArgs} {idx}".Trim(), SingleRunTimeoutMs);
+                    if (!string.IsNullOrWhiteSpace(reErr))
+                        stderrByTestId[idx] = reErr.Trim();
 
                     if (!reExited)
                     {
@@ -202,6 +207,22 @@ static class TestValidator
                             foreach (var (k, v) in vars)
                                 capturedRhsVals[id][k] = v;
                         }
+                        var reExpVals = ParseExpValMarkers(reOut);
+                        foreach (var (id, entries) in reExpVals)
+                        {
+                            if (!capturedExpVals.ContainsKey(id))
+                                capturedExpVals[id] = new Dictionary<int, ExpValRecord>();
+                            foreach (var (k, v) in entries)
+                                capturedExpVals[id][k] = v;
+                        }
+                        var reOuts = ParseOutMarkers(reOut);
+                        foreach (var (id, vars) in reOuts)
+                        {
+                            if (!capturedOuts.ContainsKey(id))
+                                capturedOuts[id] = new Dictionary<string, string>();
+                            foreach (var (k, v) in vars)
+                                capturedOuts[id][k] = v;
+                        }
                         ParseWrongValMarkers(reOut, wrongValIds);
                     }
                 }
@@ -227,24 +248,30 @@ static class TestValidator
                     var annotatedBody = AnnotateFailingExpects(
                         body,
                         capturedVals.GetValueOrDefault(i),
-                        capturedRhsVals.GetValueOrDefault(i));
+                        capturedRhsVals.GetValueOrDefault(i),
+                        capturedExpVals.GetValueOrDefault(i));
+                    annotatedBody = InjectRuntimeInfo(
+                        annotatedBody,
+                        capturedOuts.GetValueOrDefault(i),
+                        stderrByTestId.GetValueOrDefault(i),
+                        failing: true);
                     classified.Add((comment, annotatedBody, src, true));
                     failingCount++;
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: FAIL");
                 }
                 else if (wrongValIds.Contains(i))
                 {
-                    classified.Add((comment,
-                        InjectCapturedValues(body, i, capturedVals, arrayOutputNames, forceReplace: true),
-                        src, false));
+                    var injected = InjectCapturedValues(body, i, capturedVals, arrayOutputNames, forceReplace: true);
+                    injected = InjectRuntimeInfo(injected, capturedOuts.GetValueOrDefault(i), null, failing: false);
+                    classified.Add((comment, injected, src, false));
                     passingCount++;
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS (rescued — Z3 value corrected by runtime)");
                 }
                 else
                 {
-                    classified.Add((comment,
-                        InjectCapturedValues(body, i, capturedVals, arrayOutputNames),
-                        src, false));
+                    var injected = InjectCapturedValues(body, i, capturedVals, arrayOutputNames);
+                    injected = InjectRuntimeInfo(injected, capturedOuts.GetValueOrDefault(i), null, failing: false);
+                    classified.Add((comment, injected, src, false));
                     passingCount++;
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS");
                 }
@@ -431,6 +458,8 @@ static class TestValidator
         var capturedOutputs = new HashSet<string>();
         // Track if any expects use Z3 concrete values (simple literals) for output variables
         bool hasConcreteOutputExpects = false;
+        // Per-expect index (same ordering used by AnnotateFailingExpects)
+        int expectIdx = 0;
         var result = Regex.Replace(body,
             @"^(\s*)expect (.+);(?: // PRE-CHECK)?",
             m =>
@@ -442,6 +471,8 @@ static class TestValidator
                 // Strip any trailing comment from the expression
                 var expr = Regex.Replace(exprAndComment, @"\s*//.*$", "").TrimEnd();
 
+                int thisIdx = expectIdx++;
+
                 if (isPreCheck)
                 {
                     // Precondition check: if violated, print SKIP and return early
@@ -449,6 +480,7 @@ static class TestValidator
                 }
 
                 var checkLine = $"{indent}CheckExpect({expr}, {testId});";
+                var expvPrefix = BuildExpValPrints(expr, testId, thisIdx, indent);
 
                 // Detect `var == ExprWithFuncCall` and emit VAL print for the variable.
                 // Only for output vars — immutable inputs are already pinned at declaration,
@@ -462,7 +494,7 @@ static class TestValidator
                 if (valPrint != null)
                 {
                     capturedOutputs.Add(lhsEqMatch.Groups[1].Value);
-                    return valPrint + "\n" + checkLine;
+                    return (expvPrefix ?? "") + valPrint + "\n" + checkLine;
                 }
 
                 // For output == simple_literal (Z3 concrete value), always capture VAL
@@ -487,7 +519,7 @@ static class TestValidator
                         valLine = $"{indent}print \"VAL:{testId}:{outName}=\", {outName}, \"\\n\";";
                     // Use CheckZ3Value (WRONGVAL) instead of CheckExpect (FAIL)
                     var z3CheckLine = $"{indent}CheckZ3Value({expr}, {testId});";
-                    return valLine + "\n" + z3CheckLine;
+                    return (expvPrefix ?? "") + valLine + "\n" + z3CheckLine;
                 }
 
                 // For mutable array post-state: name[..] == literal or name[..N] == literal
@@ -501,12 +533,69 @@ static class TestValidator
                     var arrName = arrEqMatch.Groups[1].Value;
                     var valLine = $"{indent}print \"VAL:{testId}:{arrName}=\", {arrName}[..], \"\\n\";";
                     var z3CheckLine = $"{indent}CheckZ3Value({expr}, {testId});";
-                    return valLine + "\n" + z3CheckLine;
+                    return (expvPrefix ?? "") + valLine + "\n" + z3CheckLine;
                 }
 
-                return checkLine;
+                return (expvPrefix ?? "") + checkLine;
             },
             RegexOptions.Multiline);
+
+        // Emit OUT:testId:VarName=value prints for every local variable declared
+        // in the test body. Captured values become post-method-call comments in
+        // both passing and failing tests, so the user can see what the implementation
+        // produced. Inserted right before the first expect/CheckExpect line.
+        {
+            var arrayLocals = new HashSet<string>();
+            foreach (Match m in Regex.Matches(result, @"^\s*var\s+(\w+)\s*:=\s*new\s+\w+\s*\[", RegexOptions.Multiline))
+                arrayLocals.Add(m.Groups[1].Value);
+
+            var declaredVars = new List<string>();
+            var seen = new HashSet<string>();
+            foreach (Match m in Regex.Matches(result, @"^\s*var\s+([\w,\s]+):=", RegexOptions.Multiline))
+            {
+                foreach (var raw in m.Groups[1].Value.Split(','))
+                {
+                    var name = raw.Trim();
+                    if (name.Length == 0) continue;
+                    if (name.StartsWith("old_")) continue;
+                    if (seen.Add(name)) declaredVars.Add(name);
+                }
+            }
+
+            if (declaredVars.Count > 0)
+            {
+                var outSb = new StringBuilder();
+                const string indent = "    ";
+                foreach (var name in declaredVars)
+                {
+                    bool isArray = arrayLocals.Contains(name)
+                        || (arrayOutputNames != null && arrayOutputNames.Contains(name));
+                    if (stringOutputNames != null && stringOutputNames.Contains(name))
+                        outSb.AppendLine($"{indent}print \"OUT:{testId}:{name}=[\"; for i := 0 to |{name}| {{ if i > 0 {{ print \", \"; }} print \"'\", [{name}[i]], \"'\"; }} print \"]\\n\";");
+                    else if (isArray)
+                        outSb.AppendLine($"{indent}print \"OUT:{testId}:{name}=\", {name}[..], \"\\n\";");
+                    else
+                        outSb.AppendLine($"{indent}print \"OUT:{testId}:{name}=\", {name}, \"\\n\";");
+                }
+
+                // Insert immediately before the first CheckExpect/CheckZ3Value/expect line,
+                // skipping PRE-CHECK-derived lines (which precede the method call).
+                // PRE-CHECK expects get rewritten to `if !(expr) { print "SKIP:...\n"; ... }`
+                // earlier in this method, so skip those by the SKIP: signature.
+                int insertIdx = -1;
+                foreach (Match m in Regex.Matches(result, @"^\s*(?:CheckExpect|CheckZ3Value|expect|if\s*!).*$", RegexOptions.Multiline))
+                {
+                    if (m.Value.Contains("// PRE-CHECK")) continue;
+                    if (m.Value.Contains("\"SKIP:")) continue;
+                    insertIdx = m.Index;
+                    break;
+                }
+                if (insertIdx >= 0)
+                    result = result.Insert(insertIdx, outSb.ToString());
+                else
+                    result += outSb.ToString();
+            }
+        }
 
         // For outputs referenced in non-== expects (e.g. "m in a[..]", "forall k :: ..."),
         // add VAL prints so their runtime values can be captured and injected as commented hints.
@@ -687,6 +776,62 @@ static class TestValidator
         || Regex.IsMatch(s, @"^\{.*\}$")        // set display
         || Regex.IsMatch(s, @"^multiset\{.*\}$"); // multiset display
 
+    /// <summary>
+    /// Emits EXV:testId:idx:LHS/RHS or EXV:testId:idx:COND print statements so that
+    /// failing-test annotation can show actual runtime values alongside commented-out expects.
+    /// Returns null for expressions that are unsafe to evaluate in compiled code
+    /// (old(), fresh(), unchanged()).
+    /// </summary>
+    static string? BuildExpValPrints(string expr, int testId, int expectIdx, string indent)
+    {
+        if (Regex.IsMatch(expr, @"\b(old|fresh|unchanged|allocated)\s*\(")) return null;
+        if (expr == "false" || expr == "true") return null;
+
+        int eqPos = FindTopLevelDoubleEquals(expr);
+        if (eqPos > 0)
+        {
+            var lhs = expr.Substring(0, eqPos).Trim();
+            var rhs = expr.Substring(eqPos + 2).Trim();
+            var sb = new StringBuilder();
+            if (!IsAmbiguousEmptyLit(lhs))
+                sb.AppendLine($"{indent}print \"EXV:{testId}:{expectIdx}:LHS=\", ({lhs}), \"\\n\";");
+            if (!IsAmbiguousEmptyLit(rhs))
+                sb.AppendLine($"{indent}print \"EXV:{testId}:{expectIdx}:RHS=\", ({rhs}), \"\\n\";");
+            return sb.Length == 0 ? null : sb.ToString();
+        }
+        return $"{indent}print \"EXV:{testId}:{expectIdx}:COND=\", ({expr}), \"\\n\";\n";
+    }
+
+    /// <summary>True for Dafny collection literals whose type cannot be inferred without context.</summary>
+    static bool IsAmbiguousEmptyLit(string s)
+    {
+        s = s.Trim();
+        return s == "[]" || s == "{}" || s == "multiset{}" || s == "map[]";
+    }
+
+    /// <summary>
+    /// Returns index of first top-level `==` in s (depth 0 w.r.t. parens/brackets/braces),
+    /// excluding `<=`, `>=`, `==>`, `===`. Returns -1 if none.
+    /// </summary>
+    static int FindTopLevelDoubleEquals(string s)
+    {
+        int depth = 0;
+        for (int i = 0; i + 1 < s.Length; i++)
+        {
+            char c = s[i];
+            if (c == '(' || c == '[' || c == '{') depth++;
+            else if (c == ')' || c == ']' || c == '}') depth--;
+            else if (depth == 0 && c == '=' && s[i + 1] == '=')
+            {
+                char prev = i > 0 ? s[i - 1] : ' ';
+                char next = i + 2 < s.Length ? s[i + 2] : ' ';
+                if (prev == '<' || prev == '=' || next == '>' || next == '=') continue;
+                return i;
+            }
+        }
+        return -1;
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Marker parsing
     // ─────────────────────────────────────────────────────────────────────────
@@ -750,31 +895,169 @@ static class TestValidator
     /// EmitSplitTests then comments the whole expect line out.
     /// </summary>
     static string AnnotateFailingExpects(string body,
-        Dictionary<string, string>? vals, Dictionary<string, string>? rhsVals)
+        Dictionary<string, string>? vals, Dictionary<string, string>? rhsVals,
+        Dictionary<int, ExpValRecord>? expVals = null)
     {
-        if ((vals == null || vals.Count == 0) && (rhsVals == null || rhsVals.Count == 0))
-            return body;
-        return Regex.Replace(body, @"^(\s*)expect\s+(\w+)\s*==\s*([^;]+);(?!\s*//)",
+        bool hasAny = (vals != null && vals.Count > 0)
+                      || (rhsVals != null && rhsVals.Count > 0)
+                      || (expVals != null && expVals.Count > 0);
+        if (!hasAny) return body;
+
+        // Iterate every expect in source order, assigning the same index used by
+        // ReplaceExpectsWithChecks. Prefer the simple-var substitution path when
+        // possible (produces a ready-to-uncomment concrete RHS); otherwise fall
+        // back to EXV runtime values appended as a trailing comment.
+        int idx = 0;
+        return Regex.Replace(body, @"^(\s*)expect\s+(.+?);(\s*//[^\r\n]*)?(?=\r?$)",
             m =>
             {
+                int thisIdx = idx++;
                 var indent = m.Groups[1].Value;
-                var outName = m.Groups[2].Value;
-                var rhs = m.Groups[3].Value.TrimEnd();
-                string? expected = rhsVals != null && rhsVals.TryGetValue(outName, out var e) ? e : null;
-                string? actual = vals != null && vals.TryGetValue(outName, out var a) ? a : null;
-                if (expected == null && actual == null)
-                    return m.Value;
-                // Prefer substituting the expected value into the expect (concrete, ready
-                // to uncomment once the bug is fixed); keep the actual as a trailing comment.
-                if (expected != null)
+                var expr = m.Groups[2].Value.TrimEnd();
+                var trailing = m.Groups[3].Value;
+
+                // PRE-CHECK expects are leading guards — leave alone.
+                if (trailing.Contains("PRE-CHECK")) return m.Value;
+                // Already annotated (existing trailing comment). Leave.
+                if (!string.IsNullOrEmpty(trailing)) return m.Value;
+
+                // Simple `outName == rhs` path — substitute or annotate with RHSVAL/VAL.
+                var simpleM = Regex.Match(expr, @"^(\w+)\s*==\s*(.+)$");
+                if (simpleM.Success)
                 {
-                    var trailing = actual != null ? $" // got {actual}" : "";
-                    return $"{indent}expect {outName} == {expected};{trailing}";
+                    var outName = simpleM.Groups[1].Value;
+                    var rhs = simpleM.Groups[2].Value.TrimEnd();
+                    string? expected = rhsVals != null && rhsVals.TryGetValue(outName, out var e) ? e : null;
+                    string? actual = vals != null && vals.TryGetValue(outName, out var a) ? a : null;
+                    if (expected != null)
+                    {
+                        var tail = actual != null ? $" // got {actual}" : "";
+                        return $"{indent}expect {outName} == {expected};{tail}";
+                    }
+                    if (actual != null)
+                        return $"{indent}expect {outName} == {rhs}; // got {actual}";
                 }
-                // Only actual is available — keep original rhs, annotate with got.
-                return $"{indent}expect {outName} == {rhs}; // got {actual}";
+
+                // Generic path — use EXV LHS/RHS/COND runtime captures.
+                if (expVals != null && expVals.TryGetValue(thisIdx, out var rec))
+                {
+                    string? tail = null;
+                    if (rec.Lhs != null && rec.Rhs != null)
+                        tail = $" // LHS={rec.Lhs}, RHS={rec.Rhs}";
+                    else if (rec.Cond != null)
+                        tail = $" // got {rec.Cond}";
+                    if (tail != null)
+                        return $"{indent}expect {expr};{tail}";
+                }
+
+                return m.Value;
             },
             RegexOptions.Multiline);
+    }
+
+    /// <summary>
+    /// Adds comment line(s) before the first expect showing the runtime snapshot of
+    /// every captured local (OUT markers), and — for crashing failing tests — the
+    /// first line of stderr as "// crash: …".
+    /// </summary>
+    static string InjectRuntimeInfo(string body,
+        Dictionary<string, string>? outs, string? stderr, bool failing)
+    {
+        // Keep only OUT entries that reveal something new:
+        //   — drop if var is already covered by an `expect <name>... == ...; // observed ...` line
+        //   — drop if var's declared literal matches its observed value (unchanged)
+        var meaningful = new Dictionary<string, string>();
+        if (outs != null)
+        {
+            foreach (var kv in outs)
+            {
+                var name = kv.Key;
+                var val = kv.Value;
+
+                // Already captured by an explicit `expect X == ...; // observed ...` line
+                var coveredPattern = @"^\s*expect\s+" + Regex.Escape(name) +
+                                     @"(?:\s*\[\.\.\])?\s*==.*//\s*observed";
+                if (Regex.IsMatch(body, coveredPattern, RegexOptions.Multiline)) continue;
+
+                // Unchanged from declaration: `var X := new T[N] [lit];` or `var X := lit;`
+                var arrDecl = Regex.Match(body,
+                    @"^\s*var\s+" + Regex.Escape(name) + @"\s*:=\s*new\s+\w+(?:\[[^\]]*\])?\s*(\[[^\]]*\])\s*;",
+                    RegexOptions.Multiline);
+                if (arrDecl.Success)
+                {
+                    var declLit = NormalizeSeqLiteral(arrDecl.Groups[1].Value);
+                    if (declLit == NormalizeSeqLiteral(val)) continue;
+                }
+                else
+                {
+                    var scalarDecl = Regex.Match(body,
+                        @"^\s*var\s+" + Regex.Escape(name) + @"\s*:=\s*([^;]+);",
+                        RegexOptions.Multiline);
+                    if (scalarDecl.Success && scalarDecl.Groups[1].Value.Trim() == val.Trim())
+                        continue;
+                }
+
+                meaningful[name] = val;
+            }
+        }
+
+        if (failing)
+        {
+            // Failing test: keep OUT as a narrative comment (expects are commented out anyway).
+            var comments = new List<string>();
+            if (meaningful.Count > 0)
+            {
+                var parts = meaningful.Select(kv => $"{kv.Key}={kv.Value}");
+                comments.Add($"// actual runtime state: {string.Join(", ", parts)}");
+            }
+            if (meaningful.Count == 0 && !string.IsNullOrWhiteSpace(stderr))
+            {
+                var errLines = stderr.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0).Take(3).ToList();
+                foreach (var l in errLines) comments.Add($"// runtime error: {l}");
+            }
+            if (comments.Count == 0) return body;
+            var firstExpect = Regex.Match(body, @"^(\s*)(?://\s*)?expect ", RegexOptions.Multiline);
+            if (!firstExpect.Success) return body;
+            var indent = firstExpect.Groups[1].Value;
+            var insertion = string.Concat(comments.Select(c => $"{indent}{c}\n"));
+            return body.Insert(firstExpect.Index, insertion);
+        }
+
+        // Passing test: convert meaningful entries into `expect …; // observed from implementation` lines.
+        if (meaningful.Count == 0) return body;
+
+        var lines = new List<string>();
+        string? ind = null;
+        var firstE = Regex.Match(body, @"^(\s*)expect ", RegexOptions.Multiline);
+        if (firstE.Success) ind = firstE.Groups[1].Value;
+        ind ??= "    ";
+
+        foreach (var kv in meaningful)
+        {
+            var name = kv.Key;
+            var val = kv.Value;
+            // Array if value starts with '[' or var decl used `new`
+            bool isArr = val.TrimStart().StartsWith("[")
+                         || Regex.IsMatch(body, @"^\s*var\s+" + Regex.Escape(name) + @"\s*:=\s*new\s", RegexOptions.Multiline);
+            var lhs = isArr ? $"{name}[..]" : name;
+            lines.Add($"{ind}expect {lhs} == {val}; // observed from implementation");
+        }
+
+        // Insert after the last existing expect, so the "observed" lines come last.
+        var allExpects = Regex.Matches(body, @"^\s*expect [^\n]*\n?", RegexOptions.Multiline);
+        if (allExpects.Count > 0)
+        {
+            var last = allExpects[allExpects.Count - 1];
+            var insertAt = last.Index + last.Length;
+            return body.Insert(insertAt, string.Concat(lines.Select(l => l + "\n")));
+        }
+        return body + string.Concat(lines.Select(l => "\n" + l));
+    }
+
+    static string NormalizeSeqLiteral(string s)
+    {
+        // Strip all whitespace inside [...] for comparison stability.
+        return Regex.Replace(s.Trim(), @"\s+", "");
     }
 
     /// <summary>
@@ -792,6 +1075,60 @@ static class TestValidator
             if (!result.ContainsKey(id))
                 result[id] = new Dictionary<string, string>();
             result[id][varName] = value;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Parses OUT:testId:varName=value markers — post-method-call snapshot of
+    /// every local variable, used to annotate test bodies with actual runtime state.
+    /// </summary>
+    static Dictionary<int, Dictionary<string, string>> ParseOutMarkers(string output)
+    {
+        var result = new Dictionary<int, Dictionary<string, string>>();
+        foreach (Match m in Regex.Matches(output, @"(?<![A-Z])OUT:(\d+):(\w+)=(.+)"))
+        {
+            if (!int.TryParse(m.Groups[1].Value, out var id)) continue;
+            var varName = m.Groups[2].Value;
+            var value = m.Groups[3].Value.Trim();
+            if (!result.ContainsKey(id))
+                result[id] = new Dictionary<string, string>();
+            result[id][varName] = value;
+        }
+        return result;
+    }
+
+    /// <summary>Runtime-captured LHS/RHS/COND for one expect line.</summary>
+    internal sealed class ExpValRecord
+    {
+        public string? Lhs;
+        public string? Rhs;
+        public string? Cond;
+    }
+
+    /// <summary>
+    /// Parses EXV:testId:expectIdx:{LHS|RHS|COND}=value markers.
+    /// Returns: testId → expectIdx → record.
+    /// </summary>
+    static Dictionary<int, Dictionary<int, ExpValRecord>> ParseExpValMarkers(string output)
+    {
+        var result = new Dictionary<int, Dictionary<int, ExpValRecord>>();
+        foreach (Match m in Regex.Matches(output, @"EXV:(\d+):(\d+):(LHS|RHS|COND)=(.+)"))
+        {
+            if (!int.TryParse(m.Groups[1].Value, out var tid)) continue;
+            if (!int.TryParse(m.Groups[2].Value, out var eid)) continue;
+            var kind = m.Groups[3].Value;
+            var value = m.Groups[4].Value.Trim();
+            if (!result.ContainsKey(tid))
+                result[tid] = new Dictionary<int, ExpValRecord>();
+            if (!result[tid].TryGetValue(eid, out var rec))
+            {
+                rec = new ExpValRecord();
+                result[tid][eid] = rec;
+            }
+            if (kind == "LHS") rec.Lhs = value;
+            else if (kind == "RHS") rec.Rhs = value;
+            else rec.Cond = value;
         }
         return result;
     }
@@ -886,7 +1223,11 @@ static class TestValidator
         // pin. Tagged with a marker comment so users can review and loosen if the spec
         // admits alternative valid outputs. Skipped when forceReplace (rescued) since
         // those paths already replaced the RHS directly.
-        if (!forceReplace)
+        // Skip observed-from-implementation injection in pre-only tests — postconditions
+        // were not enforced by Z3, so pinning runtime outputs as "observed" would lock in
+        // whatever the (possibly buggy) implementation produced.
+        bool isPreOnly = result.Contains("PRE-ONLY");
+        if (!forceReplace && !isPreOnly)
         {
             foreach (var (varName, value) in vars)
             {

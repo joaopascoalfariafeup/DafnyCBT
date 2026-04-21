@@ -539,7 +539,17 @@ class Program
 
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
 
-            var testCode = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program, isBodyless);
+            var (testCode, timedOut) = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program, isBodyless);
+
+            // Automatic fallback: if first attempt produced no tests and timed out, retry in
+            // pre-only mode (postconditions ignored, inputs from preconditions only). Catches
+            // runtime crashes on methods whose full spec is too expensive for Z3.
+            if (string.IsNullOrWhiteSpace(testCode) && timedOut && method.Ens.Count > 0 && !isBodyless)
+            {
+                var retryBudget = timeoutSecs > 0 ? Math.Max(30, timeoutSecs / 2) : 0;
+                Console.WriteLine($"  Full-spec solve timed out with 0 tests — retrying in pre-only mode (budget {retryBudget}s)...");
+                (testCode, _) = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, retryBudget, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program, isBodyless, preOnlyMode: true);
+            }
 
             if (!string.IsNullOrWhiteSpace(testCode))
             {
@@ -760,10 +770,10 @@ class Program
     /// <summary>
     /// For each test condition (PRE && POST_clause), we ask Z3 to find satisfying values.
     /// </summary>
-    static async Task<string> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
+    static async Task<(string code, bool timedOut)> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
         List<(string name, List<string> paramNames, string body, bool isClassMember)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool hasNonInlinableFuncs = false,
         Dictionary<string, List<string>>? enumDatatypes = null, Dictionary<string, (string dtName, int ordinal)>? enumConstructors = null,
-        ClassInfo? classInfo = null, Microsoft.Dafny.Program? program = null, bool isBodyless = false)
+        ClassInfo? classInfo = null, Microsoft.Dafny.Program? program = null, bool isBodyless = false, bool preOnlyMode = false)
     {
         z3Path ??= Z3Runner.FindZ3Path();
         enumDatatypes ??= new Dictionary<string, List<string>>();
@@ -776,6 +786,10 @@ class Program
         // Get DNF clauses as AST Expressions — kept as Expressions throughout the pipeline.
         // Strings are only used for display, dedup keys, and at the TestEmitter boundary.
         var ensuresClauses = method.Ens.Select(e => e.E).ToList();
+        // preOnlyMode: postconditions are NOT solved by Z3 (too expensive), but still emitted
+        // as runtime-evaluated expects so buggy implementations fail with diagnostics.
+        // Force the "full-postcondition as expect" path used for uninterpreted functions.
+        if (preOnlyMode) hasNonInlinableFuncs = true;
 
         // Detect "output == expr" patterns in original postconditions.
         // When an ensures clause has the form `outName == specExpr`, the output is uniquely
@@ -906,9 +920,16 @@ class Program
 
         // Compute DNF/FDNF on inlined ensures for SMT translation.
         // FDNF (Full DNF) used only in all-combinations mode (explicit -a flag).
+        // preOnlyMode: skip post-condition SMT encoding — use single trivial clause so Z3
+        // solves for inputs satisfying preconditions only. Postconditions still emitted as
+        // runtime-evaluated expects via the hasNonInlinableFuncs path.
         bool usedFdnf = false;
-        if (allCombinations)
-        {            
+        if (preOnlyMode)
+        {
+            dnfExprs = new List<List<Expression>> { new List<Expression>() };
+        }
+        else if (allCombinations)
+        {
             dnfExprs = DnfEngine.ExprToFdnf(dnfEnsures[0]);
             for (int i = 1; i < dnfEnsures.Count; i++)
                 dnfExprs = DnfEngine.CrossProductPruned(dnfExprs, DnfEngine.ExprToFdnf(dnfEnsures[i]));
@@ -2410,7 +2431,7 @@ class Program
         }
 
         if (!testCases.Any())
-            return "";
+            return ("", TimedOut());
 
         // Convert Expression-based test cases to string-based for TestEmitter.
         // Restore original (non-inlined) literals for expect emission.
@@ -2500,7 +2521,8 @@ class Program
         bool hasUninterpFuncs = hasNonInlinableFuncs || SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
         // Emit Dafny test file
-        return TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo, inlinablePredicates, specExpects, isBodyless);
+        var emitted = TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo, inlinablePredicates, specExpects, isBodyless, preOnlyMode);
+        return (emitted, TimedOut());
     }
 
     /// <summary>
