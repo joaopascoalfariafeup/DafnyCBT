@@ -821,6 +821,8 @@ static class TestValidator
             char c = s[i];
             if (c == '(' || c == '[' || c == '{') depth++;
             else if (c == ')' || c == ']' || c == '}') depth--;
+            else if (depth == 0 && c == ':' && s[i + 1] == ':')
+                return -1; // entered quantifier/comprehension body — don't split
             else if (depth == 0 && c == '=' && s[i + 1] == '=')
             {
                 char prev = i > 0 ? s[i - 1] : ' ';
@@ -978,6 +980,17 @@ static class TestValidator
                 var coveredPattern = @"^\s*expect\s+" + Regex.Escape(name) +
                                      @"(?:\s*\[\.\.\])?\s*==.*//\s*observed";
                 if (Regex.IsMatch(body, coveredPattern, RegexOptions.Multiline)) continue;
+
+                // Already pinned by a plain spec-derived `expect X == val;` to the SAME value.
+                // Observed-from-impl comment only valuable when spec can't pin reliably.
+                var existingExpect = Regex.Match(body,
+                    @"^\s*expect\s+" + Regex.Escape(name) + @"(?:\s*\[\.\.\])?\s*==\s*([^;]+?)\s*;(?!\s*//\s*observed)",
+                    RegexOptions.Multiline);
+                if (existingExpect.Success)
+                {
+                    var pinnedVal = NormalizeSeqLiteral(existingExpect.Groups[1].Value);
+                    if (pinnedVal == NormalizeSeqLiteral(val)) continue;
+                }
 
                 // Unchanged from declaration: `var X := new T[N] [lit];` or `var X := lit;`
                 var arrDecl = Regex.Match(body,

@@ -3920,6 +3920,236 @@ static class SmtTranslator
         disjuncts.Add($"(not (= {baseName} {altName}))");
     }
 
+    // ─────────────── Phase 1v: per-literal vacuity check ───────────────
+
+    /// <summary>
+    /// Builds an SMT assertion that blocks a specific assignment of input values:
+    ///   (assert (not (and (= in1 v1) (= in2 v2) ...)))
+    /// Mirrors BuildOutputBlockingClause but over inputs (pre-state for mutables).
+    /// Used by Phase 1v CEGIS to exclude previously-tried ins in subsequent attempts.
+    /// </summary>
+    internal static string BuildInputBlockingClause(
+        List<(string Name, string Type)> inputs,
+        Dictionary<string, string> values,
+        HashSet<string>? mutableNames = null)
+    {
+        mutableNames ??= new HashSet<string>();
+        var eqParts = new List<string>();
+
+        foreach (var (name, type) in inputs)
+        {
+            var smtBase = mutableNames.Contains(name) ? $"{name}_pre" : name;
+            if (TypeUtils.IsTupleType(type))
+            {
+                var components = TypeUtils.GetTupleComponentTypes(type);
+                for (int i = 0; i < components.Count; i++)
+                {
+                    if (values.TryGetValue($"{smtBase}_{i}", out var compVal))
+                        eqParts.Add($"(= {smtBase}_{i} {compVal})");
+                }
+            }
+            else if (TypeUtils.IsSupportedNestedSeqType(type))
+            {
+                var smtName = TypeUtils.SeqSmtName(smtBase, type);
+                if (values.TryGetValue(smtBase + "_len", out var outerLenStr) && int.TryParse(outerLenStr, out var outerLen))
+                {
+                    eqParts.Add($"(= {smtName}_len {outerLen})");
+                    for (int i = 0; i < outerLen; i++)
+                    {
+                        if (values.TryGetValue($"{smtBase}_{i}_len", out var innerLenStr) && int.TryParse(innerLenStr, out var innerLen))
+                        {
+                            eqParts.Add($"(= (seq.len {smtName}_{i}) {innerLen})");
+                            if (values.TryGetValue($"{smtBase}_{i}_elems", out var innerElemsStr))
+                            {
+                                var innerElems = innerElemsStr.Split(',');
+                                for (int j = 0; j < Math.Min(innerLen, innerElems.Length); j++)
+                                    eqParts.Add($"(= (seq.nth {smtName}_{i} {j}) {innerElems[j]})");
+                            }
+                        }
+                    }
+                }
+            }
+            else if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
+            {
+                var seqName = TypeUtils.SeqSmtName(smtBase, type);
+                if (values.TryGetValue(smtBase + "_len", out var lenStr) && int.TryParse(lenStr, out var len))
+                {
+                    eqParts.Add($"(= (seq.len {seqName}) {len})");
+                    if (values.TryGetValue(smtBase + "_elems", out var elemsStr))
+                    {
+                        var elems = elemsStr.Split(',');
+                        for (int i = 0; i < Math.Min(len, elems.Length); i++)
+                            eqParts.Add($"(= (seq.nth {seqName} {i}) {elems[i]})");
+                    }
+                }
+            }
+            else if (TypeUtils.IsSetType(type) || TypeUtils.IsMultisetType(type) || TypeUtils.IsMapType(type))
+            {
+                // Skip set/multiset/map inputs in blocking clause — too complex to encode reliably
+                continue;
+            }
+            else
+            {
+                if (values.TryGetValue(smtBase, out var val))
+                    eqParts.Add($"(= {smtBase} {val})");
+            }
+        }
+
+        if (eqParts.Count == 0) return "";
+        var conjunction = eqParts.Count == 1 ? eqParts[0] : $"(and {string.Join(" ", eqParts)})";
+        return $"(assert (not {conjunction}))";
+    }
+
+    /// <summary>
+    /// Builds an SMT query that proves literal Q_k is VACUOUS for a specific ins:
+    ///   Pre(ins_pinned) ∧ (∧_{j≠k} Q_j(ins_pinned, outs_alt)) ∧ ¬Q_k(ins_pinned, outs_alt)
+    /// UNSAT → Q_k is forced true by the other literals for this ins (vacuous).
+    /// SAT   → Q_k prunes for this ins; need a different ins.
+    /// Returns null when the literal contains an uninterpreted user function or when
+    /// construction is unsafe (e.g., class outputs).
+    /// </summary>
+    internal static string? BuildVacuityPinnedQuery(
+        List<(string Name, string Type)> inputs,
+        List<(string Name, string Type)> outputs,
+        List<Expression> preLiterals,
+        List<Expression> postLiterals,
+        Dictionary<string, string> pinnedInputValues,
+        int literalIndex,
+        Method method,
+        HashSet<string>? mutableNames = null)
+    {
+        mutableNames ??= new HashSet<string>();
+        if (postLiterals.Count == 0) return null;
+        if (literalIndex < 0 || literalIndex >= postLiterals.Count) return null;
+
+        var baseSmt = BuildSmt2Query(
+            inputs, outputs, preLiterals, postLiterals, method,
+            verbose: false,
+            exclusions: null,
+            extraConstraints: null,
+            preLiterals: preLiterals,
+            mutableNames: mutableNames,
+            skipBias: true);
+
+        var checkIdx = baseSmt.LastIndexOf("(check-sat)");
+        if (checkIdx < 0) return null;
+
+        // Reject literals that reference uninterpreted user functions — Z3 can
+        // assign those arbitrarily and yield spurious UNSAT/SAT.
+        var uninterpFns = new HashSet<string>();
+        foreach (Match dm in Regex.Matches(baseSmt, @"\(declare-fun\s+(\S+)\s+\(([^)]*)\)\s"))
+        {
+            if (!string.IsNullOrWhiteSpace(dm.Groups[2].Value))
+                uninterpFns.Add(dm.Groups[1].Value);
+        }
+        if (uninterpFns.Count > 0)
+        {
+            var litDafny = DnfEngine.ExprToString(postLiterals[literalIndex]);
+            foreach (var fn in uninterpFns)
+            {
+                if (Regex.IsMatch(litDafny, @"\b" + Regex.Escape(fn) + @"\s*(<[^>]*>)?\s*\("))
+                    return null;
+            }
+        }
+
+        var sb = new System.Text.StringBuilder(baseSmt.Substring(0, checkIdx));
+        var inputsAndOutputs = inputs.Concat(outputs).ToList();
+
+        // Pin every input to its concrete value from Phase A's model.
+        sb.AppendLine();
+        sb.AppendLine($"; ─── Vacuity: pin ins for Q{literalIndex + 1} check ───");
+        foreach (var (name, type) in inputs)
+        {
+            var smtBase = mutableNames.Contains(name) ? $"{name}_pre" : name;
+            if (TypeUtils.IsTupleType(type))
+            {
+                var components = TypeUtils.GetTupleComponentTypes(type);
+                for (int i = 0; i < components.Count; i++)
+                {
+                    if (pinnedInputValues.TryGetValue($"{smtBase}_{i}", out var compVal))
+                        sb.AppendLine($"(assert (= {smtBase}_{i} {compVal}))");
+                }
+            }
+            else if (TypeUtils.IsSupportedNestedSeqType(type))
+            {
+                var smtName = TypeUtils.SeqSmtName(smtBase, type);
+                if (pinnedInputValues.TryGetValue(smtBase + "_len", out var outerLenStr) && int.TryParse(outerLenStr, out var outerLen))
+                {
+                    sb.AppendLine($"(assert (= {smtName}_len {outerLen}))");
+                    for (int i = 0; i < outerLen; i++)
+                    {
+                        if (pinnedInputValues.TryGetValue($"{smtBase}_{i}_len", out var innerLenStr) && int.TryParse(innerLenStr, out var innerLen))
+                        {
+                            sb.AppendLine($"(assert (= (seq.len {smtName}_{i}) {innerLen}))");
+                            if (pinnedInputValues.TryGetValue($"{smtBase}_{i}_elems", out var innerElemsStr))
+                            {
+                                var innerElems = innerElemsStr.Split(',');
+                                for (int j = 0; j < Math.Min(innerLen, innerElems.Length); j++)
+                                    sb.AppendLine($"(assert (= (seq.nth {smtName}_{i} {j}) {innerElems[j]}))");
+                            }
+                        }
+                    }
+                }
+            }
+            else if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
+            {
+                var seqName = TypeUtils.SeqSmtName(smtBase, type);
+                if (pinnedInputValues.TryGetValue(smtBase + "_len", out var lenStr) && int.TryParse(lenStr, out var len))
+                {
+                    sb.AppendLine($"(assert (= (seq.len {seqName}) {len}))");
+                    if (pinnedInputValues.TryGetValue(smtBase + "_elems", out var elemsStr))
+                    {
+                        var elems = elemsStr.Split(',');
+                        for (int i = 0; i < Math.Min(len, elems.Length); i++)
+                            sb.AppendLine($"(assert (= (seq.nth {seqName} {i}) {elems[i]}))");
+                    }
+                }
+            }
+            else if (TypeUtils.IsSetType(type) || TypeUtils.IsMultisetType(type) || TypeUtils.IsMapType(type))
+            {
+                // Skip pinning for set/multiset/map — too complex. Phase 1v gives up
+                // on methods with such inputs (caller should pre-filter).
+                return null;
+            }
+            else
+            {
+                if (pinnedInputValues.TryGetValue(smtBase, out var val))
+                    sb.AppendLine($"(assert (= {smtBase} {val}))");
+            }
+        }
+
+        // Single shadow output block: outs_alt violating only Q_k.
+        var suffix = $"vac{literalIndex}";
+        sb.AppendLine();
+        sb.AppendLine($"; ─── Vacuity: shadow output for Q{literalIndex + 1} (outs_{suffix}) ───");
+        if (!EmitOutputAltDeclarations(sb, inputs, outputs, mutableNames, suffix))
+            return null;
+
+        var renameMap = BuildOutputAltRenameMap(inputs, outputs, mutableNames, suffix);
+        if (renameMap.Count == 0) return null;
+
+        sb.AppendLine();
+        sb.AppendLine($"; ─── Vacuity: shadow assertions (clause minus Q{literalIndex + 1} + ¬Q{literalIndex + 1}) ───");
+        for (int j = 0; j < postLiterals.Count; j++)
+        {
+            var lit = postLiterals[j];
+            var litStr = DnfEngine.ExprToString(lit);
+            if (TypeUtils.IsSpecOnlyLiteral(litStr)) continue;
+            ResetExprToSmtBudget();
+            var smtExpr = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true);
+            if (smtExpr == null) return null;
+            smtExpr = ApplyOutputAltRenames(smtExpr, renameMap);
+            if (j == literalIndex) smtExpr = $"(not {smtExpr})";
+            sb.AppendLine($"(assert {smtExpr})");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("(check-sat)");
+
+        var smtText = RewriteNestedSeqRefs(sb.ToString(), inputs, outputs);
+        return smtText;
+    }
+
     /// <summary>
     /// Expands "x in seq" to explicit disjunctions over bounded elements, avoiding
     /// the implicit quantifier inside seq.contains that causes Z3 unknown results.

@@ -10,6 +10,8 @@ class Program
     static bool TrustUnknownUniqueness = true;
     static int UniquenessRounds = 2;
     static bool RelevanceCheckEnabled = true;
+    public static bool VacuityCheckEnabled = false;
+    const int VacuityCegisAttempts = 3;
 
     static async Task<int> Main(string[] args)
     {
@@ -51,10 +53,12 @@ class Program
         noBiasOpt.AddAlias("-nb");
         var noRelevanceOpt = new Option<bool>("--no-relevance", "Disable per-literal relevance check (Phase 1r). Default: relevance ON.");
         noRelevanceOpt.AddAlias("-nr");
+        var vacuityOpt = new Option<bool>("--vacuity", "Enable per-literal vacuity check (Phase 1v). Default: OFF.");
+        vacuityOpt.AddAlias("-v1v");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -86,6 +90,9 @@ class Program
             RelevanceCheckEnabled = relevanceEnabled;
             if (!relevanceEnabled)
                 Console.WriteLine("[DafnyTestGen] Relevance check (Phase 1r): OFF");
+            VacuityCheckEnabled = ctx.ParseResult.GetValueForOption(vacuityOpt);
+            if (VacuityCheckEnabled)
+                Console.WriteLine("[DafnyTestGen] Vacuity check (Phase 1v): ON");
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
             var z3Path = Z3Runner.FindZ3Path(z3PathCli);
@@ -1447,6 +1454,17 @@ class Program
             return result;
         }
 
+        // Helper: safe candidate indices for vacuity check — same criteria as relevance.
+        // Phase-1r-UNSAT filtering applied at call site (needs Phase 1r's bookkeeping).
+        List<int> GetVacuityCandidates(
+            List<Expression> clause,
+            List<(string Name, string Type)> ins,
+            List<(string Name, string Type)> outs,
+            HashSet<string> mutables)
+        {
+            return GetSafeRelevanceIndices(clause, ins, outs, mutables);
+        }
+
         // Helper: build baseline (Phase 1) schedule entries — one per (pi, ci), no pins.
         // (pi, ci) pairs whose clause was already solved via an embedded relevance query.
         // BuildScheduleEntries skips these so we don't duplicate the per-clause test.
@@ -2179,6 +2197,10 @@ class Program
             // the plain clause query is skipped. Unsat/unknown/skipped → fall through to
             // the plain query emitted by BuildScheduleEntries.
             int relAdded = 0, relUnsat = 0, relSkipped = 0;
+            // Per-(pi,ci) set of literal indices whose Phase 1r returned UNSAT for a SINGLE index.
+            // Used to skip those candidates in Phase 1v: UNSAT relevance ⇒ universally vacuous ⇒
+            // Phase 1 baseline already exhibits vacuity, so Phase 1v would duplicate.
+            var phase1rUnsatIndices = new Dictionary<(int pi, int ci), HashSet<int>>();
             if (RelevanceCheckEnabled && !TimedOut())
             {
                 for (int pi = 0; pi < preCombinations.Count; pi++)
@@ -2210,6 +2232,7 @@ class Program
                         if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel} (safe: [{string.Join(",", safeIndices.Select(i => i + 1))}])...");
                         var z3Result = await Z3Runner.RunZ3(z3Path, smt);
                         var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
+                        int lastQueriedIndex = safeIndices.Count == 1 ? safeIndices[0] : -1;
                         // UNSAT with multiple safe indices → at least one is redundant
                         // here. Fall back to single-literal (last safe index) query to
                         // still exercise the defining literal when possible.
@@ -2223,6 +2246,7 @@ class Program
                                 if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: multi-literal UNSAT — retry with Q{fallbackIndices[0] + 1} only");
                                 z3Result = await Z3Runner.RunZ3(z3Path, fbSmt);
                                 lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
+                                lastQueriedIndex = fallbackIndices[0];
                             }
                         }
                         if (lines.Any(l => l == "sat"))
@@ -2254,6 +2278,18 @@ class Program
                         {
                             relUnsat++;
                             if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: UNSAT (last literal redundant)");
+                            // Record confirmed per-index UNSAT (single-literal query form)
+                            // so Phase 1v can skip — that literal is universally vacuous
+                            // and Phase 1 baseline already exhibits it.
+                            if (lastQueriedIndex >= 0)
+                            {
+                                if (!phase1rUnsatIndices.TryGetValue((pi, ci), out var set))
+                                {
+                                    set = new HashSet<int>();
+                                    phase1rUnsatIndices[(pi, ci)] = set;
+                                }
+                                set.Add(lastQueriedIndex);
+                            }
                         }
                     }
                 }
@@ -2269,6 +2305,162 @@ class Program
 
             if (!verbose) Console.Write("\r                          \r"); // clear progress line
             Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
+
+            // --- Phase 1v: per-literal vacuity check (CEGIS) ---
+            // For each clause's safe candidate literal Q_k, find (ins, outs) such that
+            // Q_k is vacuously satisfied for this ins (no outs_alt violates Q_k while
+            // keeping other literals intact). Default OFF; opt-in via --vacuity.
+            // Runs only after the primary clause pass (Phase 1) if minTests not yet
+            // reached — vacuity is a "semantic BVA" fallback, lower priority than
+            // spec-coverage / relevance.
+            if (VacuityCheckEnabled && testCases.Count < minTests && !TimedOut()
+                && (maxTests <= 0 || testCases.Count < maxTests))
+            {
+                int vacAdded = 0, vacNoScenario = 0, vacSkipped = 0;
+                for (int pi = 0; pi < preCombinations.Count; pi++)
+                {
+                    if (TimedOut()) break;
+                    var (preLabel, preLits, preExclusions) = preCombinations[pi];
+                    var fullPreLits = new List<Expression>(preLits);
+                    foreach (var excl in preExclusions) fullPreLits.Add(DnfEngine.Negate(excl));
+                    var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
+                    for (int ci = 0; ci < dnfExprs.Count; ci++)
+                    {
+                        if (TimedOut()) break;
+                        if (maxTests > 0 && testCases.Count >= maxTests) break;
+                        if (testCases.Count >= minTests) break;
+                        var clause = dnfExprs[ci];
+                        var candidates = GetVacuityCandidates(clause, inputs, outputs, mutableNames);
+                        if (candidates.Count == 0) continue;
+                        // Filter: drop candidates where Phase 1r proved UNSAT (universally
+                        // vacuous — Phase 1 baseline already shows it; /V would duplicate).
+                        if (phase1rUnsatIndices.TryGetValue((pi, ci), out var unsatSet))
+                            candidates = candidates.Where(k => !unsatSet.Contains(k)).ToList();
+                        if (candidates.Count == 0) continue;
+
+                        foreach (var k in candidates)
+                        {
+                            if (TimedOut()) break;
+                            if (maxTests > 0 && testCases.Count >= maxTests) break;
+                            if (testCases.Count >= minTests) break;
+
+                            var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}/V{k + 1}";
+
+                            // Pre-CEGIS subsumption: if any prior test from THIS SAME clause
+                            // has an ins that makes Q_k vacuous, skip entirely. Restrict to
+                            // same-clause priors: cross-clause probes would return spurious
+                            // UNSAT whenever the other clause's ins falsifies one of *this*
+                            // clause's input-only literals (Phase B has no outs_alt that can
+                            // rescue it), which has nothing to do with Q_k vacuity.
+                            bool priorVacuous = false;
+                            int priorScan = Math.Max(0, testCases.Count - MAX_SUBSUME_PRIOR);
+                            for (int ti = testCases.Count - 1; ti >= priorScan && !priorVacuous; ti--)
+                            {
+                                if (TimedOut()) break;
+                                if (!object.ReferenceEquals(testCases[ti].literals, clause)) continue;
+                                var priorValues = testCases[ti].values;
+                                var probeSmt = SmtTranslator.BuildVacuityPinnedQuery(
+                                    inputs, outputs, fullPreLits, clause, priorValues, k, method, mutableNames);
+                                if (probeSmt == null) continue;
+                                var probeRes = await Z3Runner.RunZ3(z3Path, probeSmt);
+                                var probeLines = probeRes.Split('\n').Select(l => l.Trim()).ToList();
+                                if (probeLines.Any(l => l == "unsat"))
+                                {
+                                    priorVacuous = true;
+                                    if (verbose) Console.WriteLine($"  Vacuity {clauseLabel}: skipped (prior test {testCases[ti].label} already exhibits vacuity)");
+                                }
+                            }
+                            if (priorVacuous) { vacSkipped++; continue; }
+
+                            // CEGIS loop: Phase A finds ins satisfying the clause; Phase B
+                            // checks vacuity of Q_k under that ins. On Phase B SAT, block
+                            // this ins and retry. Up to VacuityCegisAttempts attempts.
+                            var excludedIns = new List<string>();
+                            Dictionary<string, string>? witness = null;
+                            for (int attempt = 0; attempt < VacuityCegisAttempts; attempt++)
+                            {
+                                if (TimedOut()) break;
+                                var extraA = new List<string>(globalExtraConstraints);
+                                extraA.AddRange(excludedIns);
+                                var smtA = SmtTranslator.BuildSmt2Query(
+                                    inputs, outputs, preClauses, clause, method, false,
+                                    null, extraA, fullPreLits, mutableNames);
+                                var resA = await Z3Runner.RunZ3(z3Path, smtA);
+                                var linesA = resA.Split('\n').Select(l => l.Trim()).ToList();
+                                if (!linesA.Any(l => l == "sat")) break;
+                                var insValues = TypeUtils.ParseZ3Model(resA, allVars);
+                                if (insValues.Count == 0) break;
+
+                                var smtB = SmtTranslator.BuildVacuityPinnedQuery(
+                                    inputs, outputs, fullPreLits, clause, insValues, k, method, mutableNames);
+                                if (smtB == null) break;
+                                var resB = await Z3Runner.RunZ3(z3Path, smtB);
+                                var linesB = resB.Split('\n').Select(l => l.Trim()).ToList();
+                                if (linesB.Any(l => l == "unsat"))
+                                {
+                                    witness = insValues;
+                                    break;
+                                }
+                                if (!linesB.Any(l => l == "sat")) break; // unknown → give up
+                                // Phase B SAT → Q_k pruned for this ins; exclude + retry
+                                var inBlock = SmtTranslator.BuildInputBlockingClause(inputs, insValues, mutableNames);
+                                if (string.IsNullOrEmpty(inBlock)) break;
+                                // extra constraints are raw SMT predicates; strip leading "(assert " wrapper
+                                var stripped = inBlock.StartsWith("(assert ")
+                                    ? inBlock.Substring("(assert ".Length, inBlock.Length - "(assert ".Length - 1)
+                                    : inBlock;
+                                excludedIns.Add(stripped);
+                            }
+
+                            if (witness == null) { vacNoScenario++; continue; }
+
+                            // Post-CEGIS subsumption: skip only if CEGIS's ins is
+                            // structurally identical to a prior test's ins (duplicate
+                            // witness). Semantic subsumption (SAT-under-pin) would
+                            // wrongly reject every V test because the clause is the
+                            // same one relevance already satisfied — so use structural
+                            // ins-equality instead.
+                            bool structurallyDup = false;
+                            var witnessInKeys = BuildInputExclusion(witness);
+                            if (witnessInKeys != null)
+                            {
+                                int priorScan2 = Math.Max(0, testCases.Count - MAX_SUBSUME_PRIOR);
+                                for (int ti = testCases.Count - 1; ti >= priorScan2; ti--)
+                                {
+                                    var priorExcl = BuildInputExclusion(testCases[ti].values);
+                                    if (priorExcl == witnessInKeys) { structurallyDup = true; break; }
+                                }
+                            }
+                            if (structurallyDup)
+                            {
+                                vacSkipped++;
+                                if (verbose) Console.WriteLine($"  Vacuity {clauseLabel}: structural duplicate of prior test — skipped");
+                                continue;
+                            }
+
+                            // Uniqueness check reuses the existing pipeline.
+                            var specSmtV = SmtTranslator.BuildSmt2Query(
+                                inputs, outputs, preClauses, dnfEnsures, method, false,
+                                null, null, fullPreLits, mutableNames, skipBias: true);
+                            var uQueryV = SmtTranslator.BuildUniquenessQuery(
+                                specSmtV, inputs, outputs, witness, mutableNames);
+                            if (!string.IsNullOrEmpty(uQueryV) && !TimedOut())
+                            {
+                                var uResV = await Z3Runner.RunZ3(z3Path, uQueryV);
+                                var uLinesV = uResV.Split('\n').Select(l => l.Trim()).ToList();
+                                bool isUniqueV = uLinesV.Any(l => l == "unsat");
+                                bool isUnknownV = !isUniqueV && uLinesV.Any(l => l == "unknown");
+                                witness["__unique__"] = (isUniqueV || (isUnknownV && TrustUnknownUniqueness)) ? "true" : "false";
+                            }
+                            testCases.Add((clauseLabel, witness, clause));
+                            vacAdded++;
+                            if (verbose) Console.WriteLine($"  Vacuity {clauseLabel}: Q{k + 1} vacuous for found ins — added test case");
+                        }
+                    }
+                }
+                if (vacAdded > 0 || vacNoScenario > 0 || vacSkipped > 0)
+                    Console.WriteLine($"  Vacuity: {vacAdded} test(s) added, {vacNoScenario} no scenario, {vacSkipped} skipped");
+            }
 
             HashSet<string> phase2Keys = new HashSet<string>();
             if (testCases.Count < minTests && (boundary || progressive)

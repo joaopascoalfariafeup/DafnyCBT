@@ -72,9 +72,10 @@ static class DnfEngine
                     ? merged.Concat(extraLits).ToList() : merged;
                 if (FindContradiction(checkLits) == null)
                 {
-                    // Deduplicate literals in the merged clause
+                    // Deduplicate literals in the merged clause using a canonical
+                    // form so equivalent pairs like "!(X !in Y)" and "X in Y" collapse.
                     var seen = new HashSet<string>();
-                    merged = merged.Where(e => seen.Add(ExprToString(e))).ToList();
+                    merged = merged.Where(e => seen.Add(CanonicalLiteralKey(ExprToString(e)))).ToList();
                     result.Add(merged);
                 }
             }
@@ -1144,6 +1145,27 @@ static class DnfEngine
         if (s.StartsWith("- "))
             s = "-" + s.Substring(2);
         return double.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out value);
+    }
+
+    /// <summary>
+    /// Canonicalize a literal string for dedup inside a DNF clause.
+    /// Collapses redundant negations like "!(X !in Y)" → "X in Y",
+    /// "!(X == Y)" → "X != Y", "!!X" → "X". Leaves atoms untouched when
+    /// no simpler form exists (e.g., "!(X)" stays as-is to avoid churn).
+    /// </summary>
+    internal static string CanonicalLiteralKey(string key)
+    {
+        string s = key.Trim();
+        while (s.StartsWith("!!"))
+            s = s.Substring(2).TrimStart();
+        if (s.StartsWith("!(") && s.EndsWith(")"))
+        {
+            var inner = s.Substring(2, s.Length - 3);
+            var neg = NegateOperatorInLiteral(inner);
+            if (neg != null && !neg.StartsWith("!("))
+                s = neg;
+        }
+        return s;
     }
 
     /// <summary>

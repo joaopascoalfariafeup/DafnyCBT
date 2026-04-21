@@ -772,15 +772,21 @@ static class TestEmitter
             // Show the test condition as a comment (skip spec-only literals like fresh())
             foreach (var pre in preClauses)
                 sb.AppendLine($"  //   PRE:  {ApplyTypeParamMap(DnfEngine.ExprToString(pre), typeParamMap)}");
+            // Vacuity label "{C}/V{k}" → mark literal k (1-based) as vacuous
+            int vacuousIndex = -1;
+            var vMatch = System.Text.RegularExpressions.Regex.Match(label, @"/V(\d+)(?:/|$)");
+            if (vMatch.Success && int.TryParse(vMatch.Groups[1].Value, out var vNum))
+                vacuousIndex = vNum - 1;
+            int litIdx = 0;
             foreach (var lit in literals)
-                if (!TypeUtils.IsSpecOnlyLiteral(lit))
-                    sb.AppendLine($"  //   POST: {ApplyTypeParamMap(lit, typeParamMap)}");
-            // Full postconditions for check-mode fallback (ensures always hold, unlike per-clause POST literals)
-            foreach (var ens in method.Ens)
             {
-                var ensStr = DnfEngine.ExprToString(ens.E);
-                if (!TypeUtils.IsSpecOnlyLiteral(ensStr))
-                    sb.AppendLine($"  //   ENSURES: {ApplyTypeParamMap(ensStr, typeParamMap)}");
+                if (!TypeUtils.IsSpecOnlyLiteral(lit))
+                {
+                    var tag = litIdx == vacuousIndex ? "  // VACUOUS (forced true by other literals for this ins)" : "";
+                    var canonical = DnfEngine.CanonicalLiteralKey(lit);
+                    sb.AppendLine($"  //   POST Q{litIdx + 1}: {ApplyTypeParamMap(canonical, typeParamMap)}{tag}");
+                }
+                litIdx++;
             }
 
             sb.AppendLine("  {");
