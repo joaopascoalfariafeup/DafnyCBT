@@ -1038,8 +1038,17 @@ static class TestValidator
             var comments = new List<string>();
             if (meaningful.Count > 0)
             {
-                var parts = meaningful.Select(kv => $"{kv.Key}={kv.Value}");
-                comments.Add($"// actual runtime state: {string.Join(", ", parts)}");
+                // Drop names already disclosed via "// expect ...; // got <val>" in
+                // commented expects below — the runtime state would duplicate that.
+                var kept = meaningful.Where(kv =>
+                    !Regex.IsMatch(body,
+                        @"//\s*expect\s+" + Regex.Escape(kv.Key) + @"\b[^\r\n]*//\s*got\s+" + Regex.Escape(kv.Value) + @"\b"))
+                    .ToList();
+                if (kept.Count > 0)
+                {
+                    var parts = kept.Select(kv => $"{kv.Key}={kv.Value}");
+                    comments.Add($"// actual runtime state: {string.Join(", ", parts)}");
+                }
             }
             if (meaningful.Count == 0 && !string.IsNullOrWhiteSpace(stderr))
             {

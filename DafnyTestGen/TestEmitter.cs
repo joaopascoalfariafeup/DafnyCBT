@@ -1736,7 +1736,35 @@ static class TestEmitter
 
                         var arrayLiteral = $"[{string.Join(", ", elems.Take(postLen))}]";
                         if (isUnique)
-                            sb.AppendLine($"    expect {inp.Name}[..] == {arrayLiteral};");
+                        {
+                            if (hasEnumeratedAlts)
+                            {
+                                var allArrayVals = new List<string> { arrayLiteral };
+                                for (int ai = 0; ai < altCount; ai++)
+                                {
+                                    if (values.TryGetValue($"__alt_{ai}_{inp.Name}_post_len", out var altLenStr)
+                                        && int.TryParse(altLenStr, out var altLen) && altLen >= 0)
+                                    {
+                                        string[] altElems;
+                                        if (values.TryGetValue($"__alt_{ai}_{inp.Name}_post_elems", out var altElemsStr))
+                                            altElems = altElemsStr.Split(',');
+                                        else
+                                            altElems = Enumerable.Range(0, altLen).Select(_ => "0").ToArray();
+                                        if (elemType == "real")
+                                            altElems = altElems.Select(e => e.Contains('.') ? e : e + ".0").ToArray();
+                                        if (elemType == "bool")
+                                            altElems = altElems.Select(e => e == "true" ? "true" : "false").ToArray();
+                                        allArrayVals.Add($"[{string.Join(", ", altElems.Take(altLen))}]");
+                                    }
+                                }
+                                if (allArrayVals.Count > 1)
+                                    sb.AppendLine($"    expect {string.Join(" || ", allArrayVals.Select(v => $"{inp.Name}[..] == {v}"))};");
+                                else
+                                    sb.AppendLine($"    expect {inp.Name}[..] == {arrayLiteral};");
+                            }
+                            else
+                                sb.AppendLine($"    expect {inp.Name}[..] == {arrayLiteral};");
+                        }
                         else
                             sb.AppendLine($"    // expect {inp.Name}[..] == {arrayLiteral}; // (one valid value — not uniquely determined by spec)");
                     }
