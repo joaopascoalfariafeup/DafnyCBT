@@ -816,14 +816,32 @@ static class TestValidator
     static int FindTopLevelDoubleEquals(string s)
     {
         int depth = 0;
+        string[] compoundKeywords = { "if", "var", "match", "forall", "exists", "assert", "assume" };
         for (int i = 0; i + 1 < s.Length; i++)
         {
             char c = s[i];
-            if (c == '(' || c == '[' || c == '{') depth++;
-            else if (c == ')' || c == ']' || c == '}') depth--;
-            else if (depth == 0 && c == ':' && s[i + 1] == ':')
+            if (c == '(' || c == '[' || c == '{') { depth++; continue; }
+            if (c == ')' || c == ']' || c == '}') { depth--; continue; }
+            if (depth != 0) continue;
+
+            if (c == ':' && s[i + 1] == ':')
                 return -1; // entered quantifier/comprehension body — don't split
-            else if (depth == 0 && c == '=' && s[i + 1] == '=')
+
+            // Compound-expression keyword at word boundary → remainder is inside
+            // compound-expr body (if/then/else, let-binding, match, quantifier). Abort.
+            bool wordStart = i == 0 || (!char.IsLetterOrDigit(s[i - 1]) && s[i - 1] != '_' && s[i - 1] != '\'');
+            if (wordStart)
+            {
+                foreach (var kw in compoundKeywords)
+                {
+                    if (i + kw.Length <= s.Length && s.Substring(i, kw.Length) == kw
+                        && (i + kw.Length == s.Length
+                            || (!char.IsLetterOrDigit(s[i + kw.Length]) && s[i + kw.Length] != '_' && s[i + kw.Length] != '\'')))
+                        return -1;
+                }
+            }
+
+            if (c == '=' && s[i + 1] == '=')
             {
                 char prev = i > 0 ? s[i - 1] : ' ';
                 char next = i + 2 < s.Length ? s[i + 2] : ' ';
