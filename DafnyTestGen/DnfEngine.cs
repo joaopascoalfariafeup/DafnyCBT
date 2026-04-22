@@ -76,6 +76,7 @@ static class DnfEngine
                     // form so equivalent pairs like "!(X !in Y)" and "X in Y" collapse.
                     var seen = new HashSet<string>();
                     merged = merged.Where(e => seen.Add(CanonicalLiteralKey(ExprToString(e)))).ToList();
+                    merged = DropImpliedLiterals(merged);
                     result.Add(merged);
                 }
             }
@@ -1166,6 +1167,92 @@ static class DnfEngine
                 s = neg;
         }
         return s;
+    }
+
+    /// <summary>
+    /// Drop or strengthen relational literals using same-LHS/RHS implications in the clause:
+    ///   a &lt;= b    dropped if   a == b   or   a &lt; b   is present
+    ///   a &gt;= b    dropped if   a == b   or   a &gt; b   is present
+    ///   a != b    dropped if   a &lt; b    or   a &gt; b   is present
+    /// And pairs collapsing two into a stronger one:
+    ///   (a &lt;= b) ∧ (a != b)   →   a &lt; b
+    ///   (a &gt;= b) ∧ (a != b)   →   a &gt; b
+    /// </summary>
+    internal static List<Expression> DropImpliedLiterals(List<Expression> clause)
+    {
+        if (clause.Count < 2) return clause;
+        var keys = clause.Select(e => CanonicalLiteralKey(ExprToString(e))).ToList();
+
+        (string? lhs, string? rhs, string? op) Parse(string s)
+        {
+            foreach (var op in new[] { " <= ", " >= ", " == ", " != ", " < ", " > " })
+            {
+                int i = FindTopLevelOperator(s, op);
+                if (i >= 0) return (s.Substring(0, i).Trim(), s.Substring(i + op.Length).Trim(), op.Trim());
+            }
+            return (null, null, null);
+        }
+
+        var parsed = keys.Select(Parse).ToList();
+
+        // Phase A: drop weaker-implied literals. When the weaker slot precedes the
+        // stronger one in spec order, relocate the stronger expression into the
+        // weaker's slot — the weaker was likely acting as a guard (`<=` before
+        // array access), so preserving that earlier position keeps guard-before-access
+        // ordering for downstream short-circuit evaluation.
+        var drop = new HashSet<int>();
+        var replace = new Dictionary<int, Expression>();
+        for (int i = 0; i < clause.Count; i++)
+        {
+            if (parsed[i].op == null) continue;
+            for (int j = 0; j < clause.Count; j++)
+            {
+                if (i == j || parsed[j].op == null) continue;
+                if (parsed[i].lhs != parsed[j].lhs || parsed[i].rhs != parsed[j].rhs) continue;
+                var (oi, oj) = (parsed[i].op!, parsed[j].op!);
+                bool weakerImplied =
+                    (oi == "<=" && (oj == "==" || oj == "<")) ||
+                    (oi == ">=" && (oj == "==" || oj == ">")) ||
+                    (oi == "!=" && (oj == "<" || oj == ">"));
+                if (!weakerImplied) continue;
+                if (i < j) { replace[i] = clause[j]; drop.Add(j); }
+                else { drop.Add(i); }
+                break;
+            }
+        }
+
+        // Phase B: strengthen (<= ∧ !=) → <, (>= ∧ !=) → >. Replace at the *earlier*
+        // position in the clause — guard-like literals (<=, >=) are typically written
+        // first in specs, so keeping that slot preserves guard-before-access ordering
+        // for any downstream short-circuit evaluation (runtime expects, EXV prints).
+        // Using LeafExpression avoids depending on the != literal's AST shape (it may
+        // be a BinaryExpr, a UnaryOp-wrapped Eq, or a synthetic LeafExpression from DNF).
+        for (int i = 0; i < clause.Count; i++)
+        {
+            if (drop.Contains(i) || parsed[i].op != "!=") continue;
+            for (int j = 0; j < clause.Count; j++)
+            {
+                if (i == j || drop.Contains(j) || parsed[j].op == null) continue;
+                if (parsed[i].lhs != parsed[j].lhs || parsed[i].rhs != parsed[j].rhs) continue;
+                var oj = parsed[j].op!;
+                string? strictOp = oj == "<=" ? "<" : oj == ">=" ? ">" : null;
+                if (strictOp == null) continue;
+                int keep = Math.Min(i, j);
+                int discard = Math.Max(i, j);
+                replace[keep] = new LeafExpression($"{parsed[i].lhs} {strictOp} {parsed[i].rhs}");
+                drop.Add(discard);
+                break;
+            }
+        }
+
+        if (drop.Count == 0 && replace.Count == 0) return clause;
+        var result = new List<Expression>(clause.Count);
+        for (int i = 0; i < clause.Count; i++)
+        {
+            if (drop.Contains(i)) continue;
+            result.Add(replace.TryGetValue(i, out var r) ? r : clause[i]);
+        }
+        return result;
     }
 
     /// <summary>

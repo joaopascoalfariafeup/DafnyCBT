@@ -3656,6 +3656,127 @@ static class SmtTranslator
     }
 
     /// <summary>
+    /// Grouped relevance query: single shadow output block with
+    ///     assert Q_j        for each non-safe (guard-like) index j
+    ///     assert ¬(⋀_{k ∈ S} Q_k)     over the safe indices S
+    ///     outs ≠ outs_altG
+    /// SAT ⇒ the cluster S is collectively relevant → witness (ins, outs) drives
+    /// non-degenerate inputs (since some Q_k in S must be genuinely cuttable).
+    /// UNSAT ⇒ the cluster is universally implied by the guards → clause genuinely
+    /// redundant.
+    ///
+    /// Strictly weaker (more SAT-prone) than the per-literal combined query,
+    /// because satisfying ¬(⋀Q_k) needs only one Q_k to fail; per-literal requires
+    /// every single Q_k individually negatable.
+    /// </summary>
+    internal static string? BuildGroupRelevanceQuery(
+        List<(string Name, string Type)> inputs,
+        List<(string Name, string Type)> outputs,
+        List<Expression> preLiterals,
+        List<Expression> postLiterals,
+        Method method,
+        HashSet<string>? mutableNames = null,
+        List<int>? safeIndices = null)
+    {
+        mutableNames ??= new HashSet<string>();
+        if (postLiterals.Count == 0) return null;
+
+        var indices = safeIndices != null && safeIndices.Count > 0
+            ? safeIndices
+            : new List<int> { postLiterals.Count - 1 };
+
+        var baseSmt = BuildSmt2Query(
+            inputs, outputs, preLiterals, postLiterals, method,
+            verbose: false,
+            exclusions: null,
+            extraConstraints: null,
+            preLiterals: preLiterals,
+            mutableNames: mutableNames,
+            skipBias: false);
+
+        var checkIdx = baseSmt.LastIndexOf("(check-sat)");
+        if (checkIdx < 0) return null;
+
+        // Drop safe indices whose literal references uninterpreted user-defined
+        // functions (same rationale as BuildRelevanceQuery).
+        var uninterpFns = new HashSet<string>();
+        foreach (Match dm in Regex.Matches(baseSmt, @"\(declare-fun\s+(\S+)\s+\(([^)]*)\)\s"))
+        {
+            if (!string.IsNullOrWhiteSpace(dm.Groups[2].Value))
+                uninterpFns.Add(dm.Groups[1].Value);
+        }
+        if (uninterpFns.Count > 0)
+        {
+            var filtered = new List<int>();
+            foreach (var idx in indices)
+            {
+                var litDafny = DnfEngine.ExprToString(postLiterals[idx]);
+                bool hasUninterp = false;
+                foreach (var fn in uninterpFns)
+                {
+                    if (Regex.IsMatch(litDafny, @"\b" + Regex.Escape(fn) + @"\s*(<[^>]*>)?\s*\("))
+                    { hasUninterp = true; break; }
+                }
+                if (!hasUninterp) filtered.Add(idx);
+            }
+            if (filtered.Count == 0) return null;
+            indices = filtered;
+        }
+
+        var sb = new System.Text.StringBuilder(baseSmt.Substring(0, checkIdx));
+        var inputsAndOutputs = inputs.Concat(outputs).ToList();
+        var safeSet = new HashSet<int>(indices);
+
+        const string suffix = "altG";
+        sb.AppendLine();
+        sb.AppendLine($"; ─── Grouped Relevance: shadow output (outs_{suffix}) ───");
+        if (!EmitOutputAltDeclarations(sb, inputs, outputs, mutableNames, suffix))
+            return null;
+
+        var renameMap = BuildOutputAltRenameMap(inputs, outputs, mutableNames, suffix);
+        if (renameMap.Count == 0) return null;
+
+        sb.AppendLine();
+        sb.AppendLine($"; ─── Grouped Relevance: non-safe literals held; ¬(⋀ safe Q_k) ───");
+
+        var safeSmtParts = new List<string>();
+        for (int j = 0; j < postLiterals.Count; j++)
+        {
+            var lit = postLiterals[j];
+            var litStr = DnfEngine.ExprToString(lit);
+            if (TypeUtils.IsSpecOnlyLiteral(litStr)) continue;
+            ResetExprToSmtBudget();
+            var smtExpr = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true);
+            if (smtExpr == null) return null;
+            smtExpr = ApplyOutputAltRenames(smtExpr, renameMap);
+            if (safeSet.Contains(j))
+                safeSmtParts.Add(smtExpr);
+            else
+                sb.AppendLine($"(assert {smtExpr})");
+        }
+
+        if (safeSmtParts.Count == 0) return null;
+        var conj = safeSmtParts.Count == 1
+            ? safeSmtParts[0]
+            : $"(and {string.Join(" ", safeSmtParts)})";
+        sb.AppendLine($"(assert (not {conj}))");
+
+        sb.AppendLine();
+        sb.AppendLine($"; ─── Grouped Relevance: outs ≠ outs_{suffix} ───");
+        var ineq = BuildOutputInequalityClause(inputs, outputs, mutableNames, suffix);
+        if (ineq == null) return null;
+        sb.AppendLine(ineq);
+
+        sb.AppendLine();
+        sb.AppendLine("(check-sat)");
+        sb.AppendLine("(get-model)");
+        EmitGetValueQueries(sb, inputs, outputs, mutableNames);
+
+        var smtText = RewriteNestedSeqRefs(sb.ToString(), inputs, outputs);
+        return smtText;
+    }
+
+    /// <summary>
     /// Emits shadow declarations for every output identifier with "_alt" suffix.
     /// Mirrors a subset of the type-handling logic in BuildSmt2Query.
     /// Returns false if an unsupported output type is encountered.

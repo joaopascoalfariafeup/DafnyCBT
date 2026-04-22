@@ -10,6 +10,11 @@ class Program
     static bool TrustUnknownUniqueness = true;
     static int UniquenessRounds = 2;
     static bool RelevanceCheckEnabled = true;
+    // "combined" (per-literal shadow blocks), "group" (single shadow block with
+    // ¬(⋀ safe Q_k) — weakest form), or "ladder" (default: combined, fall back
+    // to group on UNSAT — strictly dominates group since combined's SAT witness
+    // is richer when available).
+    static string RelevanceMode = "ladder";
     public static bool VacuityCheckEnabled = false;
     const int VacuityCegisAttempts = 3;
 
@@ -55,10 +60,12 @@ class Program
         noRelevanceOpt.AddAlias("-nr");
         var vacuityOpt = new Option<bool>("--vacuity", "Enable per-literal vacuity check (Phase 1v). Default: OFF.");
         vacuityOpt.AddAlias("-v1v");
+        var relevanceModeOpt = new Option<string>("--relevance-mode", () => "ladder",
+            "Phase 1r shadow-block strategy: 'combined' (per-literal shadow blocks, strictest), 'group' (single shadow block with ¬(⋀ safe Q_k), weakest), or 'ladder' (default: combined then fall back to group on UNSAT — strictly dominates group).");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, relevanceModeOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -93,6 +100,15 @@ class Program
             VacuityCheckEnabled = ctx.ParseResult.GetValueForOption(vacuityOpt);
             if (VacuityCheckEnabled)
                 Console.WriteLine("[DafnyTestGen] Vacuity check (Phase 1v): ON");
+            var relevanceModeCli = ctx.ParseResult.GetValueForOption(relevanceModeOpt) ?? "ladder";
+            if (relevanceModeCli != "combined" && relevanceModeCli != "group" && relevanceModeCli != "ladder")
+            {
+                Console.Error.WriteLine($"[DafnyTestGen] Invalid --relevance-mode '{relevanceModeCli}' (expected 'combined', 'group', or 'ladder'). Falling back to 'ladder'.");
+                relevanceModeCli = "ladder";
+            }
+            RelevanceMode = relevanceModeCli;
+            if (RelevanceMode != "ladder")
+                Console.WriteLine($"[DafnyTestGen] Relevance mode: {RelevanceMode}");
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
             var z3Path = Z3Runner.FindZ3Path(z3PathCli);
@@ -2226,17 +2242,27 @@ class Program
                             if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: skipped (subsumed by prior test)");
                             continue;
                         }
-                        var smt = SmtTranslator.BuildRelevanceQuery(
-                            inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices);
+                        // Mode selection:
+                        //   "combined" → per-literal shadow blocks; UNSAT fallback to last-safe-alone.
+                        //   "group"    → single shadow block with ¬(⋀ safe Q_k); no fallback.
+                        //   "ladder"   → combined first; on UNSAT, fall back to group (strictly
+                        //                richer than group alone since combined's SAT witness
+                        //                makes every safe Q_k individually cuttable).
+                        var mode = RelevanceMode;
+                        string? smt = mode == "group"
+                            ? SmtTranslator.BuildGroupRelevanceQuery(
+                                inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices)
+                            : SmtTranslator.BuildRelevanceQuery(
+                                inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices);
                         if (smt == null) { relSkipped++; continue; }
-                        if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel} (safe: [{string.Join(",", safeIndices.Select(i => i + 1))}])...");
+                        if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel} (mode={mode}, safe: [{string.Join(",", safeIndices.Select(i => i + 1))}])...");
                         var z3Result = await Z3Runner.RunZ3(z3Path, smt);
                         var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
                         int lastQueriedIndex = safeIndices.Count == 1 ? safeIndices[0] : -1;
-                        // UNSAT with multiple safe indices → at least one is redundant
-                        // here. Fall back to single-literal (last safe index) query to
-                        // still exercise the defining literal when possible.
-                        if (lines.Any(l => l == "unsat") && safeIndices.Count > 1)
+                        // combined/ladder: UNSAT with multiple safe indices → at least one is
+                        // redundant. Fall back to single-literal (last safe index) to still
+                        // exercise the defining literal when possible.
+                        if (mode != "group" && lines.Any(l => l == "unsat") && safeIndices.Count > 1)
                         {
                             var fallbackIndices = new List<int> { safeIndices[safeIndices.Count - 1] };
                             var fbSmt = SmtTranslator.BuildRelevanceQuery(
@@ -2247,6 +2273,19 @@ class Program
                                 z3Result = await Z3Runner.RunZ3(z3Path, fbSmt);
                                 lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
                                 lastQueriedIndex = fallbackIndices[0];
+                            }
+                        }
+                        // ladder: both combined attempts UNSAT → fall back to group.
+                        if (mode == "ladder" && lines.Any(l => l == "unsat"))
+                        {
+                            var gSmt = SmtTranslator.BuildGroupRelevanceQuery(
+                                inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices);
+                            if (gSmt != null)
+                            {
+                                if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: combined UNSAT — retry with group");
+                                z3Result = await Z3Runner.RunZ3(z3Path, gSmt);
+                                lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
+                                lastQueriedIndex = -1;  // group doesn't pinpoint a single index
                             }
                         }
                         if (lines.Any(l => l == "sat"))
@@ -2384,7 +2423,7 @@ class Program
                                 extraA.AddRange(excludedIns);
                                 var smtA = SmtTranslator.BuildSmt2Query(
                                     inputs, outputs, preClauses, clause, method, false,
-                                    null, extraA, fullPreLits, mutableNames);
+                                    null, extraA, fullPreLits, mutableNames, skipBias: true);
                                 var resA = await Z3Runner.RunZ3(z3Path, smtA);
                                 var linesA = resA.Split('\n').Select(l => l.Trim()).ToList();
                                 if (!linesA.Any(l => l == "sat")) break;

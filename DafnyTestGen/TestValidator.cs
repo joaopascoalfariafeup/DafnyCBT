@@ -571,7 +571,7 @@ static class TestValidator
                     bool isArray = arrayLocals.Contains(name)
                         || (arrayOutputNames != null && arrayOutputNames.Contains(name));
                     if (stringOutputNames != null && stringOutputNames.Contains(name))
-                        outSb.AppendLine($"{indent}print \"OUT:{testId}:{name}=[\"; for i := 0 to |{name}| {{ if i > 0 {{ print \", \"; }} print \"'\", [{name}[i]], \"'\"; }} print \"]\\n\";");
+                        outSb.AppendLine($"{indent}print \"OUT:{testId}:{name}=[\"; for i := 0 to |{name}| {{ if i > 0 {{ print \", \"; }} if {name}[i] == '\\'' {{ print \"'\\\\''\"; }} else if {name}[i] == '\\\\' {{ print \"'\\\\\\\\'\"; }} else {{ print \"'\", [{name}[i]], \"'\"; }} }} print \"]\\n\";");
                     else if (isArray)
                         outSb.AppendLine($"{indent}print \"OUT:{testId}:{name}=\", {name}[..], \"\\n\";");
                     else
