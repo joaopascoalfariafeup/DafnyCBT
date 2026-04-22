@@ -728,36 +728,70 @@ static class SmtTranslator
 
 
         _inPostContext = false;
-        // Encode preconditions (constrain pre-state variables)
+        // Encode preconditions (constrain pre-state variables).
+        // A precondition counts as "fully translated" (Z3-guaranteed) only when ExprToSmt
+        // succeeds AND the translation introduces no new uninterpreted functions. When a
+        // recursive / non-inlined user function appears (e.g., sum(a,0,i) in a prefix-sum
+        // spec), Z3 may satisfy the formula by fabricating arbitrary return values —
+        // producing inputs that satisfy the SMT but violate the pre at runtime. In that
+        // case, leave the assertion in (Z3 still benefits from any concrete constraints)
+        // but do NOT mark the pre as translated, so TestEmitter emits a runtime PRE-CHECK.
+        bool PreIsTrustworthy(Expression p, out string? smt)
+        {
+            smt = ExprToSmt(p, inputs, mutableNames, isPostContext: false);
+            if (smt == null) return false;
+            // Scan the emitted SMT for any uninterpreted-fn invocation "(fnName ".
+            // _uninterpFuncs accumulates across the whole query (pre+post), so a
+            // delta-count check would miss pre-clauses that re-use uninterp fns
+            // already registered by postconditions (e.g. `sum(...)` appearing in
+            // both ensures and `is_prefix_sum_for` pre).
+            foreach (var (fnName, _) in _uninterpFuncs)
+            {
+                if (Regex.IsMatch(smt, @"\(" + Regex.Escape(fnName) + @"\s"))
+                    return false;
+            }
+            return true;
+        }
+
+        var preLitsTrustworthy = new List<bool>();
         if (preLiterals != null && preLiterals.Count > 0)
         {
             foreach (var preLit in preLiterals)
             {
-                var smtExpr = ExprToSmt(preLit, inputs, mutableNames, isPostContext: false);
+                bool trustworthy = PreIsTrustworthy(preLit, out var smtExpr);
                 if (smtExpr != null)
                 {
                     assertions.AppendLine($"(assert {smtExpr})");
-                    _translatedPreConditions.Add(DnfEngine.ExprToString(preLit));
+                    if (trustworthy)
+                        _translatedPreConditions.Add(DnfEngine.ExprToString(preLit));
+                    else
+                        assertions.AppendLine($"; Pre uses uninterpreted fn — runtime PRE-CHECK required: {DnfEngine.ExprToString(preLit)}");
                 }
                 else
                 {
                     var litStr = DnfEngine.ExprToString(preLit);
                     assertions.AppendLine($"; Could not translate precondition: {litStr}");
                 }
+                preLitsTrustworthy.Add(trustworthy && smtExpr != null);
             }
-            // Also mark original preconditions as translated (they're guaranteed by their DNF literals)
-            foreach (var pre in preClauses)
-                _translatedPreConditions.Add(DnfEngine.ExprToString(pre));
+            // Mark original preconditions as translated ONLY if all their DNF literals
+            // were trustworthy — otherwise a partially-uninterpreted clause could slip past.
+            if (preLitsTrustworthy.Count > 0 && preLitsTrustworthy.All(b => b))
+                foreach (var pre in preClauses)
+                    _translatedPreConditions.Add(DnfEngine.ExprToString(pre));
         }
         else
         {
             foreach (var pre in preClauses)
             {
-                var smtExpr = ExprToSmt(pre, inputs, mutableNames, isPostContext: false);
+                bool trustworthy = PreIsTrustworthy(pre, out var smtExpr);
                 if (smtExpr != null)
                 {
                     assertions.AppendLine($"(assert {smtExpr})");
-                    _translatedPreConditions.Add(DnfEngine.ExprToString(pre));
+                    if (trustworthy)
+                        _translatedPreConditions.Add(DnfEngine.ExprToString(pre));
+                    else
+                        assertions.AppendLine($"; Pre uses uninterpreted fn — runtime PRE-CHECK required: {DnfEngine.ExprToString(pre)}");
                 }
                 else
                 {

@@ -293,6 +293,19 @@ class Program
                 Console.Error.WriteLine("No testable methods found (methods with ensures and without 'test' in name).");
                 return;
             }
+            // Skip verifier-style methods whose bodies use Dafny's havoc construct (`x := *`
+            // or `x, y := *, *`). These are proof encodings — Dafny's compiler treats `*` as
+            // a no-op at runtime, so the compiled code diverges from the spec. Running
+            // DafnyTestGen against them produces false-positive failures.
+            var havocMethods = new List<string>();
+            methods = methods.Where(m =>
+            {
+                if (!MethodContainsHavoc(m, source)) return true;
+                havocMethods.Add(m.Name);
+                return false;
+            }).ToList();
+            if (havocMethods.Count > 0)
+                Console.WriteLine($"[DafnyTestGen] Skipping {havocMethods.Count} verifier-style method(s) using havoc (`:= *`): {string.Join(", ", havocMethods)}");
             Console.WriteLine($"[DafnyTestGen] Auto-discovered {methods.Count} method(s): {string.Join(", ", methods.Select(m => m.Name))}");
         }
 
@@ -781,6 +794,29 @@ class Program
     }
 
     /// <summary>
+    /// True if the method's body contains Dafny havoc assignments (`x := *`, `x, y := *, *`).
+    /// Detected lexically from the source: find the method-name line and scan its body text
+    /// up to the matching closing brace. Havoc has no runtime semantics in compiled code, so
+    /// methods using it are verifier-only and would produce spurious test failures.
+    /// </summary>
+    static bool MethodContainsHavoc(Method m, string source)
+    {
+        if (m.Body == null) return false;
+        // Body span in source comes from the block's start/end tokens.
+        // Dafny IToken exposes `pos` as the byte offset — use it to extract the body text.
+        int startPos, endPos;
+        try
+        {
+            startPos = m.Body.StartToken.pos;
+            endPos = m.Body.EndToken.pos;
+        }
+        catch { return false; }
+        if (startPos < 0 || endPos <= startPos || endPos > source.Length) return false;
+        var bodyText = source.Substring(startPos, endPos - startPos);
+        return Regex.IsMatch(bodyText, @":=\s*\*(?:\s*,\s*\*)*\s*;");
+    }
+
+    /// <summary>
     /// True if `expr` contains a top-level (paren-depth 0) Dafny boolean operator
     /// that binds looser than ==, i.e. ==>, <==>, &&, or ||. Used to decide whether
     /// an ensures of the form "outName == rhs" is really a top-level equality or
@@ -1029,8 +1065,11 @@ class Program
 
         var preClauses = method.Req.Select(r => r.E).ToList();
 
-        // For autocontracts: add constructor requires as preconditions
-        if (classInfo is { IsAutoContracts: true, ConstructorRequires: not null })
+        // Constructor requires must hold at runtime: even when test code overwrites
+        // fields after construction (non-autocontracts), the constructor body still
+        // runs, so Z3 must pick constructor args satisfying its `requires`. Otherwise
+        // we get OverflowException / precondition violations at `new T(args)`.
+        if (classInfo is { ConstructorRequires: not null })
         {
             foreach (var ctorReq in classInfo.ConstructorRequires)
                 preClauses.Add(ctorReq);
