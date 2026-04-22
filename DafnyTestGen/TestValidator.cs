@@ -37,6 +37,13 @@ static class TestValidator
     ///   4. For tests that didn't complete (crash/timeout), re-run the same exe
     ///      with the test index as argument — no recompilation needed.
     /// </summary>
+    /// When true, tests that exit non-zero without emitting a FAIL marker (i.e., the
+    /// method under test threw an unhandled exception) are routed to SKIP instead of
+    /// FAIL. Useful when running DafnyTestGen against a corpus where some methods are
+    /// known to crash on boundary inputs and you want to separate those cases from
+    /// genuine postcondition violations.
+    public static bool SkipOnException = false;
+
     internal static async Task<string> CheckAndSplitTests(
         string generatedCode, string originalSource, string outputPath, string grouping = "by-method")
     {
@@ -153,6 +160,11 @@ static class TestValidator
             var stderrByTestId = new Dictionary<int, string>();
             var wrongValIds = new HashSet<int>();
             ParseWrongValMarkers(batchOut, wrongValIds);
+            // Tests that crashed (non-zero exit, no FAIL marker) during individual
+            // re-check. With --skip-on-exception, these are reported as SKIP rather
+            // than FAIL; without it, merged into failedIds for backwards-compatible
+            // failure reporting.
+            var exceptionIds = new HashSet<int>();
 
             // ── Phase 3: re-check incomplete tests individually ─────────────────
             var incompleteIds = new HashSet<int>();
@@ -187,8 +199,10 @@ static class TestValidator
                         skippedIds.UnionWith(reSkipped);
                         var reFailed = new HashSet<int>();
                         ParseFailMarkers(reOut, reFailed);
-                        if (reFailed.Count > 0 || reCode != 0)
-                            failedIds.Add(idx);
+                        if (reFailed.Count > 0)
+                            failedIds.Add(idx);  // genuine expect failure
+                        else if (reCode != 0)
+                            exceptionIds.Add(idx);  // crash without FAIL marker — impl threw
 
                         // Merge captured values and WRONGVAL markers from individual run
                         var reVals = ParseValMarkers(reOut);
@@ -230,8 +244,17 @@ static class TestValidator
 
             // ── Report and split ────────────────────────────────────────────────
             // Each classified block remembers its source method for by-method grouping.
+            // When --skip-on-exception is off, merge exceptionIds into failedIds so the
+            // classification logic treats them as failures (legacy behavior). When on,
+            // route them to a new "skipped-exception" bucket.
+            if (!SkipOnException)
+            {
+                foreach (var idx in exceptionIds) failedIds.Add(idx);
+                exceptionIds.Clear();
+            }
             var classified = new List<(string comment, string body, string sourceMethod, bool failing)>();
             int skippedCount = 0;
+            int skippedExceptionCount = 0;
             int passingCount = 0;
             int failingCount = 0;
 
@@ -242,6 +265,21 @@ static class TestValidator
                 {
                     skippedCount++;
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: SKIP (precondition violated)");
+                }
+                else if (exceptionIds.Contains(i))
+                {
+                    // --skip-on-exception is on: impl threw; treat as skipped, keep test
+                    // in output with its expects commented (so the user can see what ran)
+                    // but marked as failing=true in the layout so EmitByMethodTests uses
+                    // the "// expect …" rewrite and it doesn't abort the test suite.
+                    var annotatedBody = InjectRuntimeInfo(
+                        body,
+                        capturedOuts.GetValueOrDefault(i),
+                        stderrByTestId.GetValueOrDefault(i),
+                        failing: true);
+                    classified.Add((comment, annotatedBody, src, true));
+                    skippedExceptionCount++;
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: SKIP (exception from implementation)");
                 }
                 else if (failedIds.Contains(i))
                 {
@@ -279,6 +317,7 @@ static class TestValidator
 
             var resultMsg = $"[DafnyTestGen] Results: {passingCount} passing, {failingCount} failing";
             if (skippedCount > 0) resultMsg += $", {skippedCount} skipped (precondition violated)";
+            if (skippedExceptionCount > 0) resultMsg += $", {skippedExceptionCount} skipped (exception)";
             Console.WriteLine(resultMsg);
 
             if (grouping == "by-status")

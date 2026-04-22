@@ -62,12 +62,14 @@ class Program
         vacuityOpt.AddAlias("-v1v");
         var relevanceModeOpt = new Option<string>("--relevance-mode", () => "ladder",
             "Phase 1r shadow-block strategy: 'combined' (per-literal shadow blocks, strictest), 'group' (single shadow block with ¬(⋀ safe Q_k), weakest), or 'ladder' (default: combined then fall back to group on UNSAT — strictly dominates group).");
+        var skipOnExceptionOpt = new Option<bool>("--skip-on-exception",
+            "In --check mode, treat tests that crash with an unhandled exception from the method under test (non-zero exit, no FAIL marker) as SKIPPED instead of FAILED. Preconditions that passed PRE-CHECK but led to a crash (e.g. out-of-bounds access, overflow in the impl) are reported separately as `skipped (exception)`. Default: OFF — crashes count as failures.");
         var dropPostWfOpt = new Option<bool>("--drop-post-wf-guards", () => true,
             "Drop well-formedness guards (e.g., 0<=i<a.Length) generated while translating postconditions. Default: ON. An implication-guarded access like '0<=i<a.Length ==> a[i] == x' already bounds i inside the `==>`; re-asserting the bound as a hard top-level fact would incorrectly strengthen the spec and break uniqueness/relevance reasoning. Pass `--drop-post-wf-guards false` to restore legacy behavior.");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, relevanceModeOpt, dropPostWfOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -90,6 +92,7 @@ class Program
             var timeout = ctx.ParseResult.GetValueForOption(timeoutOpt);
             TrustUnknownUniqueness = ctx.ParseResult.GetValueForOption(trustUnknownOpt);
             SmtTranslator.DropPostWfGuards = ctx.ParseResult.GetValueForOption(dropPostWfOpt);
+            TestValidator.SkipOnException = ctx.ParseResult.GetValueForOption(skipOnExceptionOpt);
             UniquenessRounds = ctx.ParseResult.GetValueForOption(uniquenessRoundsOpt);
             var skipBodyless = ctx.ParseResult.GetValueForOption(skipBodylessOpt);
             var antiTrivialBias = !ctx.ParseResult.GetValueForOption(noBiasOpt);
