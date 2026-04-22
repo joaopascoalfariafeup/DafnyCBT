@@ -131,6 +131,25 @@ static class TestValidator
                 $"build --allow-warnings --no-verify \"{testFile}\" -o \"{runnerBase}\"",
                 BuildTimeoutMs);
 
+            // Retry once after commenting out lines that hit Dafny's "bounded set
+            // of values" error (unbounded quantifier in compiled context). Common
+            // with specs like `forall i :: x <= i && i < a.Length && a[i] <= m`
+            // where the guard isn't in `==>` form; Dafny's bounded-pool inference
+            // can't compile the forall. Commenting just the offending line keeps
+            // the rest of the tests alive.
+            var uncompilableByTestId = new Dictionary<int, HashSet<string>>();
+            if ((!buildExited || buildCode != 0)
+                && TryCommentUncompilableQuantifiers(
+                    testFile, buildOut + "\n" + buildErr,
+                    out var commentedLines, out uncompilableByTestId))
+            {
+                Console.WriteLine($"[DafnyTestGen] Build failed with {commentedLines} unbounded-quantifier error(s); commented them out and retrying.");
+                (buildExited, buildCode, buildOut, buildErr) = await RunProcess(
+                    dafnyPath,
+                    $"build --allow-warnings --no-verify \"{testFile}\" -o \"{runnerBase}\"",
+                    BuildTimeoutMs);
+            }
+
             if (!buildExited || buildCode != 0)
             {
                 Console.Error.WriteLine($"[DafnyTestGen] Build failed (exit={buildCode}), check file: {testFile}");
@@ -264,6 +283,10 @@ static class TestValidator
             for (int i = 0; i < testBlocks.Count; i++)
             {
                 var (comment, body, src) = testBlocks[i];
+                // Propagate uncompilable-quantifier comments from check_all.dfy into
+                // the user-visible Tests.dfy so it also compiles standalone.
+                if (uncompilableByTestId.TryGetValue(i, out var badExprs))
+                    body = CommentUncompilableExpectsInBody(body, badExprs);
                 if (skippedIds.Contains(i))
                 {
                     skippedCount++;
@@ -1423,6 +1446,113 @@ static class TestValidator
         }
 
         return (null, "");
+    }
+
+    /// <summary>
+    /// Dafny's compiler rejects `forall v :: body` in a non-ghost context when it
+    /// can't derive a bounded pool for v. The error is localised to a specific line
+    /// in check_all.dfy. Comment each such line in place and return true so the
+    /// caller can retry the build. Returns false if no such errors were found, so
+    /// the caller falls through to normal failure reporting.
+    /// Also populates `uncompilableByTestId`: the expressions that were inside
+    /// `CheckExpect(expr, testId);` on those lines — the caller uses this to
+    /// propagate the same comment back into the generated Tests.dfy so that file
+    /// also compiles stand-alone.
+    /// </summary>
+    static bool TryCommentUncompilableQuantifiers(
+        string checkFilePath,
+        string buildOutput,
+        out int commentedLines,
+        out Dictionary<int, HashSet<string>> uncompilableByTestId)
+    {
+        commentedLines = 0;
+        uncompilableByTestId = new Dictionary<int, HashSet<string>>();
+        if (!File.Exists(checkFilePath) || string.IsNullOrEmpty(buildOutput))
+            return false;
+
+        // Match `.../check_all.dfy(LINE,COL): Error: quantifiers in non-ghost contexts
+        // must be compilable, but Dafny's heuristics can't figure out how to produce or
+        // compile a bounded set of values for ...`. Keep the filename loose — different
+        // shells/paths (cygwin vs native) vary.
+        var checkFileName = Regex.Escape(Path.GetFileName(checkFilePath));
+        var errPattern = new Regex(
+            checkFileName + @"\((\d+),\d+\):\s*Error:\s*quantifiers in non-ghost contexts must be compilable",
+            RegexOptions.IgnoreCase);
+        var badLines = new HashSet<int>();
+        foreach (Match m in errPattern.Matches(buildOutput))
+        {
+            if (int.TryParse(m.Groups[1].Value, out var ln))
+                badLines.Add(ln);
+        }
+        if (badLines.Count == 0) return false;
+
+        // Matches `CheckExpect(<expr>, <testId>);` — capture the expression and the
+        // id so we can comment the corresponding `expect <expr>;` in Tests.dfy.
+        var checkExpectRe = new Regex(@"^\s*CheckExpect\((.+),\s*(\d+)\)\s*;\s*$");
+        var lines = File.ReadAllLines(checkFilePath);
+        foreach (var ln in badLines)
+        {
+            if (ln < 1 || ln > lines.Length) continue;
+            var raw = lines[ln - 1];
+            var trimmed = raw.TrimStart();
+            if (trimmed.StartsWith("//")) continue; // already commented
+
+            var ceMatch = checkExpectRe.Match(raw);
+            if (ceMatch.Success && int.TryParse(ceMatch.Groups[2].Value, out var tid))
+            {
+                var expr = ceMatch.Groups[1].Value.Trim();
+                if (!uncompilableByTestId.TryGetValue(tid, out var set))
+                    uncompilableByTestId[tid] = set = new HashSet<string>();
+                set.Add(expr);
+            }
+
+            var indent = raw.Substring(0, raw.Length - trimmed.Length);
+            lines[ln - 1] = indent + "// UNCOMPILABLE (unbounded quantifier) — " + trimmed;
+            commentedLines++;
+        }
+        if (commentedLines == 0) return false;
+        File.WriteAllLines(checkFilePath, lines);
+        return true;
+    }
+
+    /// <summary>
+    /// For each test block whose index is in `uncompilableByTestId`, rewrite any
+    /// `expect <expr>;` line whose `<expr>` matches a known-uncompilable expression
+    /// into a commented form `// UNCOMPILABLE (unbounded quantifier) — expect <expr>;`.
+    /// Keeps the user-facing Tests.dfy standalone-compilable even if the user skips
+    /// the check harness and runs it directly.
+    /// </summary>
+    static string CommentUncompilableExpectsInBody(
+        string body, HashSet<string> uncompilableExprs)
+    {
+        if (uncompilableExprs.Count == 0) return body;
+        var sb = new StringBuilder();
+        foreach (var line in body.Split('\n'))
+        {
+            var trimmedRight = line.TrimEnd('\r');
+            var trimmed = trimmedRight.TrimStart();
+            if (trimmed.StartsWith("expect "))
+            {
+                var semiIdx = trimmedRight.LastIndexOf(';');
+                if (semiIdx > 0)
+                {
+                    var expr = trimmedRight.Substring(trimmedRight.IndexOf("expect ") + 7,
+                        semiIdx - trimmedRight.IndexOf("expect ") - 7).Trim();
+                    if (uncompilableExprs.Contains(expr))
+                    {
+                        var indent = trimmedRight.Substring(0, trimmedRight.Length - trimmed.Length);
+                        sb.AppendLine(indent + "// UNCOMPILABLE (unbounded quantifier) — " + trimmed);
+                        continue;
+                    }
+                }
+            }
+            sb.AppendLine(trimmedRight);
+        }
+        // Preserve trailing-newline behaviour of original (trim the last \n we added)
+        var result = sb.ToString();
+        if (!body.EndsWith("\n") && result.EndsWith("\n"))
+            result = result.TrimEnd('\n');
+        return result;
     }
 
     static async Task<(bool exited, int exitCode, string stdout, string stderr)>
