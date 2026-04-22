@@ -44,6 +44,9 @@ static class TestValidator
     /// genuine postcondition violations.
     public static bool SkipOnException = false;
 
+    /// Classification used when splitting test blocks after a --check run.
+    internal enum TestStatus { Passing, Failing, CrashSkipped }
+
     internal static async Task<string> CheckAndSplitTests(
         string generatedCode, string originalSource, string outputPath, string grouping = "by-method")
     {
@@ -252,7 +255,7 @@ static class TestValidator
                 foreach (var idx in exceptionIds) failedIds.Add(idx);
                 exceptionIds.Clear();
             }
-            var classified = new List<(string comment, string body, string sourceMethod, bool failing)>();
+            var classified = new List<(string comment, string body, string sourceMethod, TestStatus status)>();
             int skippedCount = 0;
             int skippedExceptionCount = 0;
             int passingCount = 0;
@@ -268,16 +271,16 @@ static class TestValidator
                 }
                 else if (exceptionIds.Contains(i))
                 {
-                    // --skip-on-exception is on: impl threw; treat as skipped, keep test
-                    // in output with its expects commented (so the user can see what ran)
-                    // but marked as failing=true in the layout so EmitByMethodTests uses
-                    // the "// expect …" rewrite and it doesn't abort the test suite.
+                    // --skip-on-exception on: impl threw. Keep the block in the output
+                    // so the user can see what was attempted, but mark CrashSkipped so
+                    // EmitByMethodTests comments out EVERY line (including the method
+                    // call) — otherwise the crash would re-occur and abort later tests.
                     var annotatedBody = InjectRuntimeInfo(
                         body,
                         capturedOuts.GetValueOrDefault(i),
                         stderrByTestId.GetValueOrDefault(i),
                         failing: true);
-                    classified.Add((comment, annotatedBody, src, true));
+                    classified.Add((comment, annotatedBody, src, TestStatus.CrashSkipped));
                     skippedExceptionCount++;
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: SKIP (exception from implementation)");
                 }
@@ -293,7 +296,7 @@ static class TestValidator
                         capturedOuts.GetValueOrDefault(i),
                         stderrByTestId.GetValueOrDefault(i),
                         failing: true);
-                    classified.Add((comment, annotatedBody, src, true));
+                    classified.Add((comment, annotatedBody, src, TestStatus.Failing));
                     failingCount++;
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: FAIL");
                 }
@@ -301,7 +304,7 @@ static class TestValidator
                 {
                     var injected = InjectCapturedValues(body, i, capturedVals, arrayOutputNames, forceReplace: true);
                     injected = InjectRuntimeInfo(injected, capturedOuts.GetValueOrDefault(i), null, failing: false);
-                    classified.Add((comment, injected, src, false));
+                    classified.Add((comment, injected, src, TestStatus.Passing));
                     passingCount++;
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS (rescued — Z3 value corrected by runtime)");
                 }
@@ -309,7 +312,7 @@ static class TestValidator
                 {
                     var injected = InjectCapturedValues(body, i, capturedVals, arrayOutputNames);
                     injected = InjectRuntimeInfo(injected, capturedOuts.GetValueOrDefault(i), null, failing: false);
-                    classified.Add((comment, injected, src, false));
+                    classified.Add((comment, injected, src, TestStatus.Passing));
                     passingCount++;
                     Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS");
                 }
@@ -322,8 +325,8 @@ static class TestValidator
 
             if (grouping == "by-status")
             {
-                var passing = classified.Where(c => !c.failing).Select(c => (c.comment, c.body)).ToList();
-                var failing = classified.Where(c => c.failing).Select(c => (c.comment, c.body)).ToList();
+                var passing = classified.Where(c => c.status == TestStatus.Passing).Select(c => (c.comment, c.body)).ToList();
+                var failing = classified.Where(c => c.status != TestStatus.Passing).Select(c => (c.comment, c.body)).ToList();
                 return EmitSplitTests(sourceHeader, passing, failing);
             }
             return EmitByMethodTests(sourceHeader, classified, sourceMethodOrder);
@@ -1555,7 +1558,7 @@ static class TestValidator
 
     static string EmitByMethodTests(
         string sourceHeader,
-        List<(string comment, string body, string sourceMethod, bool failing)> classified,
+        List<(string comment, string body, string sourceMethod, TestStatus status)> classified,
         List<string> sourceMethodOrder)
     {
         var sb = new StringBuilder();
@@ -1577,15 +1580,29 @@ static class TestValidator
             sb.AppendLine("{");
             if (blocks.Count == 0)
                 sb.AppendLine("  // (no tests)");
-            foreach (var (comment, body, _, failing) in blocks)
+            foreach (var (comment, body, _, status) in blocks)
             {
-                if (failing)
+                bool failing = status == TestStatus.Failing;
+                bool crashSkipped = status == TestStatus.CrashSkipped;
+                if (crashSkipped)
+                    sb.AppendLine("  // SKIPPED (exception from implementation): body commented out so the crash doesn't abort subsequent tests");
+                else if (failing)
                     sb.AppendLine("  // FAILING: expects commented out; see VAL/RHS annotations below");
                 sb.AppendLine(comment);
                 sb.AppendLine("  {");
                 foreach (var line in body.Split('\n').Select(l => l.TrimEnd()))
                 {
                     if (line.Length == 0) continue;
+                    if (crashSkipped)
+                    {
+                        // Comment every non-comment line so the crashing call doesn't run.
+                        var trimmed = line.TrimStart();
+                        if (trimmed.StartsWith("//"))
+                            sb.AppendLine(line);
+                        else
+                            sb.AppendLine(line.Replace(trimmed, "// " + trimmed));
+                        continue;
+                    }
                     if (failing)
                     {
                         var trimmed = line.TrimStart();
