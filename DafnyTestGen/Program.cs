@@ -7,7 +7,7 @@ namespace DafnyTestGen;
 
 class Program
 {
-    static bool TrustUnknownUniqueness = true;
+    static bool TrustUnknownUniqueness = false;
     static int UniquenessRounds = 2;
     static bool RelevanceCheckEnabled = true;
     // "combined" (per-literal shadow blocks), "group" (single shadow block with
@@ -49,7 +49,7 @@ class Program
         var maxTestsOpt = new Option<int>("--max-tests", () => 0, "Maximum number of generated tests per method (0 = unlimited)");
         maxTestsOpt.AddAlias("-x");
         var timeoutOpt = new Option<int>("--timeout", () => 60, "Timeout in seconds for test generation per method (0 = unlimited, default: 60)");
-        var trustUnknownOpt = new Option<bool>("--trust-unknown", () => true, "Trust Z3 output values when uniqueness check returns 'unknown' (default: true)");
+        var trustUnknownOpt = new Option<bool>("--trust-unknown", () => false, "Trust Z3 output values when uniqueness check returns 'unknown' (default: false — safer: treat unknown as not-unique and fall back to full-postcondition expects)");
         var uniquenessRoundsOpt = new Option<int>("--uniqueness-rounds", () => 4, "Max rounds of uniqueness checking to enumerate all valid outputs (default: 4). When all valid outputs are enumerated, emit expect out == v1 || out == v2 || ...;");
         uniquenessRoundsOpt.AddAlias("-u");
         var skipBodylessOpt = new Option<bool>("--skip-bodyless", "Skip bodyless methods instead of generating spec-only tests (inputs only, call/expects commented)");
@@ -62,10 +62,12 @@ class Program
         vacuityOpt.AddAlias("-v1v");
         var relevanceModeOpt = new Option<string>("--relevance-mode", () => "ladder",
             "Phase 1r shadow-block strategy: 'combined' (per-literal shadow blocks, strictest), 'group' (single shadow block with ¬(⋀ safe Q_k), weakest), or 'ladder' (default: combined then fall back to group on UNSAT — strictly dominates group).");
+        var dropPostWfOpt = new Option<bool>("--drop-post-wf-guards", () => true,
+            "Drop well-formedness guards (e.g., 0<=i<a.Length) generated while translating postconditions. Default: ON. An implication-guarded access like '0<=i<a.Length ==> a[i] == x' already bounds i inside the `==>`; re-asserting the bound as a hard top-level fact would incorrectly strengthen the spec and break uniqueness/relevance reasoning. Pass `--drop-post-wf-guards false` to restore legacy behavior.");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, relevanceModeOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, relevanceModeOpt, dropPostWfOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -87,6 +89,7 @@ class Program
             var maxTests = ctx.ParseResult.GetValueForOption(maxTestsOpt);
             var timeout = ctx.ParseResult.GetValueForOption(timeoutOpt);
             TrustUnknownUniqueness = ctx.ParseResult.GetValueForOption(trustUnknownOpt);
+            SmtTranslator.DropPostWfGuards = ctx.ParseResult.GetValueForOption(dropPostWfOpt);
             UniquenessRounds = ctx.ParseResult.GetValueForOption(uniquenessRoundsOpt);
             var skipBodyless = ctx.ParseResult.GetValueForOption(skipBodylessOpt);
             var antiTrivialBias = !ctx.ParseResult.GetValueForOption(noBiasOpt);
@@ -778,6 +781,56 @@ class Program
     }
 
     /// <summary>
+    /// True if `expr` contains a top-level (paren-depth 0) Dafny boolean operator
+    /// that binds looser than ==, i.e. ==>, <==>, &&, or ||. Used to decide whether
+    /// an ensures of the form "outName == rhs" is really a top-level equality or
+    /// something like "(outName == x) ==> y" that the surface regex would mis-bind.
+    /// Skips string/char literals to avoid matching operators inside quotes.
+    /// </summary>
+    public static bool ContainsTopLevelLooserOp(string expr)
+    {
+        int depth = 0;
+        int i = 0;
+        while (i < expr.Length)
+        {
+            var c = expr[i];
+            if (c == '(' || c == '[' || c == '{') { depth++; i++; continue; }
+            if (c == ')' || c == ']' || c == '}') { depth--; i++; continue; }
+            if (c == '"')
+            {
+                i++;
+                while (i < expr.Length && expr[i] != '"')
+                {
+                    if (expr[i] == '\\' && i + 1 < expr.Length) i++;
+                    i++;
+                }
+                if (i < expr.Length) i++;
+                continue;
+            }
+            if (c == '\'')
+            {
+                i++;
+                while (i < expr.Length && expr[i] != '\'')
+                {
+                    if (expr[i] == '\\' && i + 1 < expr.Length) i++;
+                    i++;
+                }
+                if (i < expr.Length) i++;
+                continue;
+            }
+            if (depth == 0)
+            {
+                if (i + 2 < expr.Length && expr[i] == '=' && expr[i + 1] == '=' && expr[i + 2] == '>') return true;
+                if (i + 3 < expr.Length && expr[i] == '<' && expr[i + 1] == '=' && expr[i + 2] == '=' && expr[i + 3] == '>') return true;
+                if (i + 1 < expr.Length && expr[i] == '&' && expr[i + 1] == '&') return true;
+                if (i + 1 < expr.Length && expr[i] == '|' && expr[i + 1] == '|') return true;
+            }
+            i++;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// Checks if two literals are complementary: L and !(L), or !(L) and L.
     /// </summary>
     static bool AreComplementary(string a, string b)
@@ -835,13 +888,22 @@ class Program
                 var m = Regex.Match(ensStr, @"^" + Regex.Escape(outName) + @"\s*==(?!>)\s*(.+)$");
                 if (m.Success && !specExpects.ContainsKey(outName))
                 {
-                    specExpects[outName] = m.Groups[1].Value.Trim();
+                    var candidate = m.Groups[1].Value.Trim();
+                    // Reject if candidate contains a top-level ==>, <==>, &&, or ||: those bind
+                    // weaker than ==, so the real ensures is "(outName == lhs) OP rhs", not an
+                    // equality. Only accept when == is truly the top-level operator.
+                    if (!ContainsTopLevelLooserOp(candidate))
+                        specExpects[outName] = candidate;
                     continue;
                 }
                 // expr == outName (outName on right)
                 m = Regex.Match(ensStr, @"^(.+?)\s*==(?!>)\s*" + Regex.Escape(outName) + @"$");
                 if (m.Success && !specExpects.ContainsKey(outName))
-                    specExpects[outName] = m.Groups[1].Value.Trim();
+                {
+                    var candidate = m.Groups[1].Value.Trim();
+                    if (!ContainsTopLevelLooserOp(candidate))
+                        specExpects[outName] = candidate;
+                }
             }
         }
 
@@ -2682,10 +2744,15 @@ class Program
         var seenKeys = new Dictionary<string, int>();
         foreach (var tc in testCases)
         {
-            // For non-inlinable function methods, use full postcondition expressions as expects.
+            // For non-inlinable function methods, or when the spec admits multiple outputs
+            // for this ins (__unique__=false), use the full postcondition expressions as expects.
+            // Per-clause literals would only accept outputs satisfying THIS clause, wrongly
+            // labelling correct impl behaviour (that happens to take a different spec branch)
+            // as failing. Full-postcond expects accept any spec-compliant output.
             // Otherwise, convert per-clause literals to original (non-inlined) strings.
+            bool tcUnique = tc.values.TryGetValue("__unique__", out var uqFlag) && uqFlag == "true";
             List<string> litStrings;
-            if (hasNonInlinableFuncs)
+            if (hasNonInlinableFuncs || !tcUnique)
             {
                 litStrings = fullPostconditionStrings;
             }

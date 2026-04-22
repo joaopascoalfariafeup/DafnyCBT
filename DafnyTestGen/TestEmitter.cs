@@ -702,6 +702,10 @@ static class TestEmitter
         testSource = Regex.Replace(testSource, @"\bghost\s+predicate\b", "predicate");
         testSource = Regex.Replace(testSource, @"\bghost\s+var\b", "var");
         testSource = Regex.Replace(testSource, @"\bghost\s+const\b", "var"); // var so test code can assign it
+        // Strip 'ghost' from in/out parameter declarations (e.g. `returns (ghost m: int, p: int)`
+        // or `method Foo(ghost x: int)`). A ghost return makes the test's binding variable
+        // ghost too, which bars it from `expect` statements; strip so tests can reference it.
+        testSource = Regex.Replace(testSource, @"\bghost\s+(?=\w+\s*:)", "");
         // Strip old() wrappers only in non-spec lines (statements, assertions).
         // old() in ensures/invariant/requires/decreases clauses must be preserved
         // because it has valid semantics there (refers to pre-state values).
@@ -1211,6 +1215,9 @@ static class TestEmitter
                 if (!m.Success) continue;
                 var lhs = m.Groups[1].Value;
                 var rhs = m.Groups[2].Value.Trim();
+                // Reject when rhs contains a top-level ==>, <==>, &&, or || — these bind weaker
+                // than ==, so the literal is really "(outName == x) OP rhs", not a simple equality.
+                if (Program.ContainsTopLevelLooserOp(rhs)) continue;
                 if (!outNames_set.Contains(lhs)) continue;
                 if (coveredOutputs.Contains(lhs)) continue; // Z3 already gave a concrete value
                 if (rhsCaptures.ContainsKey(lhs) || rhsInline.ContainsKey(lhs)) continue;
@@ -1856,6 +1863,10 @@ static class TestEmitter
                 if (!mentionsAnyOutput || !mentionsOnlyCoveredOutputs)
                 {
                     var litMatch = Regex.Match(lit, @"^(\w+)\s*==\s*(?![>=])(.+)$", RegexOptions.Singleline);
+                    // Treat as a valid outName==rhs match only if rhs has no top-level ==>, <==>, &&, ||
+                    // (those bind weaker than ==, so the literal is really an implication or conjunction).
+                    if (litMatch.Success && Program.ContainsTopLevelLooserOp(litMatch.Groups[2].Value))
+                        litMatch = Match.Empty;
                     var lhsName = litMatch.Success ? litMatch.Groups[1].Value : null;
                     // Skip entirely when LHS is an immutable input: input is pinned at declaration,
                     // so the literal is either a tautology (after RHS substitution) or redundant with

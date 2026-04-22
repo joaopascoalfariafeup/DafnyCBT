@@ -548,6 +548,12 @@ static class TestValidator
             var arrayLocals = new HashSet<string>();
             foreach (Match m in Regex.Matches(result, @"^\s*var\s+(\w+)\s*:=\s*new\s+\w+\s*\[", RegexOptions.Multiline))
                 arrayLocals.Add(m.Groups[1].Value);
+            // Class instances (new T(...) — parens, not brackets) have no Dafny-literal
+            // representation: printing them yields runtime artifacts like "_module.T",
+            // which aren't valid in `expect`. Skip OUT capture for those entirely.
+            var classInstanceLocals = new HashSet<string>();
+            foreach (Match m in Regex.Matches(result, @"^\s*var\s+(\w+)\s*:=\s*new\s+[\w.<>]+\s*\(", RegexOptions.Multiline))
+                classInstanceLocals.Add(m.Groups[1].Value);
 
             var declaredVars = new List<string>();
             var seen = new HashSet<string>();
@@ -568,6 +574,7 @@ static class TestValidator
                 const string indent = "    ";
                 foreach (var name in declaredVars)
                 {
+                    if (classInstanceLocals.Contains(name)) continue; // skip: no literal form
                     bool isArray = arrayLocals.Contains(name)
                         || (arrayOutputNames != null && arrayOutputNames.Contains(name));
                     if (stringOutputNames != null && stringOutputNames.Contains(name))
@@ -738,6 +745,10 @@ static class TestValidator
         // Don't emit VAL for simple scalar literals — the expect is already concrete
         if (IsSimpleScalarLiteral(rhs)) return null;
 
+        // Skip when rhs contains a top-level ==>, <==>, &&, or || — those bind weaker than ==,
+        // so the expect is really "(varName == x) OP ..." and `(rhs)` is not a bool expression.
+        if (Program.ContainsTopLevelLooserOp(rhs)) return null;
+
         string valLine;
         string rhsValLine;
 
@@ -844,12 +855,16 @@ static class TestValidator
                 }
             }
 
-            // Top-level boolean connective → expression is a conjunction/disjunction
-            // whose precedence is lower than ==, so splitting on the first == would
-            // grab only the first sub-term's RHS. Must scan the whole string first
-            // before committing to a split — hence we record the == position but
-            // keep scanning.
+            // Top-level boolean connective → expression is a conjunction/disjunction/
+            // implication whose precedence is lower than ==, so splitting on the first
+            // top-level == would grab only the first sub-term's RHS. Abort entirely.
             if ((c == '|' && s[i + 1] == '|') || (c == '&' && s[i + 1] == '&'))
+                return -1;
+            // ==>  — implication binds looser than ==
+            if (c == '=' && i + 2 < s.Length && s[i + 1] == '=' && s[i + 2] == '>')
+                return -1;
+            // <==> — equivalence binds looser than ==
+            if (c == '<' && i + 3 < s.Length && s[i + 1] == '=' && s[i + 2] == '=' && s[i + 3] == '>')
                 return -1;
 
             if (c == '=' && s[i + 1] == '=' && firstEqPos < 0)
@@ -1049,11 +1064,14 @@ static class TestValidator
             var comments = new List<string>();
             if (meaningful.Count > 0)
             {
-                // Drop names already disclosed via "// expect ...; // got <val>" in
-                // commented expects below — the runtime state would duplicate that.
+                // Drop names already disclosed via "expect ...; // got <val>" in
+                // expect lines (either still bare or already commented) below — the
+                // runtime state would duplicate that. At this point expects haven't
+                // been commented yet (that happens later in EmitByMethodTests), so
+                // match both "expect ..." and "// expect ..." prefixes.
                 var kept = meaningful.Where(kv =>
                     !Regex.IsMatch(body,
-                        @"//\s*expect\s+" + Regex.Escape(kv.Key) + @"\b[^\r\n]*//\s*got\s+" + Regex.Escape(kv.Value) + @"\b"))
+                        @"(?://\s*)?expect\s+" + Regex.Escape(kv.Key) + @"\b[^\r\n]*//\s*got\s+" + Regex.Escape(kv.Value) + @"\b"))
                     .ToList();
                 if (kept.Count > 0)
                 {
@@ -1087,9 +1105,13 @@ static class TestValidator
         {
             var name = kv.Key;
             var val = kv.Value;
-            // Array if value starts with '[' or var decl used `new`
+            // Skip runtime artifacts that can't be expressed as Dafny literals
+            // (e.g. "_module.T" from printing a class instance).
+            if (val.StartsWith("_module.") || val.Contains("@_")) continue;
+            // Array if value starts with '[' OR var was declared with `new T[...]` (square brackets).
+            // Class instances (`new T(...)` — parens) are excluded: they have no seq-slice semantics.
             bool isArr = val.TrimStart().StartsWith("[")
-                         || Regex.IsMatch(body, @"^\s*var\s+" + Regex.Escape(name) + @"\s*:=\s*new\s", RegexOptions.Multiline);
+                         || Regex.IsMatch(body, @"^\s*var\s+" + Regex.Escape(name) + @"\s*:=\s*new\s+[\w.<>]+\s*\[", RegexOptions.Multiline);
             var lhs = isArr ? $"{name}[..]" : name;
             lines.Add($"{ind}expect {lhs} == {val}; // observed from implementation");
         }

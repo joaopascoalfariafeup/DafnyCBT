@@ -54,8 +54,17 @@ static class SmtTranslator
     internal const int MAX_SET_UNIVERSE = 8;
 
     // Collects well-formedness guards (e.g., bounds checks for seq[i])
-    // during expression translation. Caller should assert these too.
-    internal static List<string> _wfGuards = new();
+    // during expression translation. Each entry records whether it was
+    // generated while translating a postcondition (IsPost=true) or a
+    // precondition (IsPost=false). When DropPostWfGuards is on, post-context
+    // guards are not emitted as hard top-level assertions — they would
+    // redundantly strengthen the spec (an implication-guarded access like
+    // "0 <= i < a.Length ==> a[i] == x" already bounds i inside the `==>`,
+    // so asserting `0 <= i < a.Length` as a top-level fact pins i to the
+    // antecedent-range and breaks uniqueness and relevance reasoning).
+    internal static List<(string Guard, bool IsPost)> _wfGuards = new();
+    internal static bool _inPostContext = false;
+    public static bool DropPostWfGuards = true;
     // Tracks bound variables from quantifiers to suppress WF guards that reference them
     internal static HashSet<string> _boundVars = new();
     // Tracks uninterpreted functions discovered during expression translation
@@ -697,6 +706,7 @@ static class SmtTranslator
 
         // Encode postcondition literals (skip fresh() which is specification-only).
         // ExprToSmt handles old()/mutable renaming at AST level.
+        _inPostContext = true;
         foreach (var literal in postLiterals)
         {
             var litStr = DnfEngine.ExprToString(literal);
@@ -717,6 +727,7 @@ static class SmtTranslator
         }
 
 
+        _inPostContext = false;
         // Encode preconditions (constrain pre-state variables)
         if (preLiterals != null && preLiterals.Count > 0)
         {
@@ -794,8 +805,12 @@ static class SmtTranslator
                 }
             }
         }
-        foreach (var guard in _wfGuards)
+        foreach (var (guard, isPost) in _wfGuards)
         {
+            // Skip post-context guards when DropPostWfGuards is on: the surrounding
+            // implication already bounds the index, and a hard top-level assertion
+            // incorrectly strengthens the spec.
+            if (DropPostWfGuards && isPost) continue;
             // Extract variable names from the guard and check they're all declared
             var guardVars = Regex.Matches(guard, @"\b([a-zA-Z_]\w*)\b")
                 .Cast<Match>()
@@ -819,13 +834,14 @@ static class SmtTranslator
                 {
                     // Collect WF guards generated specifically by this exclusion
                     var exclGuards = _wfGuards.Skip(wfBefore)
-                        .Where(g =>
+                        .Where(entry =>
                         {
-                            var gVars = Regex.Matches(g, @"\b([a-zA-Z_]\w*)\b")
+                            var gVars = Regex.Matches(entry.Guard, @"\b([a-zA-Z_]\w*)\b")
                                 .Cast<Match>().Select(m => m.Value)
                                 .Where(v => v != "and" && v != "or" && v != "not" && v != "seq" && v != "len" && v != "nth");
                             return gVars.All(v => declaredNames.Contains(v) || int.TryParse(v, out _));
                         })
+                        .Select(entry => entry.Guard)
                         .ToList();
                     // Remove exclusion-specific guards from the global list (they shouldn't be asserted unconditionally)
                     if (exclGuards.Count > 0)
@@ -1597,7 +1613,7 @@ static class SmtTranslator
                     : (isTupleElemSel ? $"{seqBaseSmt}_0" : seqBaseSmt);
                 var idxName = GetOriginalName(seqSel.E0);
                 if (idxName == null || !_boundVars.Contains(idxName))
-                    _wfGuards.Add($"(and (<= 0 {idxSmt}) (< {idxSmt} (seq.len {smtSeq})))");
+                    _wfGuards.Add(($"(and (<= 0 {idxSmt}) (< {idxSmt} (seq.len {smtSeq})))", _inPostContext));
                 // For tuple elements, return null â€” caller should use GetTupleComponentSmt
                 if (isTupleElemSel) goto fallback;
                 var ret = $"(seq.nth {smtSeq} {idxSmt})";
@@ -1683,7 +1699,7 @@ static class SmtTranslator
                                     }
                                     var idxName = GetOriginalName(innerSeqSel.E0);
                                     if (idxName == null || !_boundVars.Contains(idxName))
-                                        _wfGuards.Add($"(and (<= 0 {idxSmt}) (< {idxSmt} (seq.len {seqName})))");
+                                        _wfGuards.Add(($"(and (<= 0 {idxSmt}) (< {idxSmt} (seq.len {seqName})))", _inPostContext));
                                     return $"(seq.nth {seqName} {idxSmt})";
                                 }
                             }
@@ -1750,7 +1766,7 @@ static class SmtTranslator
                                         dotSeqName = $"{innerDotOrigName}_{dotTupleIdx}";
                                     var dotIdxName = GetOriginalName(innerDotSeqSel.E0);
                                     if (dotIdxName == null || !_boundVars.Contains(dotIdxName))
-                                        _wfGuards.Add($"(and (<= 0 {dotIdxSmt}) (< {dotIdxSmt} (seq.len {dotSeqName})))");
+                                        _wfGuards.Add(($"(and (<= 0 {dotIdxSmt}) (< {dotIdxSmt} (seq.len {dotSeqName})))", _inPostContext));
                                     return $"(seq.nth {dotSeqName} {dotIdxSmt})";
                                 }
                             }
@@ -2919,7 +2935,7 @@ static class SmtTranslator
                 var isArray = inputs.Any(v => v.Name == arrName && TypeUtils.IsArrayType(v.Type));
                 var smtSeq = isArray ? $"{arrName}_seq" : arrName;
                 if (!_boundVars.Contains(sliceIndexMatch.Groups[2].Value.Trim()))
-                    _wfGuards.Add($"(and (<= 0 {idx}) (< {idx} (seq.len {smtSeq})))");
+                    _wfGuards.Add(($"(and (<= 0 {idx}) (< {idx} (seq.len {smtSeq})))", _inPostContext));
                 return $"(seq.nth {smtSeq} {idx})";
             }
         }
@@ -2974,7 +2990,7 @@ static class SmtTranslator
                 // Add well-formedness guard only if the index is not a quantifier-bound variable
                 var idxRaw = seqAccessMatch.Groups[2].Value.Trim();
                 if (!_boundVars.Contains(idxRaw))
-                    _wfGuards.Add($"(and (<= 0 {idx}) (< {idx} (seq.len {smtSeq})))");
+                    _wfGuards.Add(($"(and (<= 0 {idx}) (< {idx} (seq.len {smtSeq})))", _inPostContext));
                 return $"(seq.nth {smtSeq} {idx})";
             }
         }
