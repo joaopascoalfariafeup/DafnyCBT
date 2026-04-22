@@ -325,8 +325,10 @@ static class TestValidator
 
             if (grouping == "by-status")
             {
-                var passing = classified.Where(c => c.status == TestStatus.Passing).Select(c => (c.comment, c.body)).ToList();
-                var failing = classified.Where(c => c.status != TestStatus.Passing).Select(c => (c.comment, c.body)).ToList();
+                var passing = classified.Where(c => c.status == TestStatus.Passing)
+                    .Select(c => (c.comment, c.body, c.status)).ToList();
+                var failing = classified.Where(c => c.status != TestStatus.Passing)
+                    .Select(c => (c.comment, c.body, c.status)).ToList();
                 return EmitSplitTests(sourceHeader, passing, failing);
             }
             return EmitByMethodTests(sourceHeader, classified, sourceMethodOrder);
@@ -1474,8 +1476,8 @@ static class TestValidator
 
     static string EmitSplitTests(
         string sourceHeader,
-        List<(string comment, string body)> passingBlocks,
-        List<(string comment, string body)> failingBlocks)
+        List<(string comment, string body, TestStatus status)> passingBlocks,
+        List<(string comment, string body, TestStatus status)> failingBlocks)
     {
         var sb = new StringBuilder();
         sb.Append(sourceHeader);
@@ -1484,7 +1486,7 @@ static class TestValidator
         sb.AppendLine("{");
         if (passingBlocks.Count == 0)
             sb.AppendLine("  // (no passing tests)");
-        foreach (var (comment, body) in passingBlocks)
+        foreach (var (comment, body, _) in passingBlocks)
         {
             sb.AppendLine(comment);
             sb.AppendLine("  {");
@@ -1500,15 +1502,25 @@ static class TestValidator
         sb.AppendLine("{");
         if (failingBlocks.Count == 0)
             sb.AppendLine("  // (no failing tests)");
-        foreach (var (comment, body) in failingBlocks)
+        foreach (var (comment, body, status) in failingBlocks)
         {
+            if (status == TestStatus.CrashSkipped)
+                sb.AppendLine("  // SKIPPED (exception from implementation): body commented out so the crash doesn't abort subsequent tests");
             sb.AppendLine(comment);
             sb.AppendLine("  {");
             foreach (var line in body.Split('\n').Select(l => l.TrimEnd()))
             {
                 if (line.Length == 0) continue;
                 var trimmed = line.TrimStart();
-                if (trimmed.StartsWith("expect "))
+                if (status == TestStatus.CrashSkipped)
+                {
+                    // Comment every non-comment line so the crashing call doesn't run.
+                    if (trimmed.StartsWith("//"))
+                        sb.AppendLine(line);
+                    else
+                        sb.AppendLine(line.Replace(trimmed, "// " + trimmed));
+                }
+                else if (trimmed.StartsWith("expect "))
                     sb.AppendLine(line.Replace("expect ", "// expect "));
                 else
                     sb.AppendLine(line);
@@ -1548,12 +1560,12 @@ static class TestValidator
             @"(  // Test case[^\r\n]*\r?\n(?:  //[^\r\n]*\r?\n)*)  \{\r?\n(.*?)  \}",
             RegexOptions.Singleline);
 
-        var passing = new List<(string comment, string body)>();
+        var passing = new List<(string comment, string body, TestStatus status)>();
         foreach (Match w in wrapperPattern.Matches(generatedCode))
             foreach (Match m in blockPattern.Matches(w.Groups[1].Value))
-                passing.Add((m.Groups[1].Value.TrimEnd(), m.Groups[2].Value));
+                passing.Add((m.Groups[1].Value.TrimEnd(), m.Groups[2].Value, TestStatus.Passing));
 
-        return EmitSplitTests(sourceHeader, passing, new List<(string, string)>());
+        return EmitSplitTests(sourceHeader, passing, new List<(string, string, TestStatus)>());
     }
 
     static string EmitByMethodTests(
