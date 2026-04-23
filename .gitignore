@@ -19,9 +19,6 @@ _dafnycbt_check_*
 *.runtimeconfig.json
 
 # Logs
-buggy_log.txt
-correct_log.txt
-test/*.log
 test/*_log.txt
 
 # Special test cases (local corpora not committed)
@@ -32,5 +29,8 @@ test/has_errors/
 # OS
 Thumbs.db
 .DS_Store
+
+# Office temp/lock files (open-file sentinels)
+~$*
 
 run_tests.sh
