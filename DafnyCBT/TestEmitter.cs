@@ -1,7 +1,7 @@
 using System.Text.RegularExpressions;
 using Microsoft.Dafny;
 
-namespace DafnyTestGen;
+namespace DafnyCBT;
 
 static class TestEmitter
 {
@@ -735,7 +735,7 @@ static class TestEmitter
         bool preOnlyMode = false)
     {
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine("// Auto-generated test cases by DafnyTestGen");
+        sb.AppendLine("// Auto-generated test cases by DafnyCBT");
         sb.AppendLine($"// Source: {filePath}");
         sb.AppendLine($"// Method: {methodName}");
         sb.AppendLine($"// Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");

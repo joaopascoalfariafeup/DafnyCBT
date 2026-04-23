@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
-namespace DafnyTestGen;
+namespace DafnyCBT;
 
 static class Z3Runner
 {

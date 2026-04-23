@@ -3,7 +3,7 @@ using System.Diagnostics;
 using System.Text.RegularExpressions;
 using Microsoft.Dafny;
 
-namespace DafnyTestGen;
+namespace DafnyCBT;
 
 class Program
 {
@@ -101,27 +101,27 @@ class Program
             var antiTrivialBias = !ctx.ParseResult.GetValueForOption(noBiasOpt);
             SmtTranslator.AntiTrivialBiasEnabled = antiTrivialBias;
             if (!antiTrivialBias)
-                Console.WriteLine("[DafnyTestGen] Anti-trivial bias: OFF");
+                Console.WriteLine("[DafnyCBT] Anti-trivial bias: OFF");
             var relevanceEnabled = !ctx.ParseResult.GetValueForOption(noRelevanceOpt);
             RelevanceCheckEnabled = relevanceEnabled;
             if (!relevanceEnabled)
-                Console.WriteLine("[DafnyTestGen] Relevance check (Phase 1r): OFF");
+                Console.WriteLine("[DafnyCBT] Relevance check (Phase 1r): OFF");
             VacuityCheckEnabled = ctx.ParseResult.GetValueForOption(vacuityOpt);
             if (VacuityCheckEnabled)
-                Console.WriteLine("[DafnyTestGen] Vacuity check (Phase 1v): ON");
+                Console.WriteLine("[DafnyCBT] Vacuity check (Phase 1v): ON");
             var relevanceModeCli = ctx.ParseResult.GetValueForOption(relevanceModeOpt) ?? "ladder";
             if (relevanceModeCli != "combined" && relevanceModeCli != "group" && relevanceModeCli != "ladder")
             {
-                Console.Error.WriteLine($"[DafnyTestGen] Invalid --relevance-mode '{relevanceModeCli}' (expected 'combined', 'group', or 'ladder'). Falling back to 'ladder'.");
+                Console.Error.WriteLine($"[DafnyCBT] Invalid --relevance-mode '{relevanceModeCli}' (expected 'combined', 'group', or 'ladder'). Falling back to 'ladder'.");
                 relevanceModeCli = "ladder";
             }
             RelevanceMode = relevanceModeCli;
             if (RelevanceMode != "ladder")
-                Console.WriteLine($"[DafnyTestGen] Relevance mode: {RelevanceMode}");
+                Console.WriteLine($"[DafnyCBT] Relevance mode: {RelevanceMode}");
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
             var z3Path = Z3Runner.FindZ3Path(z3PathCli);
-            Console.WriteLine($"[DafnyTestGen] Z3: {z3Path}");
+            Console.WriteLine($"[DafnyCBT] Z3: {z3Path}");
 
             // Resolve input to a list of .dfy files
             var files = ResolveInputFiles(input);
@@ -169,7 +169,7 @@ class Program
             }
 
             if (files.Count > 1)
-                Console.WriteLine($"[DafnyTestGen] Processed {files.Count} files.");
+                Console.WriteLine($"[DafnyCBT] Processed {files.Count} files.");
         });
 
         return await rootCommand.InvokeAsync(args);
@@ -263,7 +263,7 @@ class Program
             for (int i = 0; i < ctors.Count; i++)
                 enumConstructors[ctors[i]] = (dtName, i);
         if (enumDatatypes.Count > 0)
-            Console.WriteLine($"[DafnyTestGen] Enum datatypes: {string.Join(", ", enumDatatypes.Select(e => $"{e.Key}({string.Join("|", e.Value)})"))}");
+            Console.WriteLine($"[DafnyCBT] Enum datatypes: {string.Join(", ", enumDatatypes.Select(e => $"{e.Key}({string.Join("|", e.Value)})"))}");
 
         // Collect user-defined class names — parameters of class/reference type can't be
         // represented as concrete SMT values and must be rejected.
@@ -302,7 +302,7 @@ class Program
             // Skip verifier-style methods whose bodies use Dafny's havoc construct (`x := *`
             // or `x, y := *, *`). These are proof encodings — Dafny's compiler treats `*` as
             // a no-op at runtime, so the compiled code diverges from the spec. Running
-            // DafnyTestGen against them produces false-positive failures.
+            // DafnyCBT against them produces false-positive failures.
             var havocMethods = new List<string>();
             methods = methods.Where(m =>
             {
@@ -311,8 +311,8 @@ class Program
                 return false;
             }).ToList();
             if (havocMethods.Count > 0)
-                Console.WriteLine($"[DafnyTestGen] Skipping {havocMethods.Count} verifier-style method(s) using havoc (`:= *`): {string.Join(", ", havocMethods)}");
-            Console.WriteLine($"[DafnyTestGen] Auto-discovered {methods.Count} method(s): {string.Join(", ", methods.Select(m => m.Name))}");
+                Console.WriteLine($"[DafnyCBT] Skipping {havocMethods.Count} verifier-style method(s) using havoc (`:= *`): {string.Join(", ", havocMethods)}");
+            Console.WriteLine($"[DafnyCBT] Auto-discovered {methods.Count} method(s): {string.Join(", ", methods.Select(m => m.Name))}");
         }
 
         // Build classInfo map for methods inside classes
@@ -339,7 +339,7 @@ class Program
         // Find all functions/predicates with bodies for unified 2-level inlining
         var inlinablePredicates = DafnyParser.FindInlinablePredicates(program);
         if (inlinablePredicates.Count > 0 && verbose)
-            Console.WriteLine($"[DafnyTestGen] Found {inlinablePredicates.Count} inlinable function(s)/predicate(s): {string.Join(", ", inlinablePredicates.Select(p => p.name))}");
+            Console.WriteLine($"[DafnyCBT] Found {inlinablePredicates.Count} inlinable function(s)/predicate(s): {string.Join(", ", inlinablePredicates.Select(p => p.name))}");
 
         // Collect bodyless functions/predicates (no body = abstract/opaque) for skip detection
         var bodylessFunctions = DafnyParser.AllTopLevelDecls(program)
@@ -375,14 +375,14 @@ class Program
         {
             var names = string.Join(", ", bodylessMethods.Select(m => $"'{m.Name}'"));
             if (skipBodyless)
-                Console.WriteLine($"[DafnyTestGen] Note: program contains bodyless method(s) {names} (will be skipped; --skip-bodyless)");
+                Console.WriteLine($"[DafnyCBT] Note: program contains bodyless method(s) {names} (will be skipped; --skip-bodyless)");
             else
-                Console.WriteLine($"[DafnyTestGen] Note: program contains bodyless method(s) {names} (spec-only tests: call/expects commented)");
+                Console.WriteLine($"[DafnyCBT] Note: program contains bodyless method(s) {names} (spec-only tests: call/expects commented)");
             Console.WriteLine();
         }
 
-        Console.WriteLine($"[DafnyTestGen] Input:  {file.FullName}");
-        Console.WriteLine($"[DafnyTestGen] Output: {outputPath}");
+        Console.WriteLine($"[DafnyCBT] Input:  {file.FullName}");
+        Console.WriteLine($"[DafnyCBT] Output: {outputPath}");
         Console.WriteLine();
 
         // Step 3: Generate tests for each method
@@ -393,7 +393,7 @@ class Program
         foreach (var method in methods)
         {
             Console.WriteLine();
-            Console.WriteLine($"[DafnyTestGen] Processing method: {method.Name}");
+            Console.WriteLine($"[DafnyCBT] Processing method: {method.Name}");
 
             // Deterministic per-method Z3 random seed (for anti-trivial bias)
             SmtTranslator.AntiTrivialBiasSeed = (int)((uint)method.Name.GetHashCode() % 100000U);
@@ -656,7 +656,7 @@ class Program
 
         if (check && hasBodylessMethods)
         {
-            Console.WriteLine("[DafnyTestGen] Warning: -c (check) is not supported for programs with bodyless methods (dafny build cannot compile them). Writing unchecked tests.");
+            Console.WriteLine("[DafnyCBT] Warning: -c (check) is not supported for programs with bodyless methods (dafny build cannot compile them). Writing unchecked tests.");
             File.WriteAllText(outputPath, allTestCode.ToString());
         }
         else if (check)
@@ -689,14 +689,14 @@ class Program
         };
         if (check && TestValidator.CheckResultSummary != null)
         {
-            Console.WriteLine($"[DafnyTestGen] Results: {TestValidator.CheckResultSummary}, {syntaxMsg} [{programName}]");
+            Console.WriteLine($"[DafnyCBT] Results: {TestValidator.CheckResultSummary}, {syntaxMsg} [{programName}]");
             TestValidator.CheckResultSummary = null;
         }
         else
         {
-            Console.WriteLine($"[DafnyTestGen] Results: {syntaxMsg} [{programName}]");
+            Console.WriteLine($"[DafnyCBT] Results: {syntaxMsg} [{programName}]");
         }
-        Console.WriteLine($"[DafnyTestGen] Tests written to: {outputPath}");
+        Console.WriteLine($"[DafnyCBT] Tests written to: {outputPath}");
     }
 
     /// <summary>
@@ -704,7 +704,7 @@ class Program
     /// </summary>
 
     /// <summary>
-    /// Prepares the source for DafnyTestGeneration by:
+    /// Prepares the source for DafnyCBTGeneration by:
     /// 1. Wrapping it in a module (required by TestGenerator)
     /// 2. Generating a {:testEntry} wrapper that converts unsupported types (arrays) to supported ones (sequences)
     /// </summary>

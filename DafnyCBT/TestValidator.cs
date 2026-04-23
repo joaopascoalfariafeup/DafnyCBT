@@ -2,7 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
 
-namespace DafnyTestGen;
+namespace DafnyCBT;
 
 static class TestValidator
 {
@@ -39,7 +39,7 @@ static class TestValidator
     /// </summary>
     /// When true, tests that exit non-zero without emitting a FAIL marker (i.e., the
     /// method under test threw an unhandled exception) are routed to SKIP instead of
-    /// FAIL. Useful when running DafnyTestGen against a corpus where some methods are
+    /// FAIL. Useful when running DafnyCBT against a corpus where some methods are
     /// known to crash on boundary inputs and you want to separate those cases from
     /// genuine postcondition violations.
     public static bool SkipOnException = false;
@@ -63,14 +63,14 @@ static class TestValidator
         string generatedCode, string originalSource, string outputPath, string grouping = "by-method")
     {
         var dafnyPath = Z3Runner.FindDafnyPath();
-        Console.WriteLine($"[DafnyTestGen] Checking tests with: {dafnyPath}");
+        Console.WriteLine($"[DafnyCBT] Checking tests with: {dafnyPath}");
 
         // ── Extract source header (everything before the first "method TestsFor<Name>()") ──
         var genMethodMatch = Regex.Match(
             generatedCode, @"^method TestsFor\w+\(\)\s*$", RegexOptions.Multiline);
         if (!genMethodMatch.Success)
         {
-            Console.Error.WriteLine("[DafnyTestGen] Could not find TestsFor method in output");
+            Console.Error.WriteLine("[DafnyCBT] Could not find TestsFor method in output");
             return generatedCode;
         }
         var sourceHeader = generatedCode.Substring(0, genMethodMatch.Index);
@@ -105,11 +105,11 @@ static class TestValidator
 
         if (testBlocks.Count == 0)
         {
-            Console.Error.WriteLine("[DafnyTestGen] No test blocks found to check");
+            Console.Error.WriteLine("[DafnyCBT] No test blocks found to check");
             return generatedCode;
         }
 
-        Console.WriteLine($"[DafnyTestGen] Checking {testBlocks.Count} test case(s)...");
+        Console.WriteLine($"[DafnyCBT] Checking {testBlocks.Count} test case(s)...");
 
         // Detect array-typed output names from method signatures (needed for [..] in expects)
         var arrayOutputNames = new HashSet<string>();
@@ -126,7 +126,7 @@ static class TestValidator
 
         // ── Generate single check file and build ─────────────────────────────────
         var tempDir = Path.Combine(Path.GetTempPath(),
-            "DafnyTestGen_" + Path.GetRandomFileName().Replace(".", ""));
+            "DafnyCBT_" + Path.GetRandomFileName().Replace(".", ""));
         Directory.CreateDirectory(tempDir);
 
         try
@@ -170,7 +170,7 @@ static class TestValidator
                         uncompilableByTestId[tid] = set = new HashSet<string>();
                     foreach (var e in exprs) set.Add(e);
                 }
-                Console.WriteLine($"[DafnyTestGen] Build failed with {commentedLines} uncompilable expect line(s); commented them out and retrying (round {retry + 1}).");
+                Console.WriteLine($"[DafnyCBT] Build failed with {commentedLines} uncompilable expect line(s); commented them out and retrying (round {retry + 1}).");
                 (buildExited, buildCode, buildOut, buildErr) = await RunProcess(
                     dafnyPath,
                     $"build --allow-warnings --no-verify \"{testFile}\" -o \"{runnerBase}\"",
@@ -179,7 +179,7 @@ static class TestValidator
 
             if (!buildExited || buildCode != 0)
             {
-                Console.Error.WriteLine($"[DafnyTestGen] Build failed (exit={buildCode}), check file: {testFile}");
+                Console.Error.WriteLine($"[DafnyCBT] Build failed (exit={buildCode}), check file: {testFile}");
                 if (!string.IsNullOrWhiteSpace(buildOut))
                     Console.Error.WriteLine(buildOut);
                 if (!string.IsNullOrWhiteSpace(buildErr))
@@ -197,7 +197,7 @@ static class TestValidator
             var (runExe, runArgs) = FindRunCommand(runnerBase);
             if (runExe == null)
             {
-                Console.Error.WriteLine("[DafnyTestGen] Cannot find compiled output");
+                Console.Error.WriteLine("[DafnyCBT] Cannot find compiled output");
                 return generatedCode;
             }
 
@@ -1544,7 +1544,7 @@ static class TestValidator
 
         // Matches a (possibly multi-line) CheckExpect. Single-line check:
         var checkExpectStartRe = new Regex(@"^\s*CheckExpect\(");
-        // Matches DafnyTestGen's diagnostic probe prints (EXV / VAL / RHSVAL). These
+        // Matches DafnyCBT's diagnostic probe prints (EXV / VAL / RHSVAL). These
         // wrap the same quantifier expression and also fail to compile when the
         // quantifier is unbounded, so we comment them alongside the CheckExpect.
         var probePrintRe = new Regex(@"^\s*print\s+""(EXV|VAL|RHSVAL):");

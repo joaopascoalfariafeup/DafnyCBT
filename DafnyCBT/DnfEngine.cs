@@ -3,7 +3,7 @@ using System.Xml.Schema;
 using Microsoft.Dafny;
 using RAST;
 
-namespace DafnyTestGen;
+namespace DafnyCBT;
 
 static class DnfEngine
 {

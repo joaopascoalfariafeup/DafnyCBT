@@ -1,6 +1,6 @@
 using System.Text.RegularExpressions;
 
-namespace DafnyTestGen;
+namespace DafnyCBT;
 
 static class TypeUtils
 {

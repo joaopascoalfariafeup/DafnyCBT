@@ -3,7 +3,7 @@ using System.Linq;
 using Microsoft.Dafny;
 using DafnyType = Microsoft.Dafny.Type;
 
-namespace DafnyTestGen;
+namespace DafnyCBT;
 
 /// <summary>
 /// AST-level inliner for non-recursive Dafny function/predicate calls.

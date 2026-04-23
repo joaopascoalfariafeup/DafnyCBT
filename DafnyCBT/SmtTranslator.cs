@@ -1,7 +1,7 @@
 ﻿using System.Text.RegularExpressions;
 using Microsoft.Dafny;
 
-namespace DafnyTestGen;
+namespace DafnyCBT;
 
 static class SmtTranslator
 {
