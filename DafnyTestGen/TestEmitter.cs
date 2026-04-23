@@ -1566,7 +1566,10 @@ static class TestEmitter
                     }
                     else
                     {
-                        seqLiteral = $"[{string.Join(", ", elems.Take(seqLen))}]";
+                        // Format each element through FormatScalarValue so enum ordinals get
+                        // mapped back to their constructor names (e.g. seq<Bases> value "2"
+                        // becomes "G" when Bases = A | C | G | T).
+                        seqLiteral = $"[{string.Join(", ", elems.Take(seqLen).Select(e => FormatScalarValue(e.Trim(), elemType, enumDatatypes)))}]";
                     }
                     if (isUnique)
                     {
@@ -1582,7 +1585,7 @@ static class TestEmitter
                                         altElems2 = altElemsStr2.Split(',');
                                     else
                                         altElems2 = Enumerable.Range(0, altLen2).Select(_ => "0").ToArray();
-                                    allSeqVals.Add($"[{string.Join(", ", altElems2.Take(altLen2))}]");
+                                    allSeqVals.Add($"[{string.Join(", ", altElems2.Take(altLen2).Select(e => FormatScalarValue(e.Trim(), elemType, enumDatatypes)))}]");
                                 }
                             }
                             if (allSeqVals.Count > 1)
