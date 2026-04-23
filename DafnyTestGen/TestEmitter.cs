@@ -37,6 +37,44 @@ static class TestEmitter
     }
 
     /// <summary>
+    /// Scans source for function / predicate declarations inside `class ClassName { ... }`
+    /// (static or not, ghost or not — we just want the names for qualification).
+    /// Matches a balanced-brace class body starting at the class header and collects
+    /// any `(static\s+)?(ghost\s+)?(function|predicate|lemma)\s+<name>` declared inside.
+    /// Returns an empty set when the class isn't found or the source can't be parsed.
+    /// </summary>
+    internal static HashSet<string> ExtractClassMemberFunctions(string source, string className)
+    {
+        var result = new HashSet<string>();
+        if (string.IsNullOrEmpty(className) || string.IsNullOrEmpty(source)) return result;
+        // Find the class header. Tolerate `class Name`, `class Name {`, `class Name<T>`, etc.
+        var headerRe = new Regex(@"\bclass\s+" + Regex.Escape(className) + @"\b[^{]*\{");
+        var headerM = headerRe.Match(source);
+        if (!headerM.Success) return result;
+        // Walk the body with balanced braces.
+        int depth = 1;
+        int i = headerM.Index + headerM.Length;
+        int bodyStart = i;
+        while (i < source.Length && depth > 0)
+        {
+            var c = source[i];
+            if (c == '{') depth++;
+            else if (c == '}') depth--;
+            i++;
+        }
+        if (depth != 0) return result;
+        var body = source.Substring(bodyStart, i - 1 - bodyStart);
+        // Strip line comments so declarations inside `//` don't match.
+        body = Regex.Replace(body, @"//[^\r\n]*", "");
+        var declRe = new Regex(
+            @"\b(?:static\s+)?(?:ghost\s+)?(?:twostate\s+|least\s+|greatest\s+)?(?:function|predicate|lemma)\b(?:\s+method)?\s+(\w+)",
+            RegexOptions.Multiline);
+        foreach (Match m in declRe.Matches(body))
+            result.Add(m.Groups[1].Value);
+        return result;
+    }
+
+    /// <summary>
     /// Checks whether a field name appears in post-state context in any of the given literals.
     /// A field in post-state context means it appears outside of old() wrappers.
     /// For example, "count == old(count) + 1" has 'count' in post-state (the first occurrence).
@@ -806,6 +844,13 @@ static class TestEmitter
 
             // For class methods: construct object and assign fields
             var fieldNames = classInfo != null ? new HashSet<string>(classInfo.Fields.Select(f => f.Name)) : new HashSet<string>();
+            // Extract class-member function/predicate names from the source so we can
+            // qualify bare calls (e.g. `SumEmUp(n,m)`) with `obj.` in module-level tests.
+            // Non-inlinable functions aren't in `inlinablePredicates`; without qualification
+            // the emitted expect would fail to resolve the name.
+            var classMemberFunctions = classInfo != null
+                ? ExtractClassMemberFunctions(originalSource, classInfo.ClassName)
+                : new HashSet<string>();
             var constFieldNames = classInfo is { ConstFields: not null }
                 ? new HashSet<string>(classInfo.ConstFields.Select(f => f.Name)) : new HashSet<string>();
             var ctorParamNames = classInfo is { ConstructorParams: not null }
@@ -1202,6 +1247,15 @@ static class TestEmitter
                     result = Regex.Replace(result,
                         @"(?<![a-zA-Z_0-9.])(?<!obj\.)Valid(?=\s*\()",
                         "obj.Valid");
+                    // Qualify bare class-member function/predicate/lemma calls
+                    // (e.g. `SumEmUp(n,m)` → `obj.SumEmUp(n,m)`). Static class members
+                    // are still reachable via an instance in Dafny.
+                    foreach (var fnName in classMemberFunctions)
+                    {
+                        result = Regex.Replace(result,
+                            @"(?<![a-zA-Z_0-9.])(?<!obj\.)" + Regex.Escape(fnName) + @"(?=\s*\()",
+                            $"obj.{fnName}");
+                    }
                     // Re-run ReplaceOldReferences to catch cases where this pass
                     // inadvertently prefixed field names inside `old(...)` expressions
                     // (e.g. old(top) → old(obj.top)). The helper's obj.-variant branch
@@ -1355,6 +1409,11 @@ static class TestEmitter
                         allFields.UnionWith(ghostFieldNames);
                         foreach (var fn in allFields)
                             specExpr = Regex.Replace(specExpr, @"(?<!\.)(?<!old_)\b" + Regex.Escape(fn) + @"\b", "obj." + fn);
+                        // Also qualify bare class-member function/predicate calls.
+                        foreach (var fnName in classMemberFunctions)
+                            specExpr = Regex.Replace(specExpr,
+                                @"(?<![a-zA-Z_0-9.])(?<!obj\.)" + Regex.Escape(fnName) + @"(?=\s*\()",
+                                $"obj.{fnName}");
                     }
                     // Run one more pass in case obj-prefix leaked into any remaining old(...).
                     specExpr = ReplaceOldReferences(specExpr, oldCaptures, arrayParamNames);

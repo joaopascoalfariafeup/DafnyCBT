@@ -62,6 +62,8 @@ class Program
         vacuityOpt.AddAlias("-v1v");
         var relevanceModeOpt = new Option<string>("--relevance-mode", () => "ladder",
             "Phase 1r shadow-block strategy: 'combined' (per-literal shadow blocks, strictest), 'group' (single shadow block with ¬(⋀ safe Q_k), weakest), or 'ladder' (default: combined then fall back to group on UNSAT — strictly dominates group).");
+        var commentUncompilableOpt = new Option<bool>("--comment-uncompilable",
+            "In --check mode, when `dafny build` fails due to uncompilable expect expressions (unbounded quantifiers, old() in non-ghost context, …), automatically comment out the offending CheckExpect lines and retry the build. The user-visible Tests.dfy gets matching `// UNCOMPILABLE (...)` markers. Default: OFF — the check phase fails hard on build errors so the user notices them.");
         var skipOnExceptionOpt = new Option<bool>("--skip-on-exception",
             "In --check mode, treat tests that crash with an unhandled exception from the method under test (non-zero exit, no FAIL marker) as SKIPPED instead of FAILED. Preconditions that passed PRE-CHECK but led to a crash (e.g. out-of-bounds access, overflow in the impl) are reported separately as `skipped (exception)`. Default: OFF — crashes count as failures.");
         var dropPostWfOpt = new Option<bool>("--drop-post-wf-guards", () => true,
@@ -69,7 +71,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -93,6 +95,7 @@ class Program
             TrustUnknownUniqueness = ctx.ParseResult.GetValueForOption(trustUnknownOpt);
             SmtTranslator.DropPostWfGuards = ctx.ParseResult.GetValueForOption(dropPostWfOpt);
             TestValidator.SkipOnException = ctx.ParseResult.GetValueForOption(skipOnExceptionOpt);
+            TestValidator.CommentUncompilable = ctx.ParseResult.GetValueForOption(commentUncompilableOpt);
             UniquenessRounds = ctx.ParseResult.GetValueForOption(uniquenessRoundsOpt);
             var skipBodyless = ctx.ParseResult.GetValueForOption(skipBodylessOpt);
             var antiTrivialBias = !ctx.ParseResult.GetValueForOption(noBiasOpt);

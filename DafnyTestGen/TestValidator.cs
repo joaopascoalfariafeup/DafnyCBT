@@ -44,6 +44,14 @@ static class TestValidator
     /// genuine postcondition violations.
     public static bool SkipOnException = false;
 
+    /// When true, build failures due to uncompilable expects (e.g., unbounded
+    /// quantifiers, `old()` in non-spec context) trigger an automatic retry loop:
+    /// the offending CheckExpect lines are commented out in check_all.dfy and the
+    /// build is re-attempted; the corresponding `expect` lines in the user-visible
+    /// Tests.dfy get an `// UNCOMPILABLE (...)` marker. Default OFF — the check
+    /// phase just reports the build failure and writes the Tests.dfy as-is.
+    public static bool CommentUncompilable = false;
+
     /// Classification used when splitting test blocks after a --check run.
     internal enum TestStatus { Passing, Failing, CrashSkipped }
 
@@ -143,8 +151,9 @@ static class TestValidator
             // error; after the primary "bounded set of values" messages are commented,
             // Dafny may surface "unresolved identifier" errors from the same broken
             // quantifier bodies, which a second pass catches.
+            // Gated behind --comment-uncompilable — skip the retry loop entirely when off.
             const int MaxRetries = 3;
-            for (int retry = 0; retry < MaxRetries; retry++)
+            for (int retry = 0; retry < MaxRetries && CommentUncompilable; retry++)
             {
                 if (buildExited && buildCode == 0) break;
                 var progressed = TryCommentUncompilableQuantifiers(
