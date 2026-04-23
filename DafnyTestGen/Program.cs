@@ -633,8 +633,14 @@ class Program
         bool sourceHasMain = DafnyParser.FindMethod(program, "Main") != null;
         if (!sourceHasMain && generatedTestMethods.Count > 0)
         {
+            // If any source method has `decreases *`, the generated Main that calls
+            // them must also be declared `decreases *`.
+            bool sourceHasDecreasesStar = Regex.IsMatch(
+                Regex.Replace(source, @"//[^\r\n]*", ""), @"\bdecreases\s*\*");
             allTestCode.AppendLine();
             allTestCode.AppendLine("method Main()");
+            if (sourceHasDecreasesStar)
+                allTestCode.AppendLine("  decreases *");
             allTestCode.AppendLine("{");
             foreach (var testMethodName in generatedTestMethods)
             {

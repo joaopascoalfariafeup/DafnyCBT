@@ -1879,6 +1879,7 @@ static class TestValidator
         sb.AppendLine();
 
         sb.AppendLine("method Main()");
+        sb.Append(decStar);
         sb.AppendLine("{");
         sb.AppendLine("  Passing();");
         sb.AppendLine("  Failing();");
@@ -1986,6 +1987,7 @@ static class TestValidator
         }
 
         sb.AppendLine("method Main()");
+        sb.Append(decStar);
         sb.AppendLine("{");
         foreach (var m in emittedMethods)
         {
