@@ -138,12 +138,26 @@ static class TestValidator
             // can't compile the forall. Commenting just the offending line keeps
             // the rest of the tests alive.
             var uncompilableByTestId = new Dictionary<int, HashSet<string>>();
-            if ((!buildExited || buildCode != 0)
-                && TryCommentUncompilableQuantifiers(
-                    testFile, buildOut + "\n" + buildErr,
-                    out var commentedLines, out uncompilableByTestId))
+            // Iteratively: while build fails AND we can comment more CheckExpect lines
+            // reported by the compiler, retry. Each pass typically fixes one class of
+            // error; after the primary "bounded set of values" messages are commented,
+            // Dafny may surface "unresolved identifier" errors from the same broken
+            // quantifier bodies, which a second pass catches.
+            const int MaxRetries = 3;
+            for (int retry = 0; retry < MaxRetries; retry++)
             {
-                Console.WriteLine($"[DafnyTestGen] Build failed with {commentedLines} unbounded-quantifier error(s); commented them out and retrying.");
+                if (buildExited && buildCode == 0) break;
+                var progressed = TryCommentUncompilableQuantifiers(
+                    testFile, buildOut + "\n" + buildErr,
+                    out var commentedLines, out var roundMap);
+                if (!progressed) break;
+                foreach (var (tid, exprs) in roundMap)
+                {
+                    if (!uncompilableByTestId.TryGetValue(tid, out var set))
+                        uncompilableByTestId[tid] = set = new HashSet<string>();
+                    foreach (var e in exprs) set.Add(e);
+                }
+                Console.WriteLine($"[DafnyTestGen] Build failed with {commentedLines} uncompilable expect line(s); commented them out and retrying (round {retry + 1}).");
                 (buildExited, buildCode, buildOut, buildErr) = await RunProcess(
                     dafnyPath,
                     $"build --allow-warnings --no-verify \"{testFile}\" -o \"{runnerBase}\"",
@@ -157,6 +171,12 @@ static class TestValidator
                     Console.Error.WriteLine(buildOut);
                 if (!string.IsNullOrWhiteSpace(buildErr))
                     Console.Error.WriteLine(buildErr);
+                // Propagate partial uncompilable markers we DID discover during retry
+                // into the Tests.dfy output. Source-level quantifier errors (in predicates
+                // / lemmas whose `ghost` was stripped) can't be auto-fixed, but at least
+                // the user-facing file marks the CheckExpect calls we know are broken.
+                if (uncompilableByTestId.Count > 0)
+                    return ApplyPartialUncompilableMarkers(generatedCode, uncompilableByTestId, testBlocks);
                 return generatedCode;
             }
 
@@ -1470,13 +1490,15 @@ static class TestValidator
         if (!File.Exists(checkFilePath) || string.IsNullOrEmpty(buildOutput))
             return false;
 
-        // Match `.../check_all.dfy(LINE,COL): Error: quantifiers in non-ghost contexts
-        // must be compilable, but Dafny's heuristics can't figure out how to produce or
-        // compile a bounded set of values for ...`. Keep the filename loose — different
-        // shells/paths (cygwin vs native) vary.
+        // Match ANY Dafny error on a check_all.dfy line. The primary trigger is
+        // "quantifiers in non-ghost contexts must be compilable", but Dafny may
+        // also surface "unresolved identifier" errors when the compiler partially
+        // emits a quantifier body after bound inference fails. We only comment
+        // lines that are `CheckExpect(...)` (identified below) so we don't
+        // accidentally comment method declarations, braces, etc.
         var checkFileName = Regex.Escape(Path.GetFileName(checkFilePath));
         var errPattern = new Regex(
-            checkFileName + @"\((\d+),\d+\):\s*Error:\s*quantifiers in non-ghost contexts must be compilable",
+            checkFileName + @"\((\d+),\d+\):\s*Error:",
             RegexOptions.IgnoreCase);
         var badLines = new HashSet<int>();
         foreach (Match m in errPattern.Matches(buildOutput))
@@ -1486,33 +1508,189 @@ static class TestValidator
         }
         if (badLines.Count == 0) return false;
 
-        // Matches `CheckExpect(<expr>, <testId>);` — capture the expression and the
-        // id so we can comment the corresponding `expect <expr>;` in Tests.dfy.
-        var checkExpectRe = new Regex(@"^\s*CheckExpect\((.+),\s*(\d+)\)\s*;\s*$");
+        // Matches a (possibly multi-line) CheckExpect. Single-line check:
+        var checkExpectStartRe = new Regex(@"^\s*CheckExpect\(");
+        // Matches DafnyTestGen's diagnostic probe prints (EXV / VAL / RHSVAL). These
+        // wrap the same quantifier expression and also fail to compile when the
+        // quantifier is unbounded, so we comment them alongside the CheckExpect.
+        var probePrintRe = new Regex(@"^\s*print\s+""(EXV|VAL|RHSVAL):");
+        // Single-line terminator: `, <testId>);` on the line (captures testId + full expr).
+        var checkExpectFullRe = new Regex(@"^\s*CheckExpect\((?<expr>.+),\s*(?<tid>\d+)\)\s*;\s*$");
+        // End-of-multiline terminator line: `<rest>, <testId>);`
+        var checkExpectEndRe = new Regex(@"^(?<rest>.+),\s*(?<tid>\d+)\)\s*;\s*$");
         var lines = File.ReadAllLines(checkFilePath);
+        // Find candidate CheckExpect start-lines that could enclose the error line.
+        // Walk back to find the nearest preceding CheckExpect; also walk forward up to
+        // a few lines in case the error sits between two adjacent CheckExpects (Dafny
+        // sometimes reports a quantifier error at a line number slightly off from the
+        // actual CheckExpect). Return all matches — the caller comments each one.
+        IEnumerable<int> FindCheckExpectStarts(int errLine)
+        {
+            var result = new HashSet<int>();
+            if (errLine < 1 || errLine > lines.Length) return result;
+            if (checkExpectStartRe.IsMatch(lines[errLine - 1])) result.Add(errLine);
+            // If the error line itself is a probe-print (EXV/VAL/RHSVAL), we comment
+            // it directly as a single-line range AND also find the neighbouring
+            // CheckExpect so they stay in sync.
+            bool errIsProbe = probePrintRe.IsMatch(lines[errLine - 1]);
+            if (errIsProbe) result.Add(errLine);
+            // Walk back
+            for (int back = 1; back <= 100 && errLine - back >= 1; back++)
+            {
+                var candidate = lines[errLine - 1 - back];
+                if (checkExpectStartRe.IsMatch(candidate)) { result.Add(errLine - back); break; }
+                var cTrim = candidate.TrimStart();
+                if (cTrim.StartsWith("method ") || cTrim.StartsWith("lemma ") || cTrim.StartsWith("function "))
+                    break;
+            }
+            // Walk forward a short distance (8 lines) — rarer but covers multi-line
+            // expressions where the error location is before the terminating CheckExpect line,
+            // or a probe print line preceding the CheckExpect.
+            for (int fwd = 1; fwd <= 8 && errLine - 1 + fwd < lines.Length; fwd++)
+            {
+                var candidate = lines[errLine - 1 + fwd];
+                if (checkExpectStartRe.IsMatch(candidate)) { result.Add(errLine + fwd); break; }
+                var cTrim = candidate.TrimStart();
+                if (cTrim.StartsWith("method ") || cTrim.StartsWith("lemma ") || cTrim.StartsWith("function "))
+                    break;
+            }
+            return result;
+        }
+        // Find the end-line of a CheckExpect starting at startLn (scan forward).
+        // Only walks forward if startLn IS a CheckExpect start; otherwise returns
+        // startLn (treats it as a single-line entity — used for probe-print lines
+        // that share an error location with an adjacent CheckExpect).
+        int FindCheckExpectEnd(int startLn)
+        {
+            if (!checkExpectStartRe.IsMatch(lines[startLn - 1])) return startLn;
+            // Single-line case
+            if (checkExpectFullRe.IsMatch(lines[startLn - 1])) return startLn;
+            // Multi-line: scan forward for a line ending in `, <tid>);`.
+            for (int fwd = 1; startLn - 1 + fwd < lines.Length && fwd <= 100; fwd++)
+            {
+                if (checkExpectEndRe.IsMatch(lines[startLn - 1 + fwd]))
+                    return startLn + fwd;
+            }
+            return startLn; // fallback — comment only the start line
+        }
+
+        var commentRanges = new HashSet<(int start, int end)>();
         foreach (var ln in badLines)
         {
-            if (ln < 1 || ln > lines.Length) continue;
-            var raw = lines[ln - 1];
-            var trimmed = raw.TrimStart();
-            if (trimmed.StartsWith("//")) continue; // already commented
-
-            var ceMatch = checkExpectRe.Match(raw);
-            if (ceMatch.Success && int.TryParse(ceMatch.Groups[2].Value, out var tid))
+            foreach (var s in FindCheckExpectStarts(ln))
             {
-                var expr = ceMatch.Groups[1].Value.Trim();
-                if (!uncompilableByTestId.TryGetValue(tid, out var set))
-                    uncompilableByTestId[tid] = set = new HashSet<string>();
+                var e = FindCheckExpectEnd(s);
+                commentRanges.Add((s, e));
+            }
+        }
+        foreach (var (start, end) in commentRanges)
+        {
+            // Already commented?
+            if (lines[start - 1].TrimStart().StartsWith("//")) continue;
+
+            // Record expr/testId for Tests.dfy propagation. Collapse multi-line into one
+            // string, matching what `expect <expr>;` would look like in the user-visible
+            // file. For that we join the captured expr (lines between start..end-1) with
+            // the `rest` on the end line, separated by single spaces.
+            var startLineM = checkExpectFullRe.Match(lines[start - 1]);
+            if (startLineM.Success && int.TryParse(startLineM.Groups["tid"].Value, out var tid1))
+            {
+                var expr = startLineM.Groups["expr"].Value.Trim();
+                if (!uncompilableByTestId.TryGetValue(tid1, out var set))
+                    uncompilableByTestId[tid1] = set = new HashSet<string>();
                 set.Add(expr);
             }
+            else if (end > start && checkExpectEndRe.IsMatch(lines[end - 1]))
+            {
+                var endM = checkExpectEndRe.Match(lines[end - 1]);
+                if (int.TryParse(endM.Groups["tid"].Value, out var tid2))
+                {
+                    var sb = new StringBuilder();
+                    // Strip the leading "CheckExpect(" from the first line
+                    var firstM = Regex.Match(lines[start - 1], @"^\s*CheckExpect\((?<rest>.*)$");
+                    if (firstM.Success) sb.Append(firstM.Groups["rest"].Value.TrimEnd());
+                    for (int li = start; li < end - 1; li++)
+                    {
+                        sb.Append(' ');
+                        sb.Append(lines[li].Trim());
+                    }
+                    sb.Append(' ');
+                    sb.Append(endM.Groups["rest"].Value.TrimEnd());
+                    var fullExpr = Regex.Replace(sb.ToString(), @"\s+", " ").Trim();
+                    if (!uncompilableByTestId.TryGetValue(tid2, out var set))
+                        uncompilableByTestId[tid2] = set = new HashSet<string>();
+                    set.Add(fullExpr);
+                }
+            }
 
-            var indent = raw.Substring(0, raw.Length - trimmed.Length);
-            lines[ln - 1] = indent + "// UNCOMPILABLE (unbounded quantifier) — " + trimmed;
-            commentedLines++;
+            // Also comment probe-print lines (EXV:, VAL:, RHSVAL:) immediately preceding
+            // the CheckExpect — they reference the same expression.
+            int pbStart = start;
+            for (int li = start - 1; li >= 1 && li >= start - 3; li--)
+            {
+                if (probePrintRe.IsMatch(lines[li - 1])) pbStart = li;
+                else break;
+            }
+            // Comment every line from pbStart to end.
+            for (int li = pbStart; li <= end; li++)
+            {
+                var raw = lines[li - 1];
+                var trimmed = raw.TrimStart();
+                if (trimmed.StartsWith("//")) continue;
+                var indent = raw.Substring(0, raw.Length - trimmed.Length);
+                var prefix = li == start ? "// UNCOMPILABLE (unbounded quantifier) — " : "// ";
+                lines[li - 1] = indent + prefix + trimmed;
+                commentedLines++;
+            }
         }
         if (commentedLines == 0) return false;
         File.WriteAllLines(checkFilePath, lines);
         return true;
+    }
+
+    /// <summary>
+    /// Applies uncompilable-expect comments to the full generatedCode string when the
+    /// check phase failed irrecoverably (but we still discovered some uncompilable
+    /// CheckExpects during retry). Goes line-by-line over generatedCode, and for each
+    /// `expect <expr>;` whose expression matches a known-uncompilable expression for
+    /// any test block, prefixes with `// UNCOMPILABLE (unbounded quantifier) —`.
+    /// </summary>
+    static string ApplyPartialUncompilableMarkers(
+        string generatedCode,
+        Dictionary<int, HashSet<string>> uncompilableByTestId,
+        List<(string comment, string body, string sourceMethod)> testBlocks)
+    {
+        // Flatten all uncompilable expressions across all test blocks into one set.
+        // Expression-level matching is coarse but sufficient — the same postcondition
+        // typically appears in multiple test blocks under the same clause, and they
+        // all share the same compilability characteristics.
+        var allBadExprs = new HashSet<string>();
+        foreach (var kv in uncompilableByTestId)
+            foreach (var e in kv.Value) allBadExprs.Add(e);
+        if (allBadExprs.Count == 0) return generatedCode;
+        var sb = new StringBuilder();
+        foreach (var line in generatedCode.Split('\n'))
+        {
+            var rtrimmed = line.TrimEnd('\r');
+            var trimmed = rtrimmed.TrimStart();
+            if (trimmed.StartsWith("expect "))
+            {
+                var semiIdx = rtrimmed.LastIndexOf(';');
+                if (semiIdx > 0)
+                {
+                    var expectIdx = rtrimmed.IndexOf("expect ");
+                    var expr = rtrimmed.Substring(expectIdx + 7, semiIdx - expectIdx - 7).Trim();
+                    if (allBadExprs.Contains(expr))
+                    {
+                        var indent = rtrimmed.Substring(0, rtrimmed.Length - trimmed.Length);
+                        sb.AppendLine(indent + "// UNCOMPILABLE (unbounded quantifier) — " + trimmed);
+                        continue;
+                    }
+                }
+            }
+            sb.AppendLine(rtrimmed);
+        }
+        return sb.ToString();
     }
 
     /// <summary>
