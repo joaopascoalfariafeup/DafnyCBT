@@ -320,10 +320,14 @@ static class TestValidator
                 // the user-visible Tests.dfy so it also compiles standalone.
                 if (uncompilableByTestId.TryGetValue(i, out var badExprs))
                     body = CommentUncompilableExpectsInBody(body, badExprs);
+                // Include the source-method name on each Test line so per-method
+                // analysis (mutation kill curves etc.) can attribute each test to
+                // its originating method without re-parsing the Tests.dfy output.
+                var methodTag = $" [{src}]";
                 if (skippedIds.Contains(i))
                 {
                     skippedCount++;
-                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: SKIP (precondition violated)");
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: SKIP (precondition violated)");
                 }
                 else if (exceptionIds.Contains(i))
                 {
@@ -338,7 +342,7 @@ static class TestValidator
                         failing: true);
                     classified.Add((comment, annotatedBody, src, TestStatus.CrashSkipped));
                     skippedExceptionCount++;
-                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: SKIP (exception from implementation)");
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: SKIP (exception from implementation)");
                 }
                 else if (failedIds.Contains(i))
                 {
@@ -354,7 +358,7 @@ static class TestValidator
                         failing: true);
                     classified.Add((comment, annotatedBody, src, TestStatus.Failing));
                     failingCount++;
-                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: FAIL");
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: FAIL");
                 }
                 else if (wrongValIds.Contains(i))
                 {
@@ -362,7 +366,7 @@ static class TestValidator
                     injected = InjectRuntimeInfo(injected, capturedOuts.GetValueOrDefault(i), null, failing: false);
                     classified.Add((comment, injected, src, TestStatus.Passing));
                     passingCount++;
-                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS (rescued — Z3 value corrected by runtime)");
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: PASS (rescued — Z3 value corrected by runtime)");
                 }
                 else
                 {
@@ -370,7 +374,7 @@ static class TestValidator
                     injected = InjectRuntimeInfo(injected, capturedOuts.GetValueOrDefault(i), null, failing: false);
                     classified.Add((comment, injected, src, TestStatus.Passing));
                     passingCount++;
-                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}: PASS");
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: PASS");
                 }
             }
 
