@@ -4193,6 +4193,9 @@ static class SmtTranslator
         if (postLiterals.Count == 0) return null;
         if (literalIndex < 0 || literalIndex >= postLiterals.Count) return null;
 
+        // Keep bias ON so the outs_alt search (Phase B) is consistent with Phase A
+        // and with the main test generation pipeline. Vacuity tests were previously
+        // run without bias, degrading their ability to exercise non-trivial values.
         var baseSmt = BuildSmt2Query(
             inputs, outputs, preLiterals, postLiterals, method,
             verbose: false,
@@ -4200,7 +4203,7 @@ static class SmtTranslator
             extraConstraints: null,
             preLiterals: preLiterals,
             mutableNames: mutableNames,
-            skipBias: true);
+            skipBias: false);
 
         var checkIdx = baseSmt.LastIndexOf("(check-sat)");
         if (checkIdx < 0) return null;

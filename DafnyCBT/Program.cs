@@ -2558,9 +2558,14 @@ class Program
                                 if (TimedOut()) break;
                                 var extraA = new List<string>(globalExtraConstraints);
                                 extraA.AddRange(excludedIns);
+                                // Apply anti-trivial bias to Phase A: the ins picked here
+                                // becomes the emitted test's input. Without bias, vacuity
+                                // witnesses often land on arr=[0] / x=0 which cancels many
+                                // arithmetic mutations (0+0 == 0-0). Phase 1 / 2b already
+                                // bias; matching here evens the playing field.
                                 var smtA = SmtTranslator.BuildSmt2Query(
                                     inputs, outputs, preClauses, clause, method, false,
-                                    null, extraA, fullPreLits, mutableNames, skipBias: true);
+                                    null, extraA, fullPreLits, mutableNames, skipBias: false);
                                 var resA = await Z3Runner.RunZ3(z3Path, smtA);
                                 var linesA = resA.Split('\n').Select(l => l.Trim()).ToList();
                                 if (!linesA.Any(l => l == "sat")) break;
