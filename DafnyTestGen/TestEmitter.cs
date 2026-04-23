@@ -217,6 +217,15 @@ static class TestEmitter
             if (isArrayCapture) continue;
             var pattern = @"\bold\s*\(" + Regex.Escape(innerExpr) + @"\)";
             result = Regex.Replace(result, pattern, varName);
+            // Also match the obj.-prefixed variant. If the literal was already
+            // obj-prefixed before this helper runs (happens in some paths), then
+            // innerExpr="top" won't match `old(obj.top)`. Try both forms so the
+            // captured `old_top` replaces either.
+            if (!innerExpr.StartsWith("obj."))
+            {
+                var objPattern = @"\bold\s*\(\s*obj\." + Regex.Escape(innerExpr) + @"\s*\)";
+                result = Regex.Replace(result, objPattern, varName);
+            }
         }
 
         // Then handle array captures: old(arrayName[...]) -> captureVar[...]
@@ -1193,6 +1202,11 @@ static class TestEmitter
                     result = Regex.Replace(result,
                         @"(?<![a-zA-Z_0-9.])(?<!obj\.)Valid(?=\s*\()",
                         "obj.Valid");
+                    // Re-run ReplaceOldReferences to catch cases where this pass
+                    // inadvertently prefixed field names inside `old(...)` expressions
+                    // (e.g. old(top) → old(obj.top)). The helper's obj.-variant branch
+                    // will now resolve `old(obj.top)` to the pre-captured `old_top`.
+                    result = ReplaceOldReferences(result, oldCaptures, arrayParamNames);
                     return result;
                 }).ToList();
             }
@@ -1328,6 +1342,11 @@ static class TestEmitter
                     && !(trustZ3Values && !hasUninterpFuncs))
                 {
                     specExpr = ApplyTypeParamMap(specExpr, typeParamMap);
+                    // Replace old() references with captured variables BEFORE obj-prefixing,
+                    // otherwise `old(top)` would become `old(obj.top)` and bypass the capture
+                    // (old() is spec-only so the emitted expect would fail to compile).
+                    specExpr = ReplaceOldReferences(specExpr, oldCaptures, arrayParamNames);
+                    specExpr = StripRemainingOld(specExpr);
                     // For class methods, qualify unqualified field references with "obj."
                     if (classInfo != null)
                     {
@@ -1335,8 +1354,10 @@ static class TestEmitter
                         allFields.UnionWith(constFieldNames);
                         allFields.UnionWith(ghostFieldNames);
                         foreach (var fn in allFields)
-                            specExpr = Regex.Replace(specExpr, @"(?<!\.)\b" + Regex.Escape(fn) + @"\b", "obj." + fn);
+                            specExpr = Regex.Replace(specExpr, @"(?<!\.)(?<!old_)\b" + Regex.Escape(fn) + @"\b", "obj." + fn);
                     }
+                    // Run one more pass in case obj-prefix leaked into any remaining old(...).
+                    specExpr = ReplaceOldReferences(specExpr, oldCaptures, arrayParamNames);
                     sb.AppendLine($"    expect {outp.Name} == {specExpr};");
                     coveredOutputs.Add(outp.Name);
                     continue;
