@@ -52,6 +52,10 @@ static class TestValidator
     /// phase just reports the build failure and writes the Tests.dfy as-is.
     public static bool CommentUncompilable = false;
 
+    /// Set by CheckAndSplitTests before returning: e.g. "19 passing, 0 failing, 1 skipped (exception)".
+    /// Program.cs combines this with the syntax-check result and program name for the final Results line.
+    internal static string? CheckResultSummary = null;
+
     /// Classification used when splitting test blocks after a --check run.
     internal enum TestStatus { Passing, Failing, CrashSkipped }
 
@@ -370,10 +374,9 @@ static class TestValidator
                 }
             }
 
-            var resultMsg = $"[DafnyTestGen] Results: {passingCount} passing, {failingCount} failing";
-            if (skippedCount > 0) resultMsg += $", {skippedCount} skipped (precondition violated)";
-            if (skippedExceptionCount > 0) resultMsg += $", {skippedExceptionCount} skipped (exception)";
-            Console.WriteLine(resultMsg);
+            CheckResultSummary = $"{passingCount} passing, {failingCount} failing";
+            if (skippedCount > 0) CheckResultSummary += $", {skippedCount} skipped (precondition violated)";
+            if (skippedExceptionCount > 0) CheckResultSummary += $", {skippedExceptionCount} skipped (exception)";
 
             if (grouping == "by-status")
             {
@@ -1762,6 +1765,28 @@ static class TestValidator
         if (!body.EndsWith("\n") && result.EndsWith("\n"))
             result = result.TrimEnd('\n');
         return result;
+    }
+
+    /// <summary>
+    /// Runs `dafny resolve --allow-warnings` on the given Tests.dfy file and returns
+    /// the number of syntax/type errors reported (0 = clean). Uses `resolve` rather
+    /// than `build` so we don't re-compile to C# — name resolution + type checking
+    /// is the fast phase that matches what the user sees when opening the file.
+    /// </summary>
+    internal static async Task<int> CountSyntaxErrors(string filePath, string dafnyPath)
+    {
+        if (string.IsNullOrEmpty(dafnyPath) || !File.Exists(filePath)) return -1;
+        var (exited, _, stdout, stderr) = await RunProcess(
+            dafnyPath,
+            $"resolve --allow-warnings \"{filePath}\"",
+            BuildTimeoutMs);
+        if (!exited) return -1;
+        var combined = stdout + "\n" + stderr;
+        // Each error line is like `<path>(LINE,COL): Error: <msg>`.
+        var count = 0;
+        foreach (Match _ in Regex.Matches(combined, @":\s*Error:"))
+            count++;
+        return count;
     }
 
     static async Task<(bool exited, int exitCode, string stdout, string stderr)>

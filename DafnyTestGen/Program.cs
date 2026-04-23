@@ -672,6 +672,30 @@ class Program
                 code = TestValidator.ReformatToByStatus(code);
             File.WriteAllText(outputPath, code);
         }
+
+        // Syntax/type-check the written Tests.dfy and append to the Results line together
+        // with the input program name. The check uses `dafny resolve` (fast name-and-type
+        // resolution; no C# codegen). The program name gives grep-friendly batch output.
+        var dafnyPath = Z3Runner.FindDafnyPath();
+        var programName = Path.GetFileNameWithoutExtension(file.FullName);
+        int syntaxErrors = -1;
+        if (!string.IsNullOrEmpty(dafnyPath))
+            syntaxErrors = await TestValidator.CountSyntaxErrors(outputPath, dafnyPath);
+        string syntaxMsg = syntaxErrors switch
+        {
+            -1 => "syntax check skipped",
+            0 => "syntax OK",
+            _ => $"{syntaxErrors} syntax/type error{(syntaxErrors == 1 ? "" : "s")}"
+        };
+        if (check && TestValidator.CheckResultSummary != null)
+        {
+            Console.WriteLine($"[DafnyTestGen] Results: {TestValidator.CheckResultSummary}, {syntaxMsg} [{programName}]");
+            TestValidator.CheckResultSummary = null;
+        }
+        else
+        {
+            Console.WriteLine($"[DafnyTestGen] Results: {syntaxMsg} [{programName}]");
+        }
         Console.WriteLine($"[DafnyTestGen] Tests written to: {outputPath}");
     }
 
