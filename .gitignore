@@ -32,5 +32,6 @@ Thumbs.db
 
 # Office temp/lock files (open-file sentinels)
 ~$*
+*.pptx
 
 run_tests.sh
