@@ -409,15 +409,23 @@ static class TestValidator
         var sb = new StringBuilder();
         sb.Append(sourceHeader);
 
-        // Detect string/seq<char>-typed output names from method signatures in the source.
-        // These need special printing because Dafny prints seq<char> as raw text.
+        // Detect `decreases *` in any method/function in the source so we can add
+        // matching decreases * annotations to the test wrappers (Dafny requires this
+        // for calls to possibly-non-terminating methods).
+        bool sourceHasDecreasesStar = Regex.IsMatch(
+            Regex.Replace(sourceHeader, @"//[^\r\n]*", ""), @"\bdecreases\s*\*");
+
+        // Detect string/seq<char>/array<char>-typed output names from method signatures.
+        // These need special printing because Dafny prints seq<char> as raw text, which
+        // yields output like `}` for a single-char seq — unparseable as a Dafny literal
+        // for observed-from-implementation expects. The helper prints `['c1', 'c2']`.
         var stringOutputNames = new HashSet<string>();
         foreach (Match rm in Regex.Matches(sourceHeader,
             @"returns\s*\(([^)]+)\)", RegexOptions.Singleline))
         {
             foreach (var part in rm.Groups[1].Value.Split(','))
             {
-                var tm = Regex.Match(part.Trim(), @"^(\w+)\s*:\s*(string|seq<char>)\s*$");
+                var tm = Regex.Match(part.Trim(), @"^(\w+)\s*:\s*(string|seq<char>|array<char>)\s*$");
                 if (tm.Success)
                     stringOutputNames.Add(tm.Groups[1].Value);
             }
@@ -510,6 +518,12 @@ static class TestValidator
             var body = ReplaceExpectsWithChecks(testBlocks[i].body, i, outputNames,
                 stringOutputNames, arrayOutputNames, postExprs);
             sb.AppendLine($"method TestCase_{i}()");
+            // Allow calls to methods declared `decreases *`: if ANY method in the
+            // source has `decreases *`, emit `decreases *` on test wrappers too.
+            // Otherwise Dafny errors: "a call to a possibly non-terminating method
+            // is allowed only if the calling method is also declared (with 'decreases *')".
+            if (sourceHasDecreasesStar)
+                sb.AppendLine("  decreases *");
             sb.AppendLine("{");
             sb.Append(body);
             sb.AppendLine($"  print \"DONE:{i}\\n\";");
@@ -519,6 +533,8 @@ static class TestValidator
 
         // Main: no args → run all; with arg → run specific test by index
         sb.AppendLine("method Main(args: seq<string>)");
+        if (sourceHasDecreasesStar)
+            sb.AppendLine("  decreases *");
         sb.AppendLine("{");
         sb.AppendLine("  if |args| > 1 {");
         // Simple string matching for test index (Dafny has no built-in parseInt)
@@ -674,7 +690,13 @@ static class TestValidator
                     bool isArray = arrayLocals.Contains(name)
                         || (arrayOutputNames != null && arrayOutputNames.Contains(name));
                     if (stringOutputNames != null && stringOutputNames.Contains(name))
-                        outSb.AppendLine($"{indent}print \"OUT:{testId}:{name}=[\"; for i := 0 to |{name}| {{ if i > 0 {{ print \", \"; }} if {name}[i] == '\\'' {{ print \"'\\\\''\"; }} else if {name}[i] == '\\\\' {{ print \"'\\\\\\\\'\"; }} else {{ print \"'\", [{name}[i]], \"'\"; }} }} print \"]\\n\";");
+                    {
+                        // For array<char>, dereference to a seq first so |…| and [i] work.
+                        bool nameIsCharArray = isArray && stringOutputNames.Contains(name);
+                        var src = nameIsCharArray ? $"{name}[..]" : name;
+                        // Emit via a temp to avoid evaluating name[..] multiple times.
+                        outSb.AppendLine($"{indent}{{ var tmpS := {src}; print \"OUT:{testId}:{name}=[\"; for i := 0 to |tmpS| {{ if i > 0 {{ print \", \"; }} if tmpS[i] == '\\'' {{ print \"'\\\\''\"; }} else if tmpS[i] == '\\\\' {{ print \"'\\\\\\\\'\"; }} else {{ print \"'\", [tmpS[i]], \"'\"; }} }} print \"]\\n\"; }}");
+                    }
                     else if (isArray)
                         outSb.AppendLine($"{indent}print \"OUT:{testId}:{name}=\", {name}[..], \"\\n\";");
                     else
@@ -1647,7 +1669,7 @@ static class TestValidator
                 var trimmed = raw.TrimStart();
                 if (trimmed.StartsWith("//")) continue;
                 var indent = raw.Substring(0, raw.Length - trimmed.Length);
-                var prefix = li == start ? "// UNCOMPILABLE (unbounded quantifier) — " : "// ";
+                var prefix = li == start ? "// UNCOMPILABLE (build error) — " : "// ";
                 lines[li - 1] = indent + prefix + trimmed;
                 commentedLines++;
             }
@@ -1662,7 +1684,7 @@ static class TestValidator
     /// check phase failed irrecoverably (but we still discovered some uncompilable
     /// CheckExpects during retry). Goes line-by-line over generatedCode, and for each
     /// `expect <expr>;` whose expression matches a known-uncompilable expression for
-    /// any test block, prefixes with `// UNCOMPILABLE (unbounded quantifier) —`.
+    /// any test block, prefixes with `// UNCOMPILABLE (build error) —`.
     /// </summary>
     static string ApplyPartialUncompilableMarkers(
         string generatedCode,
@@ -1692,7 +1714,7 @@ static class TestValidator
                     if (allBadExprs.Contains(expr))
                     {
                         var indent = rtrimmed.Substring(0, rtrimmed.Length - trimmed.Length);
-                        sb.AppendLine(indent + "// UNCOMPILABLE (unbounded quantifier) — " + trimmed);
+                        sb.AppendLine(indent + "// UNCOMPILABLE (build error) — " + trimmed);
                         continue;
                     }
                 }
@@ -1705,7 +1727,7 @@ static class TestValidator
     /// <summary>
     /// For each test block whose index is in `uncompilableByTestId`, rewrite any
     /// `expect <expr>;` line whose `<expr>` matches a known-uncompilable expression
-    /// into a commented form `// UNCOMPILABLE (unbounded quantifier) — expect <expr>;`.
+    /// into a commented form `// UNCOMPILABLE (build error) — expect <expr>;`.
     /// Keeps the user-facing Tests.dfy standalone-compilable even if the user skips
     /// the check harness and runs it directly.
     /// </summary>
@@ -1728,7 +1750,7 @@ static class TestValidator
                     if (uncompilableExprs.Contains(expr))
                     {
                         var indent = trimmedRight.Substring(0, trimmedRight.Length - trimmed.Length);
-                        sb.AppendLine(indent + "// UNCOMPILABLE (unbounded quantifier) — " + trimmed);
+                        sb.AppendLine(indent + "// UNCOMPILABLE (build error) — " + trimmed);
                         continue;
                     }
                 }
@@ -1799,7 +1821,14 @@ static class TestValidator
         var sb = new StringBuilder();
         sb.Append(sourceHeader);
 
+        // Match behaviour of WriteCheckFile: if the source has `decreases *`, the
+        // test wrappers need it too (callers of non-terminating methods).
+        bool sourceHasDecreasesStar = Regex.IsMatch(
+            Regex.Replace(sourceHeader, @"//[^\r\n]*", ""), @"\bdecreases\s*\*");
+        string decStar = sourceHasDecreasesStar ? "  decreases *\n" : "";
+
         sb.AppendLine("method Passing()");
+        sb.Append(decStar);
         sb.AppendLine("{");
         if (passingBlocks.Count == 0)
             sb.AppendLine("  // (no passing tests)");
@@ -1816,6 +1845,7 @@ static class TestValidator
         sb.AppendLine();
 
         sb.AppendLine("method Failing()");
+        sb.Append(decStar);
         sb.AppendLine("{");
         if (failingBlocks.Count == 0)
             sb.AppendLine("  // (no failing tests)");
@@ -1893,6 +1923,10 @@ static class TestValidator
         var sb = new StringBuilder();
         sb.Append(sourceHeader);
 
+        bool sourceHasDecreasesStar = Regex.IsMatch(
+            Regex.Replace(sourceHeader, @"//[^\r\n]*", ""), @"\bdecreases\s*\*");
+        string decStar = sourceHasDecreasesStar ? "  decreases *\n" : "";
+
         var grouped = classified
             .GroupBy(c => c.sourceMethod)
             .ToDictionary(g => g.Key, g => g.ToList());
@@ -1906,6 +1940,7 @@ static class TestValidator
             emittedMethods.Add(methodName);
 
             sb.AppendLine($"method {methodName}()");
+            sb.Append(decStar);
             sb.AppendLine("{");
             if (blocks.Count == 0)
                 sb.AppendLine("  // (no tests)");

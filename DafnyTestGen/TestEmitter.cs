@@ -785,6 +785,10 @@ static class TestEmitter
             : methodName;
 
         sb.AppendLine($"method TestsFor{methodName}()");
+        // If the source has any method/function declared `decreases *`, add `decreases *`
+        // to the test wrapper too — otherwise Dafny errors on calls to such methods.
+        if (Regex.IsMatch(Regex.Replace(originalSource, @"//[^\r\n]*", ""), @"\bdecreases\s*\*"))
+            sb.AppendLine("  decreases *");
         sb.AppendLine("{");
 
         // Collect array parameter names for old() capture handling
