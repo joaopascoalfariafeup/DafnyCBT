@@ -82,6 +82,11 @@ static class SmtTranslator
     // force a specific value, so correctness is preserved. Toggled by --no-bias CLI.
     internal static bool AntiTrivialBiasEnabled = false;
     internal static int AntiTrivialBiasSeed = 0;
+    // When set (via --seed CLI), forces this exact seed on every SMT query,
+    // overriding the per-method name hash and ignoring --no-bias / skipBias.
+    // Emits the seed options unconditionally. Useful for reproducibility
+    // experiments (same seed across strategies) and seed-sensitivity studies.
+    public static int? ForcedSeed = null;
 
     internal static string BuildSmt2Query(
         List<(string Name, string Type)> inputs,
@@ -99,14 +104,19 @@ static class SmtTranslator
         mutableNames ??= new HashSet<string>();
 
         bool biasOn = AntiTrivialBiasEnabled && !skipBias;
+        // ForcedSeed overrides per-method seeding and is emitted even when
+        // bias is off — it's the reproducibility knob, independent of bias.
+        int seed = ForcedSeed ?? AntiTrivialBiasSeed;
+        bool emitSeed = biasOn || ForcedSeed.HasValue;
 
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("(set-option :produce-models true)");
         if (biasOn)
-        {
             sb.AppendLine("(set-option :smt.arith.random_initial_value true)");
-            sb.AppendLine($"(set-option :smt.random-seed {AntiTrivialBiasSeed})");
-            sb.AppendLine($"(set-option :sat.random-seed {AntiTrivialBiasSeed})");
+        if (emitSeed)
+        {
+            sb.AppendLine($"(set-option :smt.random-seed {seed})");
+            sb.AppendLine($"(set-option :sat.random-seed {seed})");
         }
         sb.AppendLine("(set-logic ALL)");
 

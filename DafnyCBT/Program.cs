@@ -60,6 +60,8 @@ class Program
         noRelevanceOpt.AddAlias("-nr");
         var vacuityOpt = new Option<bool>("--vacuity", "Enable per-literal vacuity check (Phase 1v). Default: OFF.");
         vacuityOpt.AddAlias("-v1v");
+        var seedOpt = new Option<int?>("--seed",
+            "Force a fixed Z3 random seed for every SMT query, overriding the per-method name hash and bypassing the --no-bias / skipBias gating. Useful for reproducibility experiments and seed-sensitivity studies. When omitted, the usual per-method deterministic seed is used (but only when bias is on).");
         var relevanceModeOpt = new Option<string>("--relevance-mode", () => "ladder",
             "Phase 1r shadow-block strategy: 'combined' (per-literal shadow blocks, strictest), 'group' (single shadow block with ¬(⋀ safe Q_k), weakest), or 'ladder' (default: combined then fall back to group on UNSAT — strictly dominates group).");
         var commentUncompilableOpt = new Option<bool>("--comment-uncompilable",
@@ -71,7 +73,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -109,6 +111,9 @@ class Program
             VacuityCheckEnabled = ctx.ParseResult.GetValueForOption(vacuityOpt);
             if (VacuityCheckEnabled)
                 Console.WriteLine("[DafnyCBT] Vacuity check (Phase 1v): ON");
+            SmtTranslator.ForcedSeed = ctx.ParseResult.GetValueForOption(seedOpt);
+            if (SmtTranslator.ForcedSeed.HasValue)
+                Console.WriteLine($"[DafnyCBT] Z3 seed forced to {SmtTranslator.ForcedSeed.Value}");
             var relevanceModeCli = ctx.ParseResult.GetValueForOption(relevanceModeOpt) ?? "ladder";
             if (relevanceModeCli != "combined" && relevanceModeCli != "group" && relevanceModeCli != "ladder")
             {
