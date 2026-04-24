@@ -385,6 +385,12 @@ class Program
         Console.WriteLine($"[DafnyCBT] Output: {outputPath}");
         Console.WriteLine();
 
+        // Per-program timers. genSw covers test generation (DNF, SMT, relevance,
+        // vacuity, BVA, emission). checkSw covers the --check phase only. The
+        // totals go into the final Results line so ablation comparisons can
+        // report strategy-vs-strategy wall-clock cost.
+        var genSw = System.Diagnostics.Stopwatch.StartNew();
+
         // Step 3: Generate tests for each method
         var allTestCode = new System.Text.StringBuilder();
         bool first = true;
@@ -654,6 +660,9 @@ class Program
         if (dir != null && !Directory.Exists(dir))
             Directory.CreateDirectory(dir);
 
+        // Stop gen timer before the check/emit phase so we isolate generator time.
+        genSw.Stop();
+        var checkSw = System.Diagnostics.Stopwatch.StartNew();
         if (check && hasBodylessMethods)
         {
             Console.WriteLine("[DafnyCBT] Warning: -c (check) is not supported for programs with bodyless methods (dafny build cannot compile them). Writing unchecked tests.");
@@ -672,6 +681,7 @@ class Program
                 code = TestValidator.ReformatToByStatus(code);
             File.WriteAllText(outputPath, code);
         }
+        checkSw.Stop();
 
         // Syntax/type-check the written Tests.dfy and append to the Results line together
         // with the input program name. The check uses `dafny resolve` (fast name-and-type
@@ -687,14 +697,19 @@ class Program
             0 => "syntax OK",
             _ => $"{syntaxErrors} syntax/type error{(syntaxErrors == 1 ? "" : "s")}"
         };
+        // Use InvariantCulture so the log has `.` as the decimal separator
+        // regardless of the machine's locale (needed by the plot scripts).
+        var timingMsg = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+            "gen={0:F1}s check={1:F1}s",
+            genSw.Elapsed.TotalSeconds, checkSw.Elapsed.TotalSeconds);
         if (check && TestValidator.CheckResultSummary != null)
         {
-            Console.WriteLine($"[DafnyCBT] Results: {TestValidator.CheckResultSummary}, {syntaxMsg} [{programName}]");
+            Console.WriteLine($"[DafnyCBT] Results: {TestValidator.CheckResultSummary}, {syntaxMsg}, {timingMsg} [{programName}]");
             TestValidator.CheckResultSummary = null;
         }
         else
         {
-            Console.WriteLine($"[DafnyCBT] Results: {syntaxMsg} [{programName}]");
+            Console.WriteLine($"[DafnyCBT] Results: {syntaxMsg}, {timingMsg} [{programName}]");
         }
         Console.WriteLine($"[DafnyCBT] Tests written to: {outputPath}");
     }
