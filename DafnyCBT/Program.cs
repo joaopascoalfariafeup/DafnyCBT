@@ -62,6 +62,9 @@ class Program
         noRelevanceOpt.AddAlias("-nr");
         var vacuityOpt = new Option<bool>("--vacuity", "Enable per-literal vacuity check (Phase 1v). Default: OFF.");
         vacuityOpt.AddAlias("-v1v");
+        var noExistsDecompOpt = new Option<bool>("--no-exists-decomposition",
+            "Disable decomposition of single-variable existential quantifiers (and negated foralls) into left-boundary / middle-range / right-boundary cases. The quantifier is kept as a single literal in the DNF clause. Default: decomposition ON.");
+        noExistsDecompOpt.AddAlias("-ned");
         var vacuityIsolatedOpt = new Option<bool>("--vacuity-isolated",
             "Enable isolation-mode vacuity (Phase 1v): emit /Vk only when ins makes Q_k vacuous AND no OTHER candidate Q_j is also vacuous on that ins. Implies --vacuity. Produces strictly more informative localization tests at the cost of extra Z3 calls per CEGIS attempt. Default: OFF.");
         vacuityIsolatedOpt.AddAlias("-v1vi");
@@ -78,7 +81,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, vacuityIsolatedOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, vacuityIsolatedOpt, noExistsDecompOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -118,6 +121,9 @@ class Program
             if (VacuityIsolated) VacuityCheckEnabled = true; // isolation implies vacuity
             if (VacuityCheckEnabled)
                 Console.WriteLine($"[DafnyCBT] Vacuity check (Phase 1v): ON{(VacuityIsolated ? " (isolated)" : "")}");
+            DnfEngine.DecomposeQuantifiers = !ctx.ParseResult.GetValueForOption(noExistsDecompOpt);
+            if (!DnfEngine.DecomposeQuantifiers)
+                Console.WriteLine("[DafnyCBT] Existential quantifier decomposition: OFF");
             SmtTranslator.ForcedSeed = ctx.ParseResult.GetValueForOption(seedOpt);
             if (SmtTranslator.ForcedSeed.HasValue)
                 Console.WriteLine($"[DafnyCBT] Z3 seed forced to {SmtTranslator.ForcedSeed.Value}");

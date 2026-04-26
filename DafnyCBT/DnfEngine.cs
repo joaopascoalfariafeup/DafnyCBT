@@ -12,6 +12,11 @@ static class DnfEngine
     /// <summary>
     /// Sets the mode: DNF (default) or FDNF. 
     internal static bool UseFdnf { get; set; } = false;
+    /// <summary>When false, single-variable existential quantifiers (and the negation
+    /// of forall quantifiers) are kept as a single literal instead of being split
+    /// into left-boundary / middle-range / right-boundary cases. Used for ablation
+    /// experiments measuring the contribution of quantifier decomposition.</summary>
+    internal static bool DecomposeQuantifiers { get; set; } = true;
 
     /// <summary>
     /// Decomposes a Dafny expression into Disjunctive Normal Form (DNF) or Full DNF (FDNF),
@@ -341,15 +346,15 @@ static class DnfEngine
             return (pos, neg);
         }
 
-        // Exists quantifier: decompose into boundary cases 
-        if (expr is ExistsExpr existsFdnf)
+        // Exists quantifier: decompose into boundary cases (gated for ablation).
+        if (DecomposeQuantifiers && expr is ExistsExpr existsFdnf)
         {
             var decomposed = TryDecomposeExists(existsFdnf);
             if (decomposed != null)
                 return (decomposed, new List<List<Expression>> { new() { Negate(expr) } });
         }
-        // Forall: neg decomposes as exists-not
-        if (expr is ForallExpr forallFdnf)
+        // Forall: neg decomposes as exists-not (gated for ablation).
+        if (DecomposeQuantifiers && expr is ForallExpr forallFdnf)
         {
             var decomposed = TryDecomposeNegatedForall(forallFdnf);
             if (decomposed != null)
