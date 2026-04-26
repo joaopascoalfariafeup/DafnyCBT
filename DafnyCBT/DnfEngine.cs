@@ -1245,6 +1245,88 @@ static class DnfEngine
             }
         }
 
+        // Phase C: collapse (<= ∧ >=) → ==. The two non-strict bounds together
+        // pin the value, so emit a single equality and drop the other slot.
+        // Skip slots that Phase A/B already touched: parsed[] is built from the
+        // original clause and is stale once replace[] has fired, so re-firing
+        // here would clobber a strengthened slot. Skip if either slot is in
+        // drop or replace, AND skip if a same-(lhs,rhs) != literal survives —
+        // (<= ∧ >= ∧ !=) is a 3-way contradiction that should reach Z3 as
+        // UNSAT rather than be silently coerced to ==.
+        for (int i = 0; i < clause.Count; i++)
+        {
+            if (drop.Contains(i) || replace.ContainsKey(i) || parsed[i].op != "<=") continue;
+            for (int j = 0; j < clause.Count; j++)
+            {
+                if (i == j || drop.Contains(j) || replace.ContainsKey(j) || parsed[j].op != ">=") continue;
+                if (parsed[i].lhs != parsed[j].lhs || parsed[i].rhs != parsed[j].rhs) continue;
+                bool hasNeq = false;
+                for (int n = 0; n < clause.Count; n++)
+                {
+                    if (n == i || n == j || drop.Contains(n) || replace.ContainsKey(n)) continue;
+                    if (parsed[n].op == "!=" && parsed[n].lhs == parsed[i].lhs && parsed[n].rhs == parsed[i].rhs)
+                    { hasNeq = true; break; }
+                }
+                if (hasNeq) continue; // 3-way contradiction — let Z3 detect UNSAT
+                int keep = Math.Min(i, j);
+                int discard = Math.Max(i, j);
+                replace[keep] = new LeafExpression($"{parsed[i].lhs} == {parsed[i].rhs}");
+                drop.Add(discard);
+                break;
+            }
+        }
+
+        // Phase D: numeric-aware subset detection. For pairs of literals on the
+        // same lhs with both RHSs parsing as numeric constants, drop the literal
+        // whose admissible interval is a strict superset of the other's — it
+        // adds no information once the tighter literal holds. Dual of Phase 1's
+        // "numeric range with no overlap" contradiction rule (which fires on
+        // empty intersection); this fires when the intersection equals one of
+        // the two literals' intervals.
+        // Examples: (x <= 5) ∧ (x < 10) drops `< 10`; (x == 5) ∧ (x < 10) drops
+        // `< 10`; (x != 10) ∧ (x < 5) drops `!= 10` (hole 10 is outside `< 5`).
+        for (int i = 0; i < clause.Count; i++)
+        {
+            if (drop.Contains(i) || replace.ContainsKey(i)) continue;
+            if (parsed[i].op == null || parsed[i].lhs == null || parsed[i].rhs == null) continue;
+            if (!TryParseNumeric(parsed[i].rhs!, out var vi)) continue;
+            for (int j = i + 1; j < clause.Count; j++)
+            {
+                if (drop.Contains(j) || replace.ContainsKey(j)) continue;
+                if (parsed[j].op == null || parsed[j].lhs != parsed[i].lhs) continue;
+                if (!TryParseNumeric(parsed[j].rhs!, out var vj)) continue;
+                var opI = parsed[i].op!; var opJ = parsed[j].op!;
+                // NEQ + NEQ: holes at distinct points cannot be unified.
+                if (opI == "!=" && opJ == "!=") continue;
+                // NEQ + bound/eq: drop NEQ if its hole falls outside the other's interval.
+                if (opI == "!=")
+                {
+                    if (!ValueSatisfies(vi, opJ, vj)) { drop.Add(i); break; }
+                    continue;
+                }
+                if (opJ == "!=")
+                {
+                    if (!ValueSatisfies(vj, opI, vi)) { drop.Add(j); }
+                    continue;
+                }
+                // Both are bound/eq: compute intervals, intersect, drop superset.
+                var (loI, loIncI, hiI, hiIncI) = OpToInterval(opI, vi);
+                var (loJ, loIncJ, hiJ, hiIncJ) = OpToInterval(opJ, vj);
+                double loMax; bool loMaxInc;
+                if (loI > loJ) { loMax = loI; loMaxInc = loIncI; }
+                else if (loI < loJ) { loMax = loJ; loMaxInc = loIncJ; }
+                else { loMax = loI; loMaxInc = loIncI && loIncJ; }
+                double hiMin; bool hiMinInc;
+                if (hiI < hiJ) { hiMin = hiI; hiMinInc = hiIncI; }
+                else if (hiI > hiJ) { hiMin = hiJ; hiMinInc = hiIncJ; }
+                else { hiMin = hiI; hiMinInc = hiIncI && hiIncJ; }
+                bool intEqI = loMax == loI && loMaxInc == loIncI && hiMin == hiI && hiMinInc == hiIncI;
+                bool intEqJ = loMax == loJ && loMaxInc == loIncJ && hiMin == hiJ && hiMinInc == hiIncJ;
+                if (intEqI && !intEqJ) drop.Add(j);
+                else if (intEqJ && !intEqI) { drop.Add(i); break; }
+            }
+        }
+
         if (drop.Count == 0 && replace.Count == 0) return clause;
         var result = new List<Expression>(clause.Count);
         for (int i = 0; i < clause.Count; i++)
@@ -1254,6 +1336,31 @@ static class DnfEngine
         }
         return result;
     }
+
+    /// <summary>Convert a relational op + numeric value into admissible interval bounds.</summary>
+    static (double low, bool lowInc, double high, bool highInc) OpToInterval(string op, double v) =>
+        op switch
+        {
+            "<"  => (double.NegativeInfinity, false, v, false),
+            "<=" => (double.NegativeInfinity, false, v, true),
+            "==" => (v, true, v, true),
+            ">=" => (v, true, double.PositiveInfinity, false),
+            ">"  => (v, false, double.PositiveInfinity, false),
+            _    => (double.NegativeInfinity, false, double.PositiveInfinity, false),
+        };
+
+    /// <summary>True iff numeric `value` satisfies `value op v` for relational op in {&lt;, &lt;=, ==, !=, &gt;=, &gt;}.</summary>
+    static bool ValueSatisfies(double value, string op, double v) =>
+        op switch
+        {
+            "<"  => value < v,
+            "<=" => value <= v,
+            "==" => value == v,
+            "!=" => value != v,
+            ">=" => value >= v,
+            ">"  => value > v,
+            _    => true,
+        };
 
     /// <summary>
     /// Returns the complement of a literal by negating its operator, or null if not recognized.
