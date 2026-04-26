@@ -82,6 +82,14 @@ static class SmtTranslator
     // force a specific value, so correctness is preserved. Toggled by --no-bias CLI.
     internal static bool AntiTrivialBiasEnabled = false;
     internal static int AntiTrivialBiasSeed = 0;
+    // When true, EmitAntiTrivialBias emits only the magnitude / length bounds
+    // (weight-3 caps that keep integers in [-BIAS_MAX, BIAS_MAX] and seq lengths
+    // ≤ BIAS_LEN) and skips the weight-1/2 anti-trivial pushes (≠ 0, ≠ 1).
+    // Used by Phase 1v isolation mode where the trivial pushes prevent CEGIS
+    // from reaching uniform arrays (e.g. arr=[X,X]) that are required to make
+    // one literal vacuous while keeping the others non-vacuous, but where we
+    // still want bounded magnitudes for performance and readability.
+    internal static bool BiasMagnitudeOnly = false;
     // When set (via --seed CLI), forces this exact seed on every SMT query,
     // overriding the per-method name hash and ignoring --no-bias / skipBias.
     // Emits the seed options unconditionally. Useful for reproducibility
@@ -949,8 +957,11 @@ static class SmtTranslator
             if (type == "int" || type == "nat")
             {
                 var sym = mutableNames.Contains(name) ? $"{name}_pre" : name;
-                sb.AppendLine($"(assert-soft (not (= {sym} 0)) :weight 2)");
-                sb.AppendLine($"(assert-soft (not (= {sym} 1)) :weight 1)");
+                if (!BiasMagnitudeOnly)
+                {
+                    sb.AppendLine($"(assert-soft (not (= {sym} 0)) :weight 2)");
+                    sb.AppendLine($"(assert-soft (not (= {sym} 1)) :weight 1)");
+                }
                 sb.AppendLine($"(assert-soft (<= {sym} {BIAS_MAX}) :weight 3)");
                 if (type == "int")
                     sb.AppendLine($"(assert-soft (>= {sym} (- {BIAS_MAX})) :weight 3)");
@@ -964,12 +975,16 @@ static class SmtTranslator
                 if (elem != "int" && elem != "nat") continue;
                 if (TypeUtils.IsSupportedNestedSeqType(type)) continue;
                 if (TypeUtils.IsTupleType(elem)) continue;
-                sb.AppendLine($"(assert-soft (not (= (seq.len {name}) 0)) :weight 1)");
+                if (!BiasMagnitudeOnly)
+                    sb.AppendLine($"(assert-soft (not (= (seq.len {name}) 0)) :weight 1)");
                 sb.AppendLine($"(assert-soft (<= (seq.len {name}) {BIAS_LEN}) :weight 2)");
                 for (int k = 0; k < BIAS_POS; k++)
                 {
-                    sb.AppendLine($"(assert-soft (=> (> (seq.len {name}) {k}) (not (= (seq.nth {name} {k}) 0))) :weight 2)");
-                    sb.AppendLine($"(assert-soft (=> (> (seq.len {name}) {k}) (not (= (seq.nth {name} {k}) 1))) :weight 1)");
+                    if (!BiasMagnitudeOnly)
+                    {
+                        sb.AppendLine($"(assert-soft (=> (> (seq.len {name}) {k}) (not (= (seq.nth {name} {k}) 0))) :weight 2)");
+                        sb.AppendLine($"(assert-soft (=> (> (seq.len {name}) {k}) (not (= (seq.nth {name} {k}) 1))) :weight 1)");
+                    }
                     sb.AppendLine($"(assert-soft (=> (> (seq.len {name}) {k}) (<= (seq.nth {name} {k}) {BIAS_MAX})) :weight 3)");
                     if (elem == "int")
                         sb.AppendLine($"(assert-soft (=> (> (seq.len {name}) {k}) (>= (seq.nth {name} {k}) (- {BIAS_MAX}))) :weight 3)");
@@ -984,12 +999,16 @@ static class SmtTranslator
                 if (rawElem != "int" && rawElem != "nat") continue;
                 if (TypeUtils.IsTupleType(rawElem)) continue;
                 var seqSym = mutableNames.Contains(name) ? $"{name}_pre_seq" : $"{name}_seq";
-                sb.AppendLine($"(assert-soft (not (= (seq.len {seqSym}) 0)) :weight 1)");
+                if (!BiasMagnitudeOnly)
+                    sb.AppendLine($"(assert-soft (not (= (seq.len {seqSym}) 0)) :weight 1)");
                 sb.AppendLine($"(assert-soft (<= (seq.len {seqSym}) {BIAS_LEN}) :weight 2)");
                 for (int k = 0; k < BIAS_POS; k++)
                 {
-                    sb.AppendLine($"(assert-soft (=> (> (seq.len {seqSym}) {k}) (not (= (seq.nth {seqSym} {k}) 0))) :weight 2)");
-                    sb.AppendLine($"(assert-soft (=> (> (seq.len {seqSym}) {k}) (not (= (seq.nth {seqSym} {k}) 1))) :weight 1)");
+                    if (!BiasMagnitudeOnly)
+                    {
+                        sb.AppendLine($"(assert-soft (=> (> (seq.len {seqSym}) {k}) (not (= (seq.nth {seqSym} {k}) 0))) :weight 2)");
+                        sb.AppendLine($"(assert-soft (=> (> (seq.len {seqSym}) {k}) (not (= (seq.nth {seqSym} {k}) 1))) :weight 1)");
+                    }
                     sb.AppendLine($"(assert-soft (=> (> (seq.len {seqSym}) {k}) (<= (seq.nth {seqSym} {k}) {BIAS_MAX})) :weight 3)");
                     if (rawElem == "int")
                         sb.AppendLine($"(assert-soft (=> (> (seq.len {seqSym}) {k}) (>= (seq.nth {seqSym} {k}) (- {BIAS_MAX}))) :weight 3)");

@@ -827,17 +827,30 @@ static class TestEmitter
             // Show the test condition as a comment (skip spec-only literals like fresh())
             foreach (var pre in preClauses)
                 sb.AppendLine($"  //   PRE:  {ApplyTypeParamMap(DnfEngine.ExprToString(pre), typeParamMap)}");
-            // Vacuity label "{C}/V{k}" → mark literal k (1-based) as vacuous
+            // Vacuity label "{C}/V{k}" or "{C}/Vi{k}" (isolation mode) → mark
+            // literal k (1-based) as vacuous. Isolated /Vi additionally guarantees
+            // no other candidate is vacuous on this ins, which makes the test
+            // strictly more useful for fault localization.
             int vacuousIndex = -1;
-            var vMatch = System.Text.RegularExpressions.Regex.Match(label, @"/V(\d+)(?:/|$)");
-            if (vMatch.Success && int.TryParse(vMatch.Groups[1].Value, out var vNum))
+            bool isolated = false;
+            var vMatch = System.Text.RegularExpressions.Regex.Match(label, @"/V(i?)(\d+)(?:/|$)");
+            if (vMatch.Success && int.TryParse(vMatch.Groups[2].Value, out var vNum))
+            {
                 vacuousIndex = vNum - 1;
+                isolated = vMatch.Groups[1].Value == "i";
+            }
+            if (vacuousIndex >= 0)
+            {
+                sb.AppendLine(isolated
+                    ? $"  //   Vacuity (isolated): Q{vacuousIndex + 1} is vacuously true for this ins; every other candidate literal is non-vacuous, so any failure of this test must be attributable to one of the OTHER POST literals."
+                    : $"  //   Vacuity: Q{vacuousIndex + 1} is vacuously true for this ins (forced true by the other literals).");
+            }
             int litIdx = 0;
             foreach (var lit in literals)
             {
                 if (!TypeUtils.IsSpecOnlyLiteral(lit))
                 {
-                    var tag = litIdx == vacuousIndex ? "  // VACUOUS (forced true by other literals for this ins)" : "";
+                    var tag = litIdx == vacuousIndex ? "  // VACUOUSLY TRUE" : "";
                     var canonical = DnfEngine.CanonicalLiteralKey(lit);
                     sb.AppendLine($"  //   POST Q{litIdx + 1}: {ApplyTypeParamMap(canonical, typeParamMap)}{tag}");
                 }

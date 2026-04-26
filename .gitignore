@@ -20,11 +20,11 @@ _dafnycbt_check_*
 
 # Logs
 test/*_log.txt
+test/experimental_results/
 
 # Special test cases (local corpora not committed)
-test/verifixer/
-test/stuck/
-test/has_errors/
+test/new_buggy/
+
 
 # OS
 Thumbs.db
@@ -34,4 +34,5 @@ Thumbs.db
 ~$*
 *.pptx
 
-run_tests.sh
+# Shell scripts
+*.sh
