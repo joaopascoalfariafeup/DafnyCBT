@@ -3,6 +3,9 @@ DafnyCBT/bin/
 DafnyCBT/obj/
 publish/
 
+# Project file (excluded for anonymization — contains a local user path)
+*.csproj
+
 # IDE
 .vs/
 *.user
