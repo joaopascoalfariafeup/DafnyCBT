@@ -17,6 +17,7 @@ class Program
     static string RelevanceMode = "ladder";
     public static bool VacuityCheckEnabled = false;
     public static bool VacuityIsolated = false;
+    public static bool ReverseBvaOrder = false;
     const int VacuityCegisAttempts = 3;
     const int VacuityCegisAttemptsIsolated = 10;
 
@@ -65,6 +66,9 @@ class Program
         var noExistsDecompOpt = new Option<bool>("--no-exists-decomposition",
             "Disable decomposition of single-variable existential quantifiers (and negated foralls) into left-boundary / middle-range / right-boundary cases. The quantifier is kept as a single literal in the DNF clause. Default: decomposition ON.");
         noExistsDecompOpt.AddAlias("-ned");
+        var reverseBvaOrderOpt = new Option<bool>("--reverse-bva-order",
+            "Run Phase 2b (categorical type/size coverage) before Phase 2 (refined-range BVA) instead of after. Default order is 2 → 2b. When reversed, Phase 2's per-clause dedup against Phase 2b keys is dropped; subsumption at solve-time still skips redundant entries. Useful for kill-curve ablation experiments.");
+        reverseBvaOrderOpt.AddAlias("-rbva");
         var vacuityIsolatedOpt = new Option<bool>("--vacuity-isolated",
             "Enable isolation-mode vacuity (Phase 1v): emit /Vk only when ins makes Q_k vacuous AND no OTHER candidate Q_j is also vacuous on that ins. Implies --vacuity. Produces strictly more informative localization tests at the cost of extra Z3 calls per CEGIS attempt. Default: OFF.");
         vacuityIsolatedOpt.AddAlias("-v1vi");
@@ -81,7 +85,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, vacuityIsolatedOpt, noExistsDecompOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, vacuityIsolatedOpt, noExistsDecompOpt, reverseBvaOrderOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -124,6 +128,9 @@ class Program
             DnfEngine.DecomposeQuantifiers = !ctx.ParseResult.GetValueForOption(noExistsDecompOpt);
             if (!DnfEngine.DecomposeQuantifiers)
                 Console.WriteLine("[DafnyCBT] Existential quantifier decomposition: OFF");
+            ReverseBvaOrder = ctx.ParseResult.GetValueForOption(reverseBvaOrderOpt);
+            if (ReverseBvaOrder)
+                Console.WriteLine("[DafnyCBT] BVA order: Phase 2b → Phase 2 (reversed)");
             SmtTranslator.ForcedSeed = ctx.ParseResult.GetValueForOption(seedOpt);
             if (SmtTranslator.ForcedSeed.HasValue)
                 Console.WriteLine($"[DafnyCBT] Z3 seed forced to {SmtTranslator.ForcedSeed.Value}");
@@ -2758,10 +2765,12 @@ class Program
             }
 
             HashSet<string> phase2Keys = new HashSet<string>();
-            if (testCases.Count < minTests && (boundary || progressive)
-                && n <= 10 && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
+            // --- Phase 2: single-fault refined-range BVA (per clause, per variable) ---
+            async Task RunPhase2()
             {
-                // --- Phase 2: single-fault refined-range BVA (per clause, per variable) ---
+                if (!(testCases.Count < minTests && (boundary || progressive)
+                    && n <= 10 && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests)))
+                    return;
                 int phase2Start = testSchedule.Count;
                 phase2Keys = EmitPhase2Entries(testSchedule);
                 int newEntries = testSchedule.Count - phase2Start;
@@ -2776,10 +2785,12 @@ class Program
                 }
             }
 
-            if (testCases.Count < minTests
-                && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
+            // --- Phase 2b: single-fault type/size coverage + mutation tiers ---
+            async Task RunPhase2b()
             {
-                // --- Phase 2b: single-fault type/size coverage + mutation tiers ---
+                if (!(testCases.Count < minTests
+                    && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests)))
+                    return;
                 int phase2bStart = testSchedule.Count;
                 var (phase2bEntries, prunedByImplication) = EmitPhase2bEntries(testSchedule, phase2Keys);
                 if (phase2bEntries > 0)
@@ -2792,6 +2803,21 @@ class Program
                     if (!verbose) Console.Write("\r                          \r");
                     Console.WriteLine($"  Phase 2b complete: {testCases.Count} test(s)");
                 }
+            }
+
+            // Default order is Phase 2 → Phase 2b (Phase 2b dedups against
+            // Phase 2's emitted keys via phase2Keys). Reverse order: Phase 2b
+            // first with empty phase2Keys, then Phase 2; subsumption at
+            // solve-time skips any Phase 2 entries already covered.
+            if (ReverseBvaOrder)
+            {
+                await RunPhase2b();
+                await RunPhase2();
+            }
+            else
+            {
+                await RunPhase2();
+                await RunPhase2b();
             }
 
             if (testCases.Count < minTests && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
