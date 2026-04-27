@@ -21,6 +21,7 @@ _dafnycbt_check_*
 # Logs
 test/*_log.txt
 test/experimental_results/
+test/buggy_progs/out_*/
 
 # Special test cases (local corpora not committed)
 test/new_buggy/
