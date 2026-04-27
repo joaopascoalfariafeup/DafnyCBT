@@ -38,5 +38,6 @@ Thumbs.db
 ~$*
 *.pptx
 
-# Shell scripts
+# Shell scripts (excluded by default; allow specific ones below)
 *.sh
+!run_tests_buggy_progs_comparison.sh
