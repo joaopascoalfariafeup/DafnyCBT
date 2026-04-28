@@ -96,6 +96,18 @@ static class SmtTranslator
     // experiments (same seed across strategies) and seed-sensitivity studies.
     public static int? ForcedSeed = null;
 
+    /// <summary>True if `pred` matches any descendant of `expr`, including
+    /// `expr` itself. Used to scan spec expressions for collection literals
+    /// that need preamble support.</summary>
+    static bool AnyDescendant(Expression expr, Func<Expression, bool> pred)
+    {
+        if (expr == null) return false;
+        if (pred(expr)) return true;
+        foreach (var sub in expr.SubExpressions)
+            if (sub != null && AnyDescendant(sub, pred)) return true;
+        return false;
+    }
+
     internal static string BuildSmt2Query(
         List<(string Name, string Type)> inputs,
         List<(string Name, string Type)> outputs,
@@ -132,6 +144,24 @@ static class SmtTranslator
         var hasSetParam = inputs.Concat(outputs).Any(v => TypeUtils.IsSetType(v.Type));
         var hasIntSet = inputs.Concat(outputs).Any(v => TypeUtils.IsSetType(v.Type) && !TypeUtils.IsStringElementSet(v.Type));
         var hasStringSet = inputs.Concat(outputs).Any(v => TypeUtils.IsStringElementSet(v.Type));
+        // Also enable the preamble when the spec contains set/multiset/map LITERALS
+        // even if no input/output has a collection type. Without this, EmptySet etc.
+        // would be undefined and Z3 would treat them as uninterpreted, letting it
+        // satisfy any membership query (= soundness loss on `x in {1,2,3}`-style
+        // postconditions that don't bind a set-typed variable).
+        bool walkAllExprs(IEnumerable<Expression?> exprs, Func<Expression, bool> pred)
+        {
+            foreach (var e in exprs)
+                if (e != null && AnyDescendant(e, pred)) return true;
+            return false;
+        }
+        var allSpecExprs = (preClauses ?? Enumerable.Empty<Expression>())
+            .Concat(postLiterals ?? Enumerable.Empty<Expression>())
+            .Concat(preLiterals ?? Enumerable.Empty<Expression>());
+        var hasSetLiteral = walkAllExprs(allSpecExprs, e => e is SetDisplayExpr);
+        if (hasSetLiteral) hasIntSet = true; // string-element sets handled below
+        var hasMultisetLiteral = walkAllExprs(allSpecExprs, e => e is MultiSetDisplayExpr);
+        var hasMapLiteral = walkAllExprs(allSpecExprs, e => e is MapDisplayExpr);
         if (hasIntSet)
         {
             sb.AppendLine();
@@ -173,7 +203,8 @@ static class SmtTranslator
         }
 
         // Multiset operation macros (multisets encoded as (Array Int Int) â€” counts)
-        var hasMultisetParam = inputs.Concat(outputs).Any(v => TypeUtils.IsMultisetType(v.Type));
+        var hasMultisetParam = inputs.Concat(outputs).Any(v => TypeUtils.IsMultisetType(v.Type))
+            || hasMultisetLiteral; // also enable when a `multiset{...}` literal appears in the spec
         if (hasMultisetParam)
         {
             sb.AppendLine();
@@ -238,7 +269,8 @@ static class SmtTranslator
         }
 
         // Map operation macros (maps encoded as domain (Array Int Bool) + values (Array Int V))
-        var hasMapParam = inputs.Concat(outputs).Any(v => TypeUtils.IsMapType(v.Type));
+        var hasMapParam = inputs.Concat(outputs).Any(v => TypeUtils.IsMapType(v.Type))
+            || hasMapLiteral; // also enable when a `map[...]` literal appears in the spec
         if (hasMapParam)
         {
             sb.AppendLine();
@@ -1275,9 +1307,18 @@ static class SmtTranslator
                 var valSmt = ExprToSmt(bin.E0, inputs, mutableNames, isPostContext, insideOld);
                 if (valSmt == null) goto fallback;
 
-                // Check if RHS is a set type
+                // Detect the RHS collection kind by *type* (not just by name lookup),
+                // so set/multiset/map LITERALS and computed expressions (a + b, a * b, …)
+                // take the right membership encoding rather than falling through to the
+                // sequence-search path. Falling through caused unsoundness: e.g.
+                // `month in {1, 3, 5}` was emitted as `(seq.len <Array Int Bool>) ≥ 1
+                // ∧ month = (seq.nth ... 0)`, with seq.* over a non-Seq value treated as
+                // uninterpreted, letting Z3 fabricate spurious witnesses.
                 var rhsName = GetOriginalName(UnwrapExpr(bin.E1));
-                var rhsIsSet = rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsSetType(v.Type));
+                var rhsTypeStr = (bin.E1?.Type?.ToString() ?? "").Trim();
+                bool rhsIsSet = TypeUtils.IsSetType(rhsTypeStr)
+                    || (rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsSetType(v.Type)))
+                    || UnwrapExpr(bin.E1) is SetDisplayExpr;
                 if (rhsIsSet)
                 {
                     var setSmt = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
@@ -1286,8 +1327,9 @@ static class SmtTranslator
                     return bin.Op == BinaryExpr.Opcode.NotIn ? $"(not {memberExpr})" : memberExpr;
                 }
 
-                // Check if RHS is a multiset type
-                var rhsIsMultiset = rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsMultisetType(v.Type));
+                bool rhsIsMultiset = TypeUtils.IsMultisetType(rhsTypeStr)
+                    || (rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsMultisetType(v.Type)))
+                    || UnwrapExpr(bin.E1) is MultiSetDisplayExpr;
                 if (rhsIsMultiset)
                 {
                     var msetSmt = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
@@ -1296,8 +1338,9 @@ static class SmtTranslator
                     return bin.Op == BinaryExpr.Opcode.NotIn ? $"(not {memberExpr})" : memberExpr;
                 }
 
-                // Check if RHS is a map type (k in m tests domain membership)
-                var rhsIsMap = rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsMapType(v.Type));
+                bool rhsIsMap = TypeUtils.IsMapType(rhsTypeStr)
+                    || (rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsMapType(v.Type)))
+                    || UnwrapExpr(bin.E1) is MapDisplayExpr;
                 if (rhsIsMap)
                 {
                     var mapSmt = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
