@@ -478,6 +478,23 @@ class Program
                 continue;
             }
 
+            // Class methods inside named (non-default) modules need
+            // module-qualified instance construction (`new M.C(...)`) and
+            // member access — not yet implemented in TestEmitter. Skip with
+            // a clear message so the user knows it's a known gap rather than
+            // a silent miss. Module-level methods inside named modules ARE
+            // supported (their callsite gets a `M.` prefix and no `obj.`).
+            var enclMod = method.EnclosingClass?.EnclosingModuleDefinition;
+            var enclClsName = method.EnclosingClass?.Name ?? "";
+            bool inNamedModule = enclMod != null && !enclMod.IsDefaultModule;
+            bool inUserClass = method.EnclosingClass != null && enclClsName != "_default";
+            if (inNamedModule && inUserClass)
+            {
+                Console.WriteLine($"  Skipping '{method.Name}': class method inside named module '{enclMod!.Name}.{enclClsName}' (not yet supported)");
+                Console.WriteLine();
+                continue;
+            }
+
             // Skip methods whose requires/ensures reference a bodyless function or predicate.
             // Such functions have no known semantics for SMT and cannot be meaningfully tested.
             var reqEnsExprs = method.Req.Select(r => r.E).Concat(method.Ens.Select(e => e.E));

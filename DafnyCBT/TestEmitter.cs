@@ -779,14 +779,19 @@ static class TestEmitter
                     typeParamMap[tp] = "int";
 
         // Build the method call name with type instantiation if generic (method-level type args only).
-        // For methods declared inside a named module (e.g. `module M { method foo() }`), prefix the
-        // call with `M.` so the top-level test method (which lives in the default module) can resolve
-        // it. Methods inside the default module need no prefix.
+        // For *module-level* methods declared inside a named module (e.g. `module M { method foo() }`),
+        // prefix the call with `M.` so the top-level test method (which lives in the default module)
+        // can resolve it. For *class methods* the call goes through `obj.` and the instance carries
+        // its own type qualification, so no module prefix is needed there (and adding one produces
+        // wrong code like `obj.M.classMethod(...)`).
         var methodTypeArgs = method.TypeArgs?.Select(tp => tp.Name).ToList() ?? new List<string>();
         var modulePrefix = "";
-        var enclosingModule = method.EnclosingClass?.EnclosingModuleDefinition;
-        if (enclosingModule != null && !enclosingModule.IsDefaultModule)
-            modulePrefix = $"{enclosingModule.Name}.";
+        if (classInfo == null) // only for module-level methods
+        {
+            var enclosingModule = method.EnclosingClass?.EnclosingModuleDefinition;
+            if (enclosingModule != null && !enclosingModule.IsDefaultModule)
+                modulePrefix = $"{enclosingModule.Name}.";
+        }
         var methodCallName = methodTypeArgs.Count > 0
             ? $"{modulePrefix}{methodName}<{string.Join(", ", methodTypeArgs.Select(tp => typeParamMap.TryGetValue(tp, out var t) ? t : "int"))}>"
             : $"{modulePrefix}{methodName}";
