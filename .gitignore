@@ -21,9 +21,10 @@ _dafnycbt_check_*
 *.deps.json
 *.runtimeconfig.json
 
-# Logs
+# Logs and local working dirs (allow individual reproducibility scripts below)
 test/*_log.txt
-test/experimental_results/
+test/experimental_results/*
+!test/experimental_results/run_dafny_generate_tests.py
 test/buggy_progs/out_*/
 
 # Special test cases (local corpora not committed)
