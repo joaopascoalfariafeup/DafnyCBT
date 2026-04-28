@@ -778,11 +778,18 @@ static class TestEmitter
                 if (!typeParamMap.ContainsKey(tp))
                     typeParamMap[tp] = "int";
 
-        // Build the method call name with type instantiation if generic (method-level type args only)
+        // Build the method call name with type instantiation if generic (method-level type args only).
+        // For methods declared inside a named module (e.g. `module M { method foo() }`), prefix the
+        // call with `M.` so the top-level test method (which lives in the default module) can resolve
+        // it. Methods inside the default module need no prefix.
         var methodTypeArgs = method.TypeArgs?.Select(tp => tp.Name).ToList() ?? new List<string>();
+        var modulePrefix = "";
+        var enclosingModule = method.EnclosingClass?.EnclosingModuleDefinition;
+        if (enclosingModule != null && !enclosingModule.IsDefaultModule)
+            modulePrefix = $"{enclosingModule.Name}.";
         var methodCallName = methodTypeArgs.Count > 0
-            ? $"{methodName}<{string.Join(", ", methodTypeArgs.Select(tp => typeParamMap.TryGetValue(tp, out var t) ? t : "int"))}>"
-            : methodName;
+            ? $"{modulePrefix}{methodName}<{string.Join(", ", methodTypeArgs.Select(tp => typeParamMap.TryGetValue(tp, out var t) ? t : "int"))}>"
+            : $"{modulePrefix}{methodName}";
 
         sb.AppendLine($"method TestsFor{methodName}()");
         // If the source has any method/function declared `decreases *`, add `decreases *`

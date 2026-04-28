@@ -42,9 +42,26 @@ static class DafnyParser
         var defaultModule = program.DefaultModuleDef;
         if (defaultModule != null)
         {
-            foreach (var decl in defaultModule.TopLevelDecls)
-            {
+            foreach (var decl in EnumerateAllDecls(defaultModule))
                 yield return decl;
+        }
+    }
+
+    /// <summary>Recursively walk a ModuleDefinition's top-level declarations,
+    /// descending into nested named modules (LiteralModuleDecl). Surfaces all
+    /// methods/classes/datatypes regardless of how deeply they're nested,
+    /// so `module M { method foo() ensures … }` is testable just like a
+    /// top-level method.</summary>
+    static IEnumerable<TopLevelDecl> EnumerateAllDecls(ModuleDefinition moduleDef)
+    {
+        foreach (var decl in moduleDef.TopLevelDecls)
+        {
+            yield return decl;
+            // Named module → recurse into its body.
+            if (decl is LiteralModuleDecl literalMod && literalMod.ModuleDef != null)
+            {
+                foreach (var nested in EnumerateAllDecls(literalMod.ModuleDef))
+                    yield return nested;
             }
         }
     }
