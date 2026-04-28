@@ -1157,8 +1157,9 @@ static class TestValidator
                     RegexOptions.Multiline);
                 if (existingExpect.Success)
                 {
-                    var pinnedVal = NormalizeSeqLiteral(existingExpect.Groups[1].Value);
-                    if (pinnedVal == NormalizeSeqLiteral(val)) continue;
+                    var pinnedVal = NormalizeAdtPrefix(NormalizeSeqLiteral(existingExpect.Groups[1].Value));
+                    var observedNorm = NormalizeAdtPrefix(NormalizeSeqLiteral(val));
+                    if (pinnedVal == observedNorm) continue;
                 }
 
                 // Unchanged from declaration: `var X := new T[N] [lit];` or `var X := lit;`
@@ -1175,7 +1176,8 @@ static class TestValidator
                     var scalarDecl = Regex.Match(body,
                         @"^\s*var\s+" + Regex.Escape(name) + @"\s*:=\s*([^;]+);",
                         RegexOptions.Multiline);
-                    if (scalarDecl.Success && scalarDecl.Groups[1].Value.Trim() == val.Trim())
+                    if (scalarDecl.Success
+                        && NormalizeAdtPrefix(scalarDecl.Groups[1].Value.Trim()) == NormalizeAdtPrefix(val.Trim()))
                         continue;
                 }
 
@@ -1256,6 +1258,18 @@ static class TestValidator
     {
         // Strip all whitespace inside [...] for comparison stability.
         return Regex.Replace(s.Trim(), @"\s+", "");
+    }
+
+    /// <summary>
+    /// Strips Dafny's `<AdtName>.` type prefix from constructor names so the
+    /// spec-side `Some(3)` and the implementation-side `Option.Some(3)` (as
+    /// printed by Dafny's `print`) compare equal.
+    /// </summary>
+    static string NormalizeAdtPrefix(string s)
+    {
+        foreach (var adtName in SmtTranslator._adtDatatypes.Keys)
+            s = Regex.Replace(s, @"\b" + Regex.Escape(adtName) + @"\.", "");
+        return s;
     }
 
     /// <summary>

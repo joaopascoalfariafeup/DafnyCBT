@@ -221,6 +221,8 @@ static class TypeUtils
             return $"(Array {DafnyTypeToSmt(GetMultisetElementType(dafnyType))} Int)";
         if (dafnyType.StartsWith("map<"))
             return "Int"; // placeholder — maps are encoded as domain+values arrays, not a single SMT type
+        // Non-enum algebraic datatypes admitted in v1: SMT sort name == Dafny ADT name
+        if (SmtTranslator._adtDatatypes.ContainsKey(dafnyType)) return dafnyType;
         return "Int"; // fallback
     }
 
@@ -269,6 +271,13 @@ static class TypeUtils
                     if (gvMatch.Success)
                         result[name] = gvMatch.Groups[1].Value;
                 }
+            }
+            else if (SmtTranslator._adtDatatypes.ContainsKey(type))
+            {
+                // ADT scalar: capture the raw sexpr value (e.g. "Empty", "(Mk 3 7)",
+                // "(as Empty Tree)"). Conversion to Dafny syntax happens in TestEmitter.
+                var sexpr = ExtractSexprFromGetValue(fullText, name);
+                if (sexpr != null) result[name] = sexpr;
             }
             else
             {
@@ -701,5 +710,91 @@ static class TypeUtils
         }
         if (enumDatatypes != null && enumDatatypes.ContainsKey(type)) return true;
         return false;
+    }
+
+    /// <summary>
+    /// Extracts the raw sexpr value for `name` from a Z3 model/get-value
+    /// response. Tries:
+    ///   1. `((name <value>))` — get-value form
+    ///   2. `(define-fun name () <sort> <value>)` — get-model form
+    /// The <value> may be an atom (e.g. "Empty"), a sexpr (e.g. "(Mk 3 7)"),
+    /// an as-annotation ("(as Empty Tree)"), or nested.
+    /// </summary>
+    internal static string? ExtractSexprFromGetValue(string text, string name)
+    {
+        // Form 1: ((name <value>))
+        int from1 = 0;
+        var marker1 = "((" + name;
+        while ((from1 = text.IndexOf(marker1, from1, StringComparison.Ordinal)) >= 0)
+        {
+            int after = from1 + marker1.Length;
+            if (after < text.Length && char.IsWhiteSpace(text[after]))
+            {
+                var v = ReadSexprValue(text, after);
+                if (v != null) return v;
+            }
+            from1 = after;
+        }
+        // Form 2: (define-fun name () <sort> <value>)
+        int from2 = 0;
+        var marker2 = "define-fun " + name + " () ";
+        while ((from2 = text.IndexOf(marker2, from2, StringComparison.Ordinal)) >= 0)
+        {
+            int after = from2 + marker2.Length;
+            // Skip the sort token (an atom or a parenthesised sort)
+            int j = after;
+            while (j < text.Length && char.IsWhiteSpace(text[j])) j++;
+            if (j >= text.Length) break;
+            if (text[j] == '(')
+            {
+                int depth = 0;
+                while (j < text.Length)
+                {
+                    if (text[j] == '(') depth++;
+                    else if (text[j] == ')')
+                    {
+                        depth--;
+                        if (depth == 0) { j++; break; }
+                    }
+                    j++;
+                }
+            }
+            else
+            {
+                while (j < text.Length && !char.IsWhiteSpace(text[j]) && text[j] != ')') j++;
+            }
+            // Now read the value sexpr
+            var v = ReadSexprValue(text, j);
+            if (v != null) return v;
+            from2 = after;
+        }
+        return null;
+    }
+
+    static string? ReadSexprValue(string text, int startPos)
+    {
+        int j = startPos;
+        while (j < text.Length && char.IsWhiteSpace(text[j])) j++;
+        if (j >= text.Length) return null;
+        int valStart = j;
+        if (text[j] == '(')
+        {
+            int depth = 0;
+            while (j < text.Length)
+            {
+                if (text[j] == '(') depth++;
+                else if (text[j] == ')')
+                {
+                    depth--;
+                    if (depth == 0) { j++; break; }
+                }
+                j++;
+            }
+        }
+        else
+        {
+            while (j < text.Length && !char.IsWhiteSpace(text[j]) && text[j] != ')') j++;
+        }
+        return text.Substring(valStart, j - valStart);
     }
 }

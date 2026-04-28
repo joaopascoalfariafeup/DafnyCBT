@@ -77,6 +77,12 @@ static class SmtTranslator
     internal static Dictionary<string, List<string>> _enumDatatypes = new();
     internal static Dictionary<string, (string dtName, int ordinal)> _enumConstructors = new();
 
+    // Non-enum algebraic datatypes admitted in v1 (slice 1: non-recursive only).
+    // _adtDatatypes:   dtName → list of (ctorName, list of (formalName, formalType))
+    // _adtConstructors: ctorName → (dtName, ordinal)
+    internal static Dictionary<string, List<(string CtorName, List<(string Name, string Type)> Formals)>> _adtDatatypes = new();
+    internal static Dictionary<string, (string dtName, int ordinal)> _adtConstructors = new();
+
     // Anti-trivial bias: bias Z3 away from special values (0, 1) when the spec
     // otherwise allows many solutions. Soft-asserts are ignored when hard constraints
     // force a specific value, so correctness is preserved. Toggled by --no-bias CLI.
@@ -292,6 +298,42 @@ static class SmtTranslator
             }
         }
         sb.AppendLine();
+
+        // Algebraic-datatype declarations — must precede any (declare-const) of an ADT type.
+        // Emit only ADTs that are actually referenced in this query, to keep the SMT minimal.
+        if (_adtDatatypes.Count > 0)
+        {
+            var referencedAdts = new HashSet<string>();
+            foreach (var (_, t) in inputs.Concat(outputs))
+                if (_adtDatatypes.ContainsKey(t)) referencedAdts.Add(t);
+            foreach (var e in allSpecExprs)
+                if (e != null) AnyDescendant(e, sub =>
+                {
+                    if (sub is DatatypeValue dv && _adtConstructors.TryGetValue(dv.MemberName, out var info))
+                        referencedAdts.Add(info.dtName);
+                    return false;
+                });
+            if (referencedAdts.Count > 0)
+            {
+                sb.AppendLine("; Algebraic datatype declarations (non-recursive ADTs admitted in v1)");
+                var sortDecls = string.Join(" ", referencedAdts.Select(n => $"({n} 0)"));
+                var ctorBlocks = new List<string>();
+                foreach (var name in referencedAdts)
+                {
+                    var ctors = _adtDatatypes[name];
+                    var ctorStrs = ctors.Select(c =>
+                    {
+                        if (c.Formals.Count == 0) return $"({c.CtorName})";
+                        var fields = string.Join(" ", c.Formals.Select((f, i) =>
+                            $"({c.CtorName}_{i} {TypeUtils.DafnyTypeToSmt(f.Type)})"));
+                        return $"({c.CtorName} {fields})";
+                    });
+                    ctorBlocks.Add($"({string.Join(" ", ctorStrs)})");
+                }
+                sb.AppendLine($"(declare-datatypes ({sortDecls}) ({string.Join(" ", ctorBlocks)}))");
+                sb.AppendLine();
+            }
+        }
 
         // Declare variables for inputs and outputs.
         // For mutable params (listed in method's modifies clause), declare separate
@@ -1497,6 +1539,22 @@ static class SmtTranslator
         {
             if (_enumConstructors.TryGetValue(dtVal.MemberName, out var enumInfo))
                 return enumInfo.ordinal.ToString();
+            // Nullary constructor of a non-enum ADT (e.g. None, Empty)
+            if (_adtConstructors.ContainsKey(dtVal.MemberName))
+                return dtVal.MemberName;
+        }
+        // Non-enum ADT constructor application (e.g. Mk(a, b), Some(x))
+        if (expr is DatatypeValue adtCtor && adtCtor.Arguments.Count > 0
+            && _adtConstructors.ContainsKey(adtCtor.MemberName))
+        {
+            var argSmts = new List<string>();
+            foreach (var arg in adtCtor.Arguments)
+            {
+                var argSmt = ExprToSmt(arg, inputs, mutableNames, isPostContext, insideOld);
+                if (argSmt == null) goto fallback;
+                argSmts.Add(argSmt);
+            }
+            return $"({adtCtor.MemberName} {string.Join(" ", argSmts)})";
         }
 
         // ThisExpr: 'this' has no SMT representation (object reference)
@@ -1766,6 +1824,34 @@ static class SmtTranslator
                 var objSmt = ExprToSmt(memSel.Obj, inputs, mutableNames, isPostContext, insideOld);
                 if (objSmt != null) return $"{objSmt}_len";
                 goto fallback;
+            }
+
+            // ADT discriminator (e.g. s.Circle?, t.Empty?) → ((_ is Ctor) obj)
+            if (memSel.MemberName.EndsWith("?"))
+            {
+                var ctorName = memSel.MemberName.Substring(0, memSel.MemberName.Length - 1);
+                if (_adtConstructors.ContainsKey(ctorName))
+                {
+                    var objSmt = ExprToSmt(memSel.Obj, inputs, mutableNames, isPostContext, insideOld);
+                    if (objSmt != null) return $"((_ is {ctorName}) {objSmt})";
+                    goto fallback;
+                }
+            }
+            // ADT destructor (e.g. p.fst, s.radius) → (Ctor_<i> obj)
+            // Disambiguate by resolved object type when available.
+            {
+                var objTypeStr = memSel.Obj?.Type?.ToString();
+                if (objTypeStr != null && _adtDatatypes.TryGetValue(objTypeStr, out var adtCtors))
+                {
+                    foreach (var c in adtCtors)
+                        for (int fi = 0; fi < c.Formals.Count; fi++)
+                            if (c.Formals[fi].Name == memSel.MemberName)
+                            {
+                                var objSmt = ExprToSmt(memSel.Obj, inputs, mutableNames, isPostContext, insideOld);
+                                if (objSmt != null) return $"({c.CtorName}_{fi} {objSmt})";
+                                goto fallback;
+                            }
+                }
             }
             // Tuple component access: t.0, t.1 (MemberName may be "0" or "_0")
             var tupleIdxStr = memSel.MemberName.StartsWith("_") ? memSel.MemberName.Substring(1) : memSel.MemberName;

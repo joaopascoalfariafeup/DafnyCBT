@@ -665,6 +665,14 @@ static class TestEmitter
             return $"    var {name} := {scalarEnumCtors[0]};";
         }
 
+        // Non-enum ADT: convert Z3 sexpr to Dafny constructor syntax.
+        if (SmtTranslator._adtDatatypes.ContainsKey(typeStr))
+        {
+            if (values.TryGetValue(name, out var sexpr))
+                return $"    var {name} := {SexprToDafnyAdt(sexpr)};";
+            return $"    var {name} := {DefaultAdtValue(typeStr)}; // Z3 did not assign";
+        }
+
         if (values.TryGetValue(name, out var val))
         {
             // Ensure real values have a decimal point (Dafny requires e.g. 0.0, not 0)
@@ -686,6 +694,84 @@ static class TestEmitter
     }
 
     /// <summary>
+    /// Converts a Z3 sexpr value (e.g. "Empty", "(Mk 3 7)", "(as Empty Tree)",
+    /// "(Some (- 5))") to Dafny constructor syntax ("Empty", "Mk(3, 7)",
+    /// "Empty", "Some(-5)").
+    /// </summary>
+    internal static string SexprToDafnyAdt(string sexpr)
+    {
+        sexpr = sexpr.Trim();
+        if (!sexpr.StartsWith("(")) return sexpr; // atom (nullary ctor or numeric)
+        var inner = sexpr.Substring(1, sexpr.Length - 2);
+        var tokens = TokenizeSexprTopLevel(inner);
+        if (tokens.Count == 0) return sexpr;
+        // Strip Z3 'as' annotation: (as Ctor Type) → Ctor (recurse on payload)
+        if (tokens.Count == 3 && tokens[0] == "as")
+            return SexprToDafnyAdt(tokens[1]);
+        // Numeric negation: (- 5) → -5
+        if (tokens.Count == 2 && tokens[0] == "-")
+            return "-" + tokens[1];
+        // Constructor application: (Ctor a b ...) → Ctor(a', b', ...)
+        var ctor = tokens[0];
+        var args = tokens.Skip(1).Select(SexprToDafnyAdt);
+        return $"{ctor}({string.Join(", ", args)})";
+    }
+
+    static List<string> TokenizeSexprTopLevel(string s)
+    {
+        var tokens = new List<string>();
+        int i = 0;
+        while (i < s.Length)
+        {
+            while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+            if (i >= s.Length) break;
+            if (s[i] == '(')
+            {
+                int depth = 0, start = i;
+                while (i < s.Length)
+                {
+                    if (s[i] == '(') depth++;
+                    else if (s[i] == ')')
+                    {
+                        depth--;
+                        if (depth == 0) { i++; break; }
+                    }
+                    i++;
+                }
+                tokens.Add(s.Substring(start, i - start));
+            }
+            else
+            {
+                int start = i;
+                while (i < s.Length && !char.IsWhiteSpace(s[i]) && s[i] != '(' && s[i] != ')') i++;
+                tokens.Add(s.Substring(start, i - start));
+            }
+        }
+        return tokens;
+    }
+
+    /// <summary>
+    /// Returns a default constructor expression for an ADT type, used when Z3
+    /// did not assign a value. Picks the first nullary constructor if any,
+    /// otherwise the first constructor with zero-default formals.
+    /// </summary>
+    static string DefaultAdtValue(string adtName)
+    {
+        if (!SmtTranslator._adtDatatypes.TryGetValue(adtName, out var ctors)) return "??";
+        var nullary = ctors.FirstOrDefault(c => c.Formals.Count == 0);
+        if (nullary.CtorName != null) return nullary.CtorName;
+        var first = ctors[0];
+        var args = first.Formals.Select(f => f.Type switch
+        {
+            "bool" => "false",
+            "real" => "0.0",
+            "char" => "' '",
+            _ => "0"
+        });
+        return $"{first.CtorName}({string.Join(", ", args)})";
+    }
+
+    /// <summary>
     /// Formats a scalar Z3 value for Dafny emission (used for class field assignments).
     /// </summary>
     static string FormatScalarValue(string val, string typeStr, Dictionary<string, List<string>>? enumDatatypes)
@@ -696,6 +782,8 @@ static class TestEmitter
                 return ctors[ord];
             return ctors[0];
         }
+        if (SmtTranslator._adtDatatypes.ContainsKey(typeStr))
+            return SexprToDafnyAdt(val);
         if (typeStr == "real" && !val.Contains('.'))
             return val + ".0";
         if (typeStr == "char" && int.TryParse(val, out var charCode))
@@ -892,8 +980,16 @@ static class TestEmitter
                 : new List<(string Name, string Type)>();
             if (classInfo != null)
             {
-                // Build class name with type instantiation for generic classes
-                var classNameWithTypes = classInfo.ClassName;
+                // Build class name with type instantiation for generic classes.
+                // For classes inside a named module, prefix with `<Module>.` so the
+                // top-level test method (which lives in the default module) can
+                // resolve the type. The constructor call and field assignments use
+                // the qualified name; member access via `obj.` resolves through the
+                // obj's type without further qualification.
+                var classModule = method.EnclosingClass?.EnclosingModuleDefinition;
+                var classModulePrefix = (classModule != null && !classModule.IsDefaultModule)
+                    ? $"{classModule.Name}." : "";
+                var classNameWithTypes = $"{classModulePrefix}{classInfo.ClassName}";
                 if (classInfo.ClassTypeParams != null && classInfo.ClassTypeParams.Count > 0)
                     classNameWithTypes += $"<{string.Join(", ", classInfo.ClassTypeParams.Select(tp => typeParamMap.TryGetValue(tp, out var t) ? t : "int"))}>";
 
@@ -1508,6 +1604,9 @@ static class TestEmitter
                     if (enumDatatypes != null && enumDatatypes.TryGetValue(typeStr, out var outEnumCtors)
                         && int.TryParse(val, out var outOrd) && outOrd >= 0 && outOrd < outEnumCtors.Count)
                         val = outEnumCtors[outOrd];
+                    // Convert ADT sexpr to Dafny constructor syntax (e.g. "(Mk 2 6)" → "Mk(2, 6)")
+                    if (SmtTranslator._adtDatatypes.ContainsKey(typeStr))
+                        val = SexprToDafnyAdt(val);
                     // Ensure real output values have a decimal point
                     if (typeStr == "real" && !val.Contains('.'))
                         val += ".0";

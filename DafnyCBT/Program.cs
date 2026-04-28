@@ -270,18 +270,23 @@ class Program
         }
 
         // Step 2: Determine which methods to process
-        // Classify user-defined datatypes: pure enums (all constructors parameterless) vs complex
+        // Classify user-defined datatypes:
+        //   - Pure enums (all constructors parameterless) → encoded as bounded ints.
+        //   - Non-enum, supported (single-self-referential or non-recursive, no type
+        //     params, not codata, not in a mutually-recursive group) → emitted via
+        //     native (declare-datatypes). Slice 1 admits only non-recursive ADTs.
+        //   - Anything else → still skipped at the per-method filter.
         var allDatatypes = DafnyParser.AllTopLevelDecls(program)
             .OfType<DatatypeDecl>()
             .ToList();
         var enumDatatypes = new Dictionary<string, List<string>>();
-        var datatypeNames = new HashSet<string>(); // non-enum datatypes (still skipped)
+        var nonEnumDatatypes = new List<DatatypeDecl>();
         foreach (var dt in allDatatypes)
         {
             if (dt.Ctors.All(ctor => ctor.Formals.Count == 0))
                 enumDatatypes[dt.Name] = dt.Ctors.Select(c => c.Name).ToList();
             else
-                datatypeNames.Add(dt.Name);
+                nonEnumDatatypes.Add(dt);
         }
         var enumConstructors = new Dictionary<string, (string dtName, int ordinal)>();
         foreach (var (dtName, ctors) in enumDatatypes)
@@ -289,6 +294,50 @@ class Program
                 enumConstructors[ctors[i]] = (dtName, i);
         if (enumDatatypes.Count > 0)
             Console.WriteLine($"[DafnyCBT] Enum datatypes: {string.Join(", ", enumDatatypes.Select(e => $"{e.Key}({string.Join("|", e.Value)})"))}");
+
+        // Slice 1 admission: non-enum ADT, no type params, not codata, no formal
+        // referencing any non-enum datatype name (excludes recursion + mutual rec).
+        var nonEnumDatatypeNames = new HashSet<string>(nonEnumDatatypes.Select(d => d.Name));
+        var adtDatatypes = new Dictionary<string, List<(string CtorName, List<(string Name, string Type)> Formals)>>();
+        var adtConstructors = new Dictionary<string, (string dtName, int ordinal)>();
+        var skippedDatatypeNames = new HashSet<string>();
+        foreach (var dt in nonEnumDatatypes)
+        {
+            if (dt is CoDatatypeDecl) { skippedDatatypeNames.Add(dt.Name); continue; }
+            if (dt.TypeArgs.Count > 0) { skippedDatatypeNames.Add(dt.Name); continue; }
+            // Reject mutual recursion: any reference to ANOTHER non-enum datatype.
+            // Self-references (recursive ADTs like Tree = Empty | Node(int, Tree, Tree))
+            // are admitted — Z3's (declare-datatypes) handles recursion natively.
+            bool refsOtherNonEnum = dt.Ctors.Any(c => c.Formals.Any(f =>
+            {
+                var ts = f.Type.ToString();
+                var ids = Regex.Matches(ts, @"\b([A-Za-z_]\w*)\b");
+                return ids.Cast<Match>().Any(m =>
+                {
+                    var n = m.Groups[1].Value;
+                    return n != dt.Name && nonEnumDatatypeNames.Contains(n);
+                });
+            }));
+            if (refsOtherNonEnum) { skippedDatatypeNames.Add(dt.Name); continue; }
+            var ctorList = new List<(string, List<(string, string)>)>();
+            for (int ci = 0; ci < dt.Ctors.Count; ci++)
+            {
+                var c = dt.Ctors[ci];
+                var formals = c.Formals.Select(f => (f.Name, f.Type.ToString())).ToList();
+                ctorList.Add((c.Name, formals));
+                adtConstructors[c.Name] = (dt.Name, ci);
+            }
+            adtDatatypes[dt.Name] = ctorList;
+        }
+        if (adtDatatypes.Count > 0)
+            Console.WriteLine($"[DafnyCBT] ADT datatypes: {string.Join(", ", adtDatatypes.Select(e => $"{e.Key}({string.Join("|", e.Value.Select(c => c.CtorName + (c.Formals.Count == 0 ? "" : "(" + string.Join(",", c.Formals.Select(f => f.Type)) + ")")))})"))}");
+        // Plumb ADT info into SmtTranslator (program-scoped — same for every method).
+        SmtTranslator._adtDatatypes = adtDatatypes;
+        SmtTranslator._adtConstructors = adtConstructors;
+
+        // datatypeNames retained for the per-method skip filter — only contains
+        // datatypes still NOT supported (codata, generic, recursive, mutually rec).
+        var datatypeNames = skippedDatatypeNames;
 
         // Collect user-defined class names — parameters of class/reference type can't be
         // represented as concrete SMT values and must be rejected.
@@ -474,23 +523,6 @@ class Program
             if (isBodyless && skipBodyless)
             {
                 Console.WriteLine($"  Skipping '{method.Name}': bodyless method (--skip-bodyless)");
-                Console.WriteLine();
-                continue;
-            }
-
-            // Class methods inside named (non-default) modules need
-            // module-qualified instance construction (`new M.C(...)`) and
-            // member access — not yet implemented in TestEmitter. Skip with
-            // a clear message so the user knows it's a known gap rather than
-            // a silent miss. Module-level methods inside named modules ARE
-            // supported (their callsite gets a `M.` prefix and no `obj.`).
-            var enclMod = method.EnclosingClass?.EnclosingModuleDefinition;
-            var enclClsName = method.EnclosingClass?.Name ?? "";
-            bool inNamedModule = enclMod != null && !enclMod.IsDefaultModule;
-            bool inUserClass = method.EnclosingClass != null && enclClsName != "_default";
-            if (inNamedModule && inUserClass)
-            {
-                Console.WriteLine($"  Skipping '{method.Name}': class method inside named module '{enclMod!.Name}.{enclClsName}' (not yet supported)");
                 Console.WriteLine();
                 continue;
             }
