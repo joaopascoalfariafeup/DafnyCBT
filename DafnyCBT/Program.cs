@@ -2561,6 +2561,15 @@ class Program
                                 if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: SAT — added test case");
                             }
                         }
+                        else if (lines.Any(l => l == "unknown"))
+                        {
+                            // Z3 couldn't decide — common when the post contains
+                            // uninterpreted recursive functions (e.g. ProdF) that
+                            // make the dual-block relevance query intractable.
+                            // Phase 1's plain SAT query (run later for clauses not
+                            // in coveredByRelevance) is the safety net.
+                            if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: UNKNOWN (falling back to plain Phase 1)");
+                        }
                         else if (lines.Any(l => l == "unsat"))
                         {
                             relUnsat++;

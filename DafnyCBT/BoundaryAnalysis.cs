@@ -36,7 +36,13 @@ static class BoundaryAnalysis
             string smtName = kind == VarKind.MutablePost ? $"{varName}_post" : varName;
 
             // Skip rule: classLiterals pin the variable to a single value.
-            if (IsEqualityPinned(varName, cleanLits)) return result;
+            // Only meaningful for *outputs* — `res == expr` pins `res` because
+            // Phase 1's witness already covers the unique RHS. For *inputs*,
+            // an equation like `expr == n` (where n is an input and expr
+            // involves outputs or other inputs) does NOT pin n — varying n
+            // is the whole point of BVA, and Phase 2 should explore its
+            // boundaries even if it appears on one side of an `==`.
+            if (kind != VarKind.Input && IsEqualityPinned(varName, cleanLits)) return result;
 
             var (lo, hi) = ExtractBounds(varName, cleanLits);
             var relUpperExprs = ExtractRelationalBounds(varName, cleanLits, inputs, mutableNames);
