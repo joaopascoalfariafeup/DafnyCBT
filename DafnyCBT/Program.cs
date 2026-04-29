@@ -1190,6 +1190,13 @@ class Program
         }
 
         // Compute DNF on un-inlined ensures for expect emission (preserves predicate names).
+        // Also detect when inlining (typically recursive at depth ≥ 2) changed
+        // the per-clause literal count — that means an if-then-else was DNF-
+        // expanded into extra literals, breaking the position-based mapping
+        // and (more importantly) leaving the inlined spec semantically weaker
+        // than the original (residual recursive calls remain uninterpreted),
+        // so uniqueness alt enumeration can return spurious alternatives.
+        // Force the full-postcondition / no-alt-enum path in that case.
         // Use CrossProductPruned to keep clause structure aligned with dnfExprs — otherwise
         // the position-based inlined→original mapping below misaligns and literals get lost.
         var originalDnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
@@ -1218,6 +1225,28 @@ class Program
             dnfExprs = DnfEngine.ExprToDnf(dnfEnsures[0]);
             for (int i = 1; i < dnfEnsures.Count; i++)
                 dnfExprs = DnfEngine.CrossProductPruned(dnfExprs, DnfEngine.ExprToDnf(dnfEnsures[i]));
+        }
+
+        // Detect whether inlining (typically recursive at depth ≥ 2) altered
+        // the per-clause structure. If the inlined DNF has a different literal
+        // count than the original DNF for the same clause, an if-then-else was
+        // DNF-expanded, leaving the inlined spec semantically weaker than the
+        // original (residual recursive calls remain uninterpreted). Force the
+        // hasNonInlinableFuncs path so expect emission uses the original spec
+        // and uniqueness alt enumeration is disabled (it can return spurious
+        // alternatives when reasoning over the partial inlined spec).
+        if (!hasNonInlinableFuncs && predsToInline != null && predsToInline.Count > 0)
+        {
+            var origLits = DnfEngine.ToStringDnf(originalDnfExprs);
+            var inlLits = DnfEngine.ToStringDnf(dnfExprs);
+            for (int ci = 0; ci < origLits.Count && ci < inlLits.Count; ci++)
+            {
+                if (origLits[ci].Count != inlLits[ci].Count)
+                {
+                    hasNonInlinableFuncs = true;
+                    break;
+                }
+            }
         }
 
         var preClauses = method.Req.Select(r => r.E).ToList();
@@ -1949,8 +1978,16 @@ class Program
                     // no tier extra constraints) — otherwise tier literals that pin the output
                     // (e.g. index == 0 from an output-boundary tier) would make uniqueness trivially
                     // hold, producing false-positive "unique" verdicts and wrong concrete expects.
+                    //
+                    // Skip uniqueness entirely when hasNonInlinableFuncs is true (e.g. recursive
+                    // function unrolled at depth ≥ 2 leaves residual calls handled via uninterpreted
+                    // stubs). The uniqueness query uses the partially-inlined spec, where Z3 can
+                    // make residual calls take any value, producing spurious "alternatives" and
+                    // false-positive uniqueness verdicts (e.g. f=[419] for ProdF(f)==2).
                     var specSmt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, dnfEnsures, method, false, null, null, preLits, mutableNames, skipBias: true);
-                    var uQuery = SmtTranslator.BuildUniquenessQuery(specSmt, inputs, outputs, values, mutableNames);
+                    var uQuery = !hasNonInlinableFuncs
+                        ? SmtTranslator.BuildUniquenessQuery(specSmt, inputs, outputs, values, mutableNames)
+                        : null;
                     if (!string.IsNullOrEmpty(uQuery) && !TimedOut())
                     {
                         var uResult = await Z3Runner.RunZ3(z3Path, uQuery);
@@ -2554,8 +2591,10 @@ class Program
                                 var specSmt = SmtTranslator.BuildSmt2Query(
                                     inputs, outputs, preClauses, dnfEnsures, method, false,
                                     null, null, fullPreLits, mutableNames, skipBias: true);
-                                var uQuery = SmtTranslator.BuildUniquenessQuery(
-                                    specSmt, inputs, outputs, values, mutableNames);
+                                var uQuery = !hasNonInlinableFuncs
+                                    ? SmtTranslator.BuildUniquenessQuery(
+                                        specSmt, inputs, outputs, values, mutableNames)
+                                    : null;
                                 bool isUnique = false;
                                 if (!string.IsNullOrEmpty(uQuery) && !TimedOut())
                                 {
@@ -2834,8 +2873,10 @@ class Program
                             var specSmtV = SmtTranslator.BuildSmt2Query(
                                 inputs, outputs, preClauses, dnfEnsures, method, false,
                                 null, null, fullPreLits, mutableNames, skipBias: true);
-                            var uQueryV = SmtTranslator.BuildUniquenessQuery(
-                                specSmtV, inputs, outputs, witness, mutableNames);
+                            var uQueryV = !hasNonInlinableFuncs
+                                ? SmtTranslator.BuildUniquenessQuery(
+                                    specSmtV, inputs, outputs, witness, mutableNames)
+                                : null;
                             if (!string.IsNullOrEmpty(uQueryV) && !TimedOut())
                             {
                                 var uResV = await Z3Runner.RunZ3(z3Path, uQueryV);
@@ -3040,12 +3081,22 @@ class Program
         // Restore original (non-inlined) literals for expect emission.
         var originalDnfClauses = DnfEngine.ToStringDnf(originalDnfExprs);
         var inlinedToOriginal = new Dictionary<string, string>();
+        // Tracks clauses whose inlined-DNF expanded to more literals than the
+        // original (typically because deeper unrolling produced an
+        // if-then-else == val that DNF split). Per-literal mapping is
+        // position-based and breaks under count mismatch; for those clauses
+        // we'll force the fullPostconditionStrings fallback below.
+        var clausesWithStructuralInlining = new HashSet<int>();
         if (predsToInline != null && predsToInline.Count > 0)
         {
             var inlinedDnfClauses = DnfEngine.ToStringDnf(dnfExprs);
             for (int ci = 0; ci < originalDnfClauses.Count && ci < inlinedDnfClauses.Count; ci++)
+            {
+                if (originalDnfClauses[ci].Count != inlinedDnfClauses[ci].Count)
+                    clausesWithStructuralInlining.Add(ci);
                 for (int li = 0; li < originalDnfClauses[ci].Count && li < inlinedDnfClauses[ci].Count; li++)
                     inlinedToOriginal[inlinedDnfClauses[ci][li]] = originalDnfClauses[ci][li];
+            }
         }
 
         // Deduplicate test cases with identical input values.
@@ -3062,7 +3113,12 @@ class Program
             // Otherwise, convert per-clause literals to original (non-inlined) strings.
             bool tcUnique = tc.values.TryGetValue("__unique__", out var uqFlag) && uqFlag == "true";
             List<string> litStrings;
-            if (hasNonInlinableFuncs || !tcUnique)
+            // Force fullPostcond fallback when inlining altered the clause structure
+            // (e.g. recursive unroll at depth ≥ 2 produced an if-then-else == val
+            // that DNF expanded into extra literals). Per-literal back-mapping is
+            // position-based and would mis-label literals across the count change.
+            bool inliningChangedStructure = clausesWithStructuralInlining.Count > 0;
+            if (hasNonInlinableFuncs || !tcUnique || inliningChangedStructure)
             {
                 litStrings = fullPostconditionStrings;
             }
