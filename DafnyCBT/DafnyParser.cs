@@ -306,22 +306,30 @@ static class DafnyParser
     /// E.g., "IsDigit(s[i])" with predicate IsDigit(c) = '0' <= c <= '9'
     /// becomes "('0' <= s[i] <= '9')".
     /// Applies repeatedly to handle nested inlining (up to a depth limit).
+    /// `recursiveUnrollDepth` controls how many times a recursive function
+    /// gets re-substituted (default 1; --unroll-depth on the CLI bumps it).
+    /// At depth N, a linear recursion like ProdF(s) = s[0]*ProdF(s[1..])
+    /// fully unrolls for sequences of length ≤ N; beyond N a residual call
+    /// remains and falls back to the type-correct uninterpreted stub.
     /// </summary>
     internal static string InlinePredicates(string literal,
-        List<(string name, List<string> paramNames, string body, bool isClassMember)> predicates)
+        List<(string name, List<string> paramNames, string body, bool isClassMember)> predicates,
+        int recursiveUnrollDepth = 1)
     {
         var result = literal;
         const int maxInlinedLength = 50_000; // safety limit to prevent exponential growth
-        const int maxPasses = 2; // up to 2 levels for non-recursive funcs; recursive funcs capped at 1 level.
+        const int maxPassesNonRecursive = 2; // nested non-recursive calls
+        int maxPasses = Math.Max(maxPassesNonRecursive, recursiveUnrollDepth);
         for (int pass = 0; pass < maxPasses; pass++)
         {
             var changed = false;
             foreach (var (name, paramNames, body, _) in predicates)
             {
                 bool isRecursive = Regex.IsMatch(body, @"\b" + Regex.Escape(name) + @"\s*\(");
-                // Recursive funcs: only inline once (pass 0). Further passes would just deepen the unrolling.
-                // Non-recursive funcs: inline across passes so nested non-recursive calls expand.
-                if (pass > 0 && isRecursive) continue;
+                // Per-kind pass cap: recursive funcs unroll up to `recursiveUnrollDepth`
+                // levels, non-recursive funcs up to `maxPassesNonRecursive`.
+                int passCap = isRecursive ? recursiveUnrollDepth : maxPassesNonRecursive;
+                if (pass >= passCap) continue;
 
                 // Find occurrences of name(args...) — search forward past each replacement
                 // to avoid re-inlining calls introduced by the replacement (recursive functions).

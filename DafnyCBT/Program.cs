@@ -18,6 +18,11 @@ class Program
     public static bool VacuityCheckEnabled = false;
     public static bool VacuityIsolated = false;
     public static bool ReverseBvaOrder = false;
+    // Unroll depth for recursive functions during spec inlining. Default 1
+    // (one level of substitution; residual recursive calls fall back to a
+    // type-correct uninterpreted stub). Higher values fully unroll linear
+    // recursions like ProdF(s) = s[0]*ProdF(s[1..]) up to N seq elements.
+    public static int RecursiveUnrollDepth = 1;
     const int VacuityCegisAttempts = 3;
     const int VacuityCegisAttemptsIsolated = 10;
 
@@ -80,12 +85,14 @@ class Program
             "In --check mode, when `dafny build` fails due to uncompilable expect expressions (unbounded quantifiers, old() in non-ghost context, …), automatically comment out the offending CheckExpect lines and retry the build. The user-visible Tests.dfy gets matching `// UNCOMPILABLE (...)` markers. Default: OFF — the check phase fails hard on build errors so the user notices them.");
         var skipOnExceptionOpt = new Option<bool>("--skip-on-exception",
             "In --check mode, treat tests that crash with an unhandled exception from the method under test (non-zero exit, no FAIL marker) as SKIPPED instead of FAILED. Preconditions that passed PRE-CHECK but led to a crash (e.g. out-of-bounds access, overflow in the impl) are reported separately as `skipped (exception)`. Default: OFF — crashes count as failures.");
+        var unrollDepthOpt = new Option<int>("--unroll-depth", () => 1,
+            "Unroll depth for recursive functions in spec inlining. Default 1 (one level of body substitution; the residual recursive call falls back to a type-correct uninterpreted stub). Bump to e.g. 4 to fully unroll linear recursions like ProdF(s) = s[0]*ProdF(s[1..]) for sequences of length ≤ N. Higher values can blow up SMT size for branching recursion (Fibonacci-style); start small and raise only if needed.");
         var dropPostWfOpt = new Option<bool>("--drop-post-wf-guards", () => true,
             "Drop well-formedness guards (e.g., 0<=i<a.Length) generated while translating postconditions. Default: ON. An implication-guarded access like '0<=i<a.Length ==> a[i] == x' already bounds i inside the `==>`; re-asserting the bound as a hard top-level fact would incorrectly strengthen the spec and break uniqueness/relevance reasoning. Pass `--drop-post-wf-guards false` to restore legacy behavior.");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, vacuityIsolatedOpt, noExistsDecompOpt, reverseBvaOrderOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, vacuityIsolatedOpt, noExistsDecompOpt, reverseBvaOrderOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -132,6 +139,9 @@ class Program
             if (ReverseBvaOrder)
                 Console.WriteLine("[DafnyCBT] BVA order: Phase 2b → Phase 2 (reversed)");
             SmtTranslator.ForcedSeed = ctx.ParseResult.GetValueForOption(seedOpt);
+            RecursiveUnrollDepth = Math.Max(1, ctx.ParseResult.GetValueForOption(unrollDepthOpt));
+            if (RecursiveUnrollDepth > 1)
+                Console.WriteLine($"[DafnyCBT] Recursive-function unroll depth: {RecursiveUnrollDepth}");
             if (SmtTranslator.ForcedSeed.HasValue)
                 Console.WriteLine($"[DafnyCBT] Z3 seed forced to {SmtTranslator.ForcedSeed.Value}");
             var relevanceModeCli = ctx.ParseResult.GetValueForOption(relevanceModeOpt) ?? "ladder";
@@ -1123,7 +1133,7 @@ class Program
                 for (int i = 0; i < dnfEnsures.Count; i++)
                 {
                     var before = DnfEngine.ExprToString(dnfEnsures[i]);
-                    dnfEnsures[i] = FunctionInliner.InlineExpression(program, dnfEnsures[i], astInlinable);
+                    dnfEnsures[i] = FunctionInliner.InlineExpression(program, dnfEnsures[i], astInlinable, maxDepth: 2, recursiveMaxDepth: RecursiveUnrollDepth);
                     var after = DnfEngine.ExprToString(dnfEnsures[i]);
                     astInlined[i] = before != after;
                 }
@@ -3155,7 +3165,7 @@ class Program
     static Expression InlineExpr(Expression expr, List<(string name, List<string> paramNames, string body, bool isClassMember)> predsToInline)
     {
         var original = DnfEngine.ExprToString(expr);
-        var inlined = DafnyParser.InlinePredicates(original, predsToInline);
+        var inlined = DafnyParser.InlinePredicates(original, predsToInline, RecursiveUnrollDepth);
         if (inlined == original)
             return expr;
         return new LeafExpression(inlined);

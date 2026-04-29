@@ -16,16 +16,18 @@ internal class FunctionInliningSubstituter : Substituter
 {
     private readonly Dictionary<string, Function> _inlinable;
     private readonly int _maxDepth;
+    private readonly int _recursiveMaxDepth;
     private readonly Dictionary<string, int> _inliningDepth;
     private readonly HashSet<string> _recursive;
     private readonly Microsoft.Dafny.Program _program;
 
-    internal FunctionInliningSubstituter(Microsoft.Dafny.Program program, Dictionary<string, Function> inlinable, int maxDepth = 2)
+    internal FunctionInliningSubstituter(Microsoft.Dafny.Program program, Dictionary<string, Function> inlinable, int maxDepth = 2, int recursiveMaxDepth = 1)
         : base(null, new Dictionary<IVariable, Expression>(), new Dictionary<TypeParameter, DafnyType>(), null, program.SystemModuleManager)
     {
         _program = program;
         _inlinable = inlinable;
         _maxDepth = maxDepth;
+        _recursiveMaxDepth = recursiveMaxDepth;
         _inliningDepth = new Dictionary<string, int>();
         _recursive = FunctionInliner.ComputeRecursive(inlinable);
     }
@@ -37,17 +39,19 @@ internal class FunctionInliningSubstituter : Substituter
         Dictionary<string, Function> inlinable,
         Dictionary<string, int> inliningDepth,
         int maxDepth,
+        int recursiveMaxDepth,
         HashSet<string> recursive)
         : base(null, substMap, new Dictionary<TypeParameter, DafnyType>(), null, program.SystemModuleManager)
     {
         _program = program;
         _inlinable = inlinable;
         _maxDepth = maxDepth;
+        _recursiveMaxDepth = recursiveMaxDepth;
         _inliningDepth = inliningDepth;
         _recursive = recursive;
     }
 
-    private int EffectiveMaxDepth(string name) => _recursive.Contains(name) ? 1 : _maxDepth;
+    private int EffectiveMaxDepth(string name) => _recursive.Contains(name) ? _recursiveMaxDepth : _maxDepth;
 
     public override Expression Substitute(Expression expr)
     {
@@ -67,7 +71,7 @@ internal class FunctionInliningSubstituter : Substituter
                 for (int i = 0; i < func.Ins.Count && i < substitutedArgs.Count; i++)
                     subMap[func.Ins[i]] = substitutedArgs[i];
 
-                var innerSub = new FunctionInliningSubstituter(_program, subMap, _inlinable, _inliningDepth, _maxDepth, _recursive);
+                var innerSub = new FunctionInliningSubstituter(_program, subMap, _inlinable, _inliningDepth, _maxDepth, _recursiveMaxDepth, _recursive);
                 _inliningDepth[func.Name] = depth + 1;
                 try
                 {
@@ -103,7 +107,7 @@ internal class FunctionInliningSubstituter : Substituter
                 var lambdaSubMap = new Dictionary<IVariable, Expression>();
                 for (int i = 0; i < lambda.BoundVars.Count && i < substArgs.Count; i++)
                     lambdaSubMap[lambda.BoundVars[i]] = substArgs[i];
-                var lambdaSub = new FunctionInliningSubstituter(_program, lambdaSubMap, _inlinable, _inliningDepth, _maxDepth, _recursive);
+                var lambdaSub = new FunctionInliningSubstituter(_program, lambdaSubMap, _inlinable, _inliningDepth, _maxDepth, _recursiveMaxDepth, _recursive);
                 var reduced = lambdaSub.Substitute(lambda.Term);
                 return new ParensExpression(lambda.Term.Origin, reduced);
             }
@@ -176,12 +180,12 @@ internal static class FunctionInliner
     /// Inline inlinable function calls in an Expression tree at the AST level, preserving node types.
     /// </summary>
     internal static Expression InlineExpression(Microsoft.Dafny.Program program, Expression expr,
-        Dictionary<string, Function> inlinable, int maxDepth = 2)
+        Dictionary<string, Function> inlinable, int maxDepth = 2, int recursiveMaxDepth = 1)
     {
         if (inlinable.Count == 0) return expr;
         try
         {
-            var subst = new FunctionInliningSubstituter(program, inlinable, maxDepth);
+            var subst = new FunctionInliningSubstituter(program, inlinable, maxDepth, recursiveMaxDepth);
             return subst.Substitute(expr);
         }
         catch (System.NullReferenceException)
