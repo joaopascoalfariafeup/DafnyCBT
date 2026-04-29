@@ -339,6 +339,28 @@ class Program
         // datatypes still NOT supported (codata, generic, recursive, mutually rec).
         var datatypeNames = skippedDatatypeNames;
 
+        // Collect function/predicate signatures so SmtTranslator can emit
+        // type-correct declare-fun stubs for any function it has to leave
+        // uninterpreted (e.g. the residual recursive call left by the
+        // FunctionInliner when a recursive function is unrolled once).
+        var funcSigs = new Dictionary<string, (List<string> ArgSorts, string ReturnSort)>();
+        foreach (var topDecl in DafnyParser.AllTopLevelDecls(program))
+        {
+            if (topDecl is TopLevelDeclWithMembers tld)
+            {
+                foreach (var member in tld.Members)
+                {
+                    if (member is Function fn)
+                    {
+                        var argSorts = fn.Ins.Select(p => TypeUtils.DafnyTypeToSmt(p.Type.ToString())).ToList();
+                        var retSort = TypeUtils.DafnyTypeToSmt(fn.ResultType.ToString());
+                        funcSigs[fn.Name] = (argSorts, retSort);
+                    }
+                }
+            }
+        }
+        SmtTranslator._functionSignatures = funcSigs;
+
         // Collect user-defined class names — parameters of class/reference type can't be
         // represented as concrete SMT values and must be rejected.
         var classNames = new HashSet<string>(DafnyParser.AllTopLevelDecls(program)

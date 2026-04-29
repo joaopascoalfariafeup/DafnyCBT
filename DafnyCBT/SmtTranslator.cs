@@ -69,6 +69,12 @@ static class SmtTranslator
     internal static HashSet<string> _boundVars = new();
     // Tracks uninterpreted functions discovered during expression translation
     internal static Dictionary<string, int> _uninterpFuncs = new();
+    // Program-scoped function signatures: name → (SMT arg sorts, SMT return sort).
+    // Populated by Program.cs from the resolved Dafny AST. When emitting a
+    // declare-fun stub for an uninterpreted call, we look up here first to
+    // get the actual argument/return types instead of defaulting everything
+    // to Int (which mis-typed seq/array/bool args and made Z3 reject the query).
+    internal static Dictionary<string, (List<string> ArgSorts, string ReturnSort)> _functionSignatures = new();
     // True if any postcondition literal could not be translated to SMT
     internal static bool _hasUntranslatedPost = false;
     // Tracks precondition strings that were successfully translated to SMT
@@ -893,11 +899,25 @@ static class SmtTranslator
             }
         }
 
-        // Emit uninterpreted function declarations (discovered during translation)
+        // Emit uninterpreted function declarations (discovered during translation).
+        // Use the program-scoped signature map (populated from the Dafny AST) when
+        // available so seq/array/bool arguments get their real SMT sort. Fall back
+        // to Int-everywhere for callers we couldn't resolve (e.g. spec literals
+        // referencing a function whose decl wasn't traversed).
         foreach (var (funcName, arity) in _uninterpFuncs)
         {
-            var argTypes = string.Join(" ", Enumerable.Repeat("Int", arity));
-            sb.AppendLine($"(declare-fun {funcName} ({argTypes}) Int)");
+            string argTypes, returnType;
+            if (_functionSignatures.TryGetValue(funcName, out var sig) && sig.ArgSorts.Count == arity)
+            {
+                argTypes = string.Join(" ", sig.ArgSorts);
+                returnType = sig.ReturnSort;
+            }
+            else
+            {
+                argTypes = string.Join(" ", Enumerable.Repeat("Int", arity));
+                returnType = "Int";
+            }
+            sb.AppendLine($"(declare-fun {funcName} ({argTypes}) {returnType})");
         }
 
         // Now append all collected assertions
