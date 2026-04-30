@@ -2781,17 +2781,55 @@ class Program
                                 // others non-vacuous).
                                 bool savedBiasMagOnly = SmtTranslator.BiasMagnitudeOnly;
                                 if (VacuityIsolated) SmtTranslator.BiasMagnitudeOnly = true;
-                                string smtA;
+                                string? smtA;
                                 try
                                 {
-                                    smtA = SmtTranslator.BuildSmt2Query(
-                                        inputs, outputs, preClauses, clause, method, false,
-                                        null, extraA, fullPreLits, mutableNames, skipBias: false);
+                                    if (VacuityIsolated)
+                                    {
+                                        // Bake the isolation property into Phase A: require ins
+                                        // where each OTHER candidate Q_j (j ≠ k) is non-vacuous,
+                                        // i.e. there exists an alt-witness satisfying ⋀_{i≠j} Q_i
+                                        // and ¬Q_j. This is exactly the relevance query with
+                                        // safeIndices = candidates ∖ {k}. Without it, Phase A
+                                        // picks the simplest model (often length-1 arrays where
+                                        // every Q_j is trivially vacuous), the post-hoc shared-
+                                        // vacuous rejection runs, and CEGIS attrits without ever
+                                        // finding the structural witness (e.g. [3,3] for /Vi3).
+                                        var nonKSafe = candidates.Where(j => j != k).ToList();
+                                        if (nonKSafe.Count == 0)
+                                        {
+                                            // No other candidates to keep non-vacuous — fall back
+                                            // to plain Phase A (post-hoc isolation can't reject).
+                                            smtA = SmtTranslator.BuildSmt2Query(
+                                                inputs, outputs, preClauses, clause, method, false,
+                                                null, extraA, fullPreLits, mutableNames, skipBias: false);
+                                        }
+                                        else
+                                        {
+                                            smtA = SmtTranslator.BuildRelevanceQuery(
+                                                inputs, outputs, fullPreLits, clause, method,
+                                                mutableNames, nonKSafe, extraA);
+                                            // BuildRelevanceQuery returns null if all non-k indices
+                                            // are filtered out (e.g. uninterpreted-fn refs). Fall
+                                            // back to plain Phase A in that case.
+                                            if (string.IsNullOrEmpty(smtA))
+                                                smtA = SmtTranslator.BuildSmt2Query(
+                                                    inputs, outputs, preClauses, clause, method, false,
+                                                    null, extraA, fullPreLits, mutableNames, skipBias: false);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        smtA = SmtTranslator.BuildSmt2Query(
+                                            inputs, outputs, preClauses, clause, method, false,
+                                            null, extraA, fullPreLits, mutableNames, skipBias: false);
+                                    }
                                 }
                                 finally
                                 {
                                     SmtTranslator.BiasMagnitudeOnly = savedBiasMagOnly;
                                 }
+                                if (string.IsNullOrEmpty(smtA)) break;
                                 var resA = await Z3Runner.RunZ3(z3Path, smtA);
                                 var linesA = resA.Split('\n').Select(l => l.Trim()).ToList();
                                 if (!linesA.Any(l => l == "sat")) break;
