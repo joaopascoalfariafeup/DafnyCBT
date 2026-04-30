@@ -2608,6 +2608,16 @@ class Program
                                 coveredByRelevance.Add((pi, ci));
                                 relAdded++;
                                 if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: SAT — added test case");
+                                // Register the relevance witness's input in the baseConditionExclusions
+                                // for the matching {ci+1} clause base so Phase 3 repeats are forced to
+                                // diverge from it (rather than re-picking near-identical small models).
+                                // Without this, the rich /Rel witness is invisible to Phase 3 and the
+                                // R-tests cluster on the simplest model Z3 finds first.
+                                var relBaseKey = ScheduleKey(clause, new List<Expression>(), fullPreLits);
+                                if (!baseConditionExclusions.ContainsKey(relBaseKey))
+                                    baseConditionExclusions[relBaseKey] = new List<string>();
+                                var relExcl = BuildInputExclusion(values);
+                                if (relExcl != null) baseConditionExclusions[relBaseKey].Add(relExcl);
                             }
                         }
                         else if (lines.Any(l => l == "unknown"))
@@ -2974,6 +2984,15 @@ class Program
                     }
                 }
 
+                // Per-base label families: each base normally emits `{baseLabel}/R{n}` repeats.
+                // When a `{baseLabel}/Rel` relevance witness exists for the same clause, also
+                // emit `{baseLabel}/Rel/R{n}` repeats — they share Z3 constraints (same literals,
+                // same exclusion list) but the alternating label tells the user which "starting
+                // witness family" each repeat extends. Useful for SFL / kill-curve attribution.
+                var relevantClauseLabels = new HashSet<string>(
+                    testCases.Where(t => t.Item1.EndsWith("/Rel"))
+                             .Select(t => t.Item1.Substring(0, t.Item1.Length - 4)));
+
                 foreach (var (baseLabel, literals, preLits, exclusions, baseExtras, baseKey) in baseConditions)
                 {
                     if (testCases.Count >= minTests || TimedOut()) break;
@@ -2987,11 +3006,18 @@ class Program
                     int shortfall = Math.Max(0, minTests - testCases.Count);
                     int needed = Math.Max(effectiveRepeat - found, shortfall);
 
+                    // Round-robin between the bare base label and a /Rel-suffixed variant
+                    // when a relevance witness exists for this clause.
+                    var labelFamilies = relevantClauseLabels.Contains(baseLabel)
+                        ? new[] { baseLabel, $"{baseLabel}/Rel" }
+                        : new[] { baseLabel };
+
                     for (int rep = 0; rep < needed; rep++)
                     {
                         if (testCases.Count >= minTests || TimedOut()) break;
                         if (maxTests > 0 && testCases.Count >= maxTests) break;
-                        var repLabel = $"{baseLabel}/R{found + rep + 1}";
+                        var familyPrefix = labelFamilies[rep % labelFamilies.Length];
+                        var repLabel = $"{familyPrefix}/R{found + rep + 1}";
                         var combinedExtras = new List<string>(baseExtras);
                         combinedExtras.AddRange(inputExclusions);
                         var (repValues, _) = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, combinedExtras);
