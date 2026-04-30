@@ -620,7 +620,7 @@ static class TestValidator
                 // so the test can be rescued if Z3's value is wrong but postconditions pass.
                 // Use CheckZ3Value (prints WRONGVAL, not FAIL) so we can distinguish
                 // "Z3 value wrong" from "postcondition wrong".
-                var eqLitMatch = Regex.Match(expr, @"^(\w+)\s*==\s*(.+)$");
+                var eqLitMatch = Regex.Match(expr, @"^(\w+)\s*==(?!>)\s*(.+)$");
                 if (eqLitMatch.Success && outputNames != null &&
                     outputNames.Contains(eqLitMatch.Groups[1].Value) &&
                     IsSimpleScalarLiteral(eqLitMatch.Groups[2].Value.Trim()) &&
@@ -630,9 +630,17 @@ static class TestValidator
                     capturedOutputs.Add(outName);
                     hasConcreteOutputExpects = true;
                     string valLine;
+                    // For array<char> outputs, the helper PrintCharSeqVal (which takes
+                    // seq<char>) is preferred over raw `print` for parseable output, but
+                    // the array must be sliced to its seq view first — passing the array
+                    // directly is a type error.
+                    bool isArrayOut = arrayOutputNames != null && arrayOutputNames.Contains(outName);
                     if (stringOutputNames != null && stringOutputNames.Contains(outName))
-                        valLine = $"{indent}PrintCharSeqVal({testId}, \"{outName}\", {outName});";
-                    else if (arrayOutputNames != null && arrayOutputNames.Contains(outName))
+                    {
+                        var arg = isArrayOut ? $"{outName}[..]" : outName;
+                        valLine = $"{indent}PrintCharSeqVal({testId}, \"{outName}\", {arg});";
+                    }
+                    else if (isArrayOut)
                         valLine = $"{indent}print \"VAL:{testId}:{outName}=\", {outName}[..], \"\\n\";";
                     else
                         valLine = $"{indent}print \"VAL:{testId}:{outName}=\", {outName}, \"\\n\";";
@@ -643,7 +651,7 @@ static class TestValidator
 
                 // For mutable array post-state: name[..] == literal or name[..N] == literal
                 // These are also Z3 concrete values that may be wrong (uninterpreted functions).
-                var arrEqMatch = Regex.Match(expr, @"^(\w+)\[\.\.(\w*)\]\s*==\s*(.+)$");
+                var arrEqMatch = Regex.Match(expr, @"^(\w+)\[\.\.(\w*)\]\s*==(?!>)\s*(.+)$");
                 if (arrEqMatch.Success &&
                     IsValidDafnyLiteral(arrEqMatch.Groups[3].Value.Trim()) &&
                     postExprs != null && postExprs.Count > 0)
@@ -744,9 +752,13 @@ static class TestValidator
                         var sb2 = new System.Text.StringBuilder(m2.Value);
                         foreach (var name in uncaptured)
                         {
+                            bool isArrayOut2 = arrayOutputNames != null && arrayOutputNames.Contains(name);
                             if (stringOutputNames != null && stringOutputNames.Contains(name))
-                                sb2.AppendLine($"\n    PrintCharSeqVal({testId}, \"{name}\", {name});");
-                            else if (arrayOutputNames != null && arrayOutputNames.Contains(name))
+                            {
+                                var arg = isArrayOut2 ? $"{name}[..]" : name;
+                                sb2.AppendLine($"\n    PrintCharSeqVal({testId}, \"{name}\", {arg});");
+                            }
+                            else if (isArrayOut2)
                                 sb2.AppendLine($"\n    print \"VAL:{testId}:{name}=\", {name}[..], \"\\n\";");
                             else
                                 sb2.AppendLine($"\n    print \"VAL:{testId}:{name}=\", {name}, \"\\n\";");
@@ -860,8 +872,8 @@ static class TestValidator
         // probe like `print "RHSVAL:...=", (0 || index == 1), ...`.
         if (expr.Contains("||")) return null;
 
-        // Match: varName == <expr>
-        var m = Regex.Match(expr, @"^(\w+)\s*==\s*(.+)$");
+        // Match: varName == <expr> (top-level ==, NOT ==> implication)
+        var m = Regex.Match(expr, @"^(\w+)\s*==(?!>)\s*(.+)$");
         if (!m.Success) return null;
 
         var varName = m.Groups[1].Value;
@@ -1093,7 +1105,7 @@ static class TestValidator
                 if (!string.IsNullOrEmpty(trailing)) return m.Value;
 
                 // Simple `outName == rhs` path — substitute or annotate with RHSVAL/VAL.
-                var simpleM = Regex.Match(expr, @"^(\w+)\s*==\s*(.+)$");
+                var simpleM = Regex.Match(expr, @"^(\w+)\s*==(?!>)\s*(.+)$");
                 if (simpleM.Success)
                 {
                     var outName = simpleM.Groups[1].Value;
@@ -1222,6 +1234,24 @@ static class TestValidator
         // Passing test: convert meaningful entries into `expect …; // observed from implementation` lines.
         if (meaningful.Count == 0) return body;
 
+        // Identify INPUT-only parameters in the test body: variables passed as args to
+        // the method-under-test call but NOT bound as the call's output. For Dafny methods
+        // without a `modifies` effect on the input, the input is unchanged after the call,
+        // so the observed-from-impl line is redundant noise. For seq<char> / array<char>
+        // inputs the noise also produces invalid Dafny syntax (Dafny prints seq<char> as
+        // raw chars, e.g. `}` — yields `expect xs[..] == };` which won't parse).
+        // Heuristic: scan the test body for `var <out> := <method>(<args>);` lines and
+        // collect each <args> name as an input; skip observed emission for those names.
+        var inputOnlyNames = new HashSet<string>();
+        foreach (Match callMatch in Regex.Matches(body, @"^\s*var\s+\w+\s*:=\s*\w+(?:\s*<[^>]*>)?\s*\(([^)]*)\)\s*;", RegexOptions.Multiline))
+        {
+            foreach (Match argMatch in Regex.Matches(callMatch.Groups[1].Value, @"\b([a-zA-Z_]\w*)\b"))
+                inputOnlyNames.Add(argMatch.Groups[1].Value);
+        }
+        // Don't treat the LHS of any `var X := METHOD(...)` as input-only — it's the output.
+        foreach (Match outMatch in Regex.Matches(body, @"^\s*var\s+(\w+)\s*:=\s*\w+(?:\s*<[^>]*>)?\s*\(", RegexOptions.Multiline))
+            inputOnlyNames.Remove(outMatch.Groups[1].Value);
+
         var lines = new List<string>();
         string? ind = null;
         var firstE = Regex.Match(body, @"^(\s*)expect ", RegexOptions.Multiline);
@@ -1232,6 +1262,9 @@ static class TestValidator
         {
             var name = kv.Key;
             var val = kv.Value;
+            // Skip input-only parameters (passed as args to the method call but not its output) —
+            // their value is whatever the test set them to, so the observed-from-impl line adds no info.
+            if (inputOnlyNames.Contains(name)) continue;
             // Skip runtime artifacts that can't be expressed as Dafny literals
             // (e.g. "_module.T" from printing a class instance).
             if (val.StartsWith("_module.") || val.Contains("@_")) continue;
