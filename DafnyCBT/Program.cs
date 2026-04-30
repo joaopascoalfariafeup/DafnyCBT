@@ -3178,6 +3178,58 @@ class Program
         if (!testCases.Any())
             return ("", TimedOut());
 
+        // Vacuity annotation pass: for each test, query Phase B per safe candidate
+        // literal to determine which Q_k are forced true on this test's ins.
+        // Stored under the special key __vacuous_indices__ (0-indexed, comma-
+        // separated) so TestEmitter can tag every vacuous Q with // VACUOUSLY
+        // TRUE — not just the one named in a /Vk or /Vik label. Useful for SFL:
+        // a /R or /B test that happens to make Q_k vacuous still gets the
+        // annotation, so a passing-test exoneration of Q_k's code can be
+        // properly discounted.
+        if (!TimedOut())
+        {
+            // Pre-compute fullPreLits per preCombination index for label parsing.
+            var fullPreLitsByPreIdx = new List<List<Expression>>();
+            for (int pi = 0; pi < preCombinations.Count; pi++)
+            {
+                var (_, plPreLits, plPreExclusions) = preCombinations[pi];
+                var fullPreLits = new List<Expression>(plPreLits);
+                foreach (var excl in plPreExclusions) fullPreLits.Add(DnfEngine.Negate(excl));
+                fullPreLitsByPreIdx.Add(fullPreLits);
+            }
+
+            for (int ti = 0; ti < testCases.Count; ti++)
+            {
+                if (TimedOut()) break;
+                var (label, tcValues, tcClause) = testCases[ti];
+                var safeIdxs = GetVacuityCandidates(tcClause, inputs, outputs, mutableNames);
+                if (safeIdxs.Count == 0) continue;
+
+                // Parse preIdx (default 0 for single-pre methods) from label prefix
+                // like "P{P}/{C}". Most methods are single-pre so pi = 0.
+                int pi2 = 0;
+                var pMatch = Regex.Match(label, @"^P\{?(\d+)\}?/");
+                if (pMatch.Success && int.TryParse(pMatch.Groups[1].Value, out var pn))
+                    pi2 = pn - 1;
+                if (pi2 < 0 || pi2 >= fullPreLitsByPreIdx.Count) pi2 = 0;
+                var fullPreLits2 = pi2 < fullPreLitsByPreIdx.Count ? fullPreLitsByPreIdx[pi2] : new List<Expression>();
+
+                var vacIndices = new List<int>();
+                foreach (var k in safeIdxs)
+                {
+                    if (TimedOut()) break;
+                    var smtB = SmtTranslator.BuildVacuityPinnedQuery(
+                        inputs, outputs, fullPreLits2, tcClause, tcValues, k, method, mutableNames);
+                    if (string.IsNullOrEmpty(smtB)) continue;
+                    var resB = await Z3Runner.RunZ3(z3Path, smtB);
+                    var linesB = resB.Split('\n').Select(l => l.Trim()).ToList();
+                    if (linesB.Any(l => l == "unsat")) vacIndices.Add(k);
+                }
+                if (vacIndices.Count > 0)
+                    tcValues["__vacuous_indices__"] = string.Join(",", vacIndices.Select(i => i.ToString()));
+            }
+        }
+
         // Convert Expression-based test cases to string-based for TestEmitter.
         // Restore original (non-inlined) literals for expect emission.
         var originalDnfClauses = DnfEngine.ToStringDnf(originalDnfExprs);

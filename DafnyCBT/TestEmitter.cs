@@ -928,9 +928,9 @@ static class TestEmitter
             foreach (var pre in preClauses)
                 sb.AppendLine($"  //   PRE:  {ApplyTypeParamMap(DnfEngine.ExprToString(pre), typeParamMap)}");
             // Vacuity label "{C}/V{k}" or "{C}/Vi{k}" (isolation mode) → mark
-            // literal k (1-based) as vacuous. Isolated /Vi additionally guarantees
-            // no other candidate is vacuous on this ins, which makes the test
-            // strictly more useful for fault localization.
+            // literal k (1-based) as the test's nominal vacuous target. Isolated
+            // /Vi additionally guarantees no other candidate is vacuous on this
+            // ins, which makes the test strictly more useful for fault localization.
             int vacuousIndex = -1;
             bool isolated = false;
             var vMatch = System.Text.RegularExpressions.Regex.Match(label, @"/V(i?)(\d+)(?:/|$)");
@@ -938,6 +938,19 @@ static class TestEmitter
             {
                 vacuousIndex = vNum - 1;
                 isolated = vMatch.Groups[1].Value == "i";
+            }
+            // Annotation pass result: __vacuous_indices__ holds the full set of
+            // 0-indexed Q literals that are vacuously true for this test's ins
+            // (computed via Phase B queries on every safe candidate, regardless
+            // of whether the test is /V/Vi or just /R/B/etc.). Used to tag
+            // every vacuous Q with VACUOUSLY TRUE — broader than the single
+            // label-derived index above.
+            var vacuousSet = new HashSet<int>();
+            if (vacuousIndex >= 0) vacuousSet.Add(vacuousIndex);
+            if (values.TryGetValue("__vacuous_indices__", out var vacIdxStr) && !string.IsNullOrEmpty(vacIdxStr))
+            {
+                foreach (var part in vacIdxStr.Split(','))
+                    if (int.TryParse(part.Trim(), out var v)) vacuousSet.Add(v);
             }
             if (vacuousIndex >= 0)
             {
@@ -950,7 +963,7 @@ static class TestEmitter
             {
                 if (!TypeUtils.IsSpecOnlyLiteral(lit))
                 {
-                    var tag = litIdx == vacuousIndex ? "  // VACUOUSLY TRUE" : "";
+                    var tag = vacuousSet.Contains(litIdx) ? "  // VACUOUSLY TRUE" : "";
                     var canonical = DnfEngine.CanonicalLiteralKey(lit);
                     sb.AppendLine($"  //   POST Q{litIdx + 1}: {ApplyTypeParamMap(canonical, typeParamMap)}{tag}");
                 }
