@@ -75,6 +75,11 @@ static class SmtTranslator
     // get the actual argument/return types instead of defaulting everything
     // to Int (which mis-typed seq/array/bool args and made Z3 reject the query).
     internal static Dictionary<string, (List<string> ArgSorts, string ReturnSort)> _functionSignatures = new();
+    // Names of `ghost predicate`/`ghost function` declarations. Preconditions that
+    // mention any of these cannot be runtime-PRE-CHECKed: `if !(ghost-expr) { return; }`
+    // is rejected by Dafny ("return statement is not allowed in this context, because
+    // it is guarded by a specification-only expression").
+    internal static HashSet<string> _ghostFunctions = new();
     // True if any postcondition literal could not be translated to SMT
     internal static bool _hasUntranslatedPost = false;
     // Tracks precondition strings that were successfully translated to SMT

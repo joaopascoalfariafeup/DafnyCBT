@@ -408,6 +408,11 @@ class Program
         // uninterpreted (e.g. the residual recursive call left by the
         // FunctionInliner when a recursive function is unrolled once).
         var funcSigs = new Dictionary<string, (List<string> ArgSorts, string ReturnSort)>();
+        // Ghost functions/predicates: cannot be referenced from non-ghost code,
+        // so any precondition that mentions one cannot be PRE-CHECKed at runtime
+        // (the resulting `if !(ghost) { return; }` is rejected by Dafny with
+        // "return statement is not allowed in this context").
+        var ghostFunctions = new HashSet<string>();
         foreach (var topDecl in DafnyParser.AllTopLevelDecls(program))
         {
             if (topDecl is TopLevelDeclWithMembers tld)
@@ -419,11 +424,13 @@ class Program
                         var argSorts = fn.Ins.Select(p => TypeUtils.DafnyTypeToSmt(p.Type.ToString())).ToList();
                         var retSort = TypeUtils.DafnyTypeToSmt(fn.ResultType.ToString());
                         funcSigs[fn.Name] = (argSorts, retSort);
+                        if (fn.IsGhost) ghostFunctions.Add(fn.Name);
                     }
                 }
             }
         }
         SmtTranslator._functionSignatures = funcSigs;
+        SmtTranslator._ghostFunctions = ghostFunctions;
 
         // Collect user-defined class names — parameters of class/reference type can't be
         // represented as concrete SMT values and must be rejected.

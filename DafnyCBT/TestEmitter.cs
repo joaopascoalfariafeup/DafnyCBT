@@ -1489,7 +1489,25 @@ static class TestEmitter
                         }
                     }
                 }
-                sb.AppendLine($"    expect {preStr}; // PRE-CHECK");
+                // Skip PRE-CHECK if the expression cannot be evaluated at runtime:
+                //   1. References a `ghost predicate` / `ghost function` — Dafny rejects
+                //      `if !(ghost-expr) { return; }` (the rewritten form) with
+                //      "return statement is not allowed in this context, because it is
+                //      guarded by a specification-only expression".
+                //   2. Uses an unbounded `exists`/`forall` over `int` (or otherwise
+                //      lacks an obvious finite bound) — also a specification-only expression.
+                bool refsGhostFn = SmtTranslator._ghostFunctions
+                    .Any(g => Regex.IsMatch(preStr, @"(?<![a-zA-Z_0-9.])" + Regex.Escape(g) + @"(?=\s*\()"));
+                bool hasQuantifier = Regex.IsMatch(preStr, @"\b(exists|forall)\b");
+                if (refsGhostFn || hasQuantifier)
+                {
+                    var reason = refsGhostFn ? "uses ghost predicate" : "uses unbounded quantifier";
+                    sb.AppendLine($"    // PRE-CHECK skipped ({reason}, not runtime-evaluable): {preStr}");
+                }
+                else
+                {
+                    sb.AppendLine($"    expect {preStr}; // PRE-CHECK");
+                }
             }
 
             // Call the method
