@@ -2984,15 +2984,6 @@ class Program
                     }
                 }
 
-                // Per-base label families: each base normally emits `{baseLabel}/R{n}` repeats.
-                // When a `{baseLabel}/Rel` relevance witness exists for the same clause, also
-                // emit `{baseLabel}/Rel/R{n}` repeats — they share Z3 constraints (same literals,
-                // same exclusion list) but the alternating label tells the user which "starting
-                // witness family" each repeat extends. Useful for SFL / kill-curve attribution.
-                var relevantClauseLabels = new HashSet<string>(
-                    testCases.Where(t => t.Item1.EndsWith("/Rel"))
-                             .Select(t => t.Item1.Substring(0, t.Item1.Length - 4)));
-
                 foreach (var (baseLabel, literals, preLits, exclusions, baseExtras, baseKey) in baseConditions)
                 {
                     if (testCases.Count >= minTests || TimedOut()) break;
@@ -3006,18 +2997,11 @@ class Program
                     int shortfall = Math.Max(0, minTests - testCases.Count);
                     int needed = Math.Max(effectiveRepeat - found, shortfall);
 
-                    // Round-robin between the bare base label and a /Rel-suffixed variant
-                    // when a relevance witness exists for this clause.
-                    var labelFamilies = relevantClauseLabels.Contains(baseLabel)
-                        ? new[] { baseLabel, $"{baseLabel}/Rel" }
-                        : new[] { baseLabel };
-
                     for (int rep = 0; rep < needed; rep++)
                     {
                         if (testCases.Count >= minTests || TimedOut()) break;
                         if (maxTests > 0 && testCases.Count >= maxTests) break;
-                        var familyPrefix = labelFamilies[rep % labelFamilies.Length];
-                        var repLabel = $"{familyPrefix}/R{found + rep + 1}";
+                        var repLabel = $"{baseLabel}/R{found + rep + 1}";
                         var combinedExtras = new List<string>(baseExtras);
                         combinedExtras.AddRange(inputExclusions);
                         var (repValues, _) = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, combinedExtras);
