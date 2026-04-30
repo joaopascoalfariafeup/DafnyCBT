@@ -3781,7 +3781,8 @@ static class SmtTranslator
         List<Expression> postLiterals,
         Method method,
         HashSet<string>? mutableNames = null,
-        List<int>? safeIndices = null)
+        List<int>? safeIndices = null,
+        List<string>? extraConstraints = null)
     {
         mutableNames ??= new HashSet<string>();
         if (postLiterals.Count == 0) return null;
@@ -3796,11 +3797,13 @@ static class SmtTranslator
         // EmitAntiTrivialBias only biases inputs, so outs_i is never skewed.
         // Keeps ins magnitudes in range (BIAS_MAX) so uniqueness enumeration
         // can afterward enumerate alternative outs within a reasonable budget.
+        // extraConstraints (e.g. input-exclusion clauses for relevance-driven
+        // repetition) are passed through to the base query.
         var baseSmt = BuildSmt2Query(
             inputs, outputs, preLiterals, postLiterals, method,
             verbose: false,
             exclusions: null,
-            extraConstraints: null,
+            extraConstraints: extraConstraints,
             preLiterals: preLiterals,
             mutableNames: mutableNames,
             skipBias: false);
@@ -3904,7 +3907,8 @@ static class SmtTranslator
         List<Expression> postLiterals,
         Method method,
         HashSet<string>? mutableNames = null,
-        List<int>? safeIndices = null)
+        List<int>? safeIndices = null,
+        List<string>? extraConstraints = null)
     {
         mutableNames ??= new HashSet<string>();
         if (postLiterals.Count == 0) return null;
@@ -3917,7 +3921,7 @@ static class SmtTranslator
             inputs, outputs, preLiterals, postLiterals, method,
             verbose: false,
             exclusions: null,
-            extraConstraints: null,
+            extraConstraints: extraConstraints,
             preLiterals: preLiterals,
             mutableNames: mutableNames,
             skipBias: false);

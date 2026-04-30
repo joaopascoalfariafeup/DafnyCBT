@@ -2491,6 +2491,11 @@ class Program
         var testCases = new List<(string label, Dictionary<string, string> values, List<Expression> literals)>();
         var baseConditionExclusions = new Dictionary<string, List<string>>();
         var knownUnsatLiteralMasks = new Dictionary<int, List<int>>(); // per preIdx, masks whose literals are contradictory
+        // Relevance context per clause (keyed by baseConditionExclusions key) — populated when
+        // Phase 1r succeeds. Used by Phase 3 to issue /Rel-style repeats: same dual-block query
+        // (each safe Q_k forced to actively prune outputs) plus the accumulating input-exclusion
+        // clause. Each repeat is a genuine relevance witness, not a plain SAT repeat.
+        var relevanceContextByBaseKey = new Dictionary<string, (List<int> SafeIndices, List<Expression> Clause, List<Expression> FullPreLits, string Mode, string ClauseLabel)>();
 
         if (progressive)
         {
@@ -2618,6 +2623,10 @@ class Program
                                     baseConditionExclusions[relBaseKey] = new List<string>();
                                 var relExcl = BuildInputExclusion(values);
                                 if (relExcl != null) baseConditionExclusions[relBaseKey].Add(relExcl);
+                                // Persist the relevance context so Phase 3 can re-issue the same
+                                // dual-block query with input-exclusion to produce additional
+                                // genuine /Rel witnesses (not just plain SAT repeats).
+                                relevanceContextByBaseKey[relBaseKey] = (safeIndices, clause, fullPreLits, mode, clauseLabel);
                             }
                         }
                         else if (lines.Any(l => l == "unknown"))
@@ -2997,21 +3006,65 @@ class Program
                     int shortfall = Math.Max(0, minTests - testCases.Count);
                     int needed = Math.Max(effectiveRepeat - found, shortfall);
 
+                    // If a relevance witness was registered for this clause, every other
+                    // repeat is issued as a /Rel-style query (same safeIndices + mode as
+                    // Phase 1r, plus the accumulating input-exclusion). Genuine relevance
+                    // witnesses, not plain SAT repeats — addresses the /Rel/R* labelling
+                    // problem and the diversity loss when Phase 3 picks trivial models.
+                    bool hasRelContext = relevanceContextByBaseKey.TryGetValue(baseKey, out var relCtx);
+                    bool relExhausted = false;  // set when a /Rel-style query returns UNSAT/UNKNOWN
+
                     for (int rep = 0; rep < needed; rep++)
                     {
                         if (testCases.Count >= minTests || TimedOut()) break;
                         if (maxTests > 0 && testCases.Count >= maxTests) break;
-                        var repLabel = $"{baseLabel}/R{found + rep + 1}";
-                        var combinedExtras = new List<string>(baseExtras);
-                        combinedExtras.AddRange(inputExclusions);
-                        var (repValues, _) = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, combinedExtras);
+                        bool useRel = hasRelContext && !relExhausted && (rep % 2 == 1);
+                        var repLabel = useRel
+                            ? $"{relCtx.ClauseLabel}/R{found + rep + 1}"
+                            : $"{baseLabel}/R{found + rep + 1}";
+                        Dictionary<string, string>? repValues = null;
+                        if (useRel)
+                        {
+                            // /Rel-style repeat: re-issue the relevance query with
+                            // accumulating input-exclusion. Use the same mode (ladder
+                            // collapses to combined here — no fallback path; if combined
+                            // fails, mark exhausted and let plain repeats fill the rest).
+                            var smt = relCtx.Mode == "group"
+                                ? SmtTranslator.BuildGroupRelevanceQuery(
+                                    inputs, outputs, relCtx.FullPreLits, relCtx.Clause,
+                                    method, mutableNames, relCtx.SafeIndices, inputExclusions)
+                                : SmtTranslator.BuildRelevanceQuery(
+                                    inputs, outputs, relCtx.FullPreLits, relCtx.Clause,
+                                    method, mutableNames, relCtx.SafeIndices, inputExclusions);
+                            if (string.IsNullOrEmpty(smt)) { relExhausted = true; rep--; continue; }
+                            if (verbose) Console.WriteLine($"  Solving {repLabel} (relevance-style)...");
+                            var z3Result = await Z3Runner.RunZ3(z3Path, smt);
+                            var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
+                            if (lines.Any(l => l == "sat"))
+                            {
+                                repValues = TypeUtils.ParseZ3Model(z3Result, allVars);
+                                if (repValues.Count == 0) repValues = null;
+                            }
+                            else
+                            {
+                                relExhausted = true;
+                                if (verbose) Console.WriteLine($"  {repLabel}: {(lines.Any(l => l == "unsat") ? "UNSAT" : "UNKNOWN")} — falling back to plain repeats");
+                                rep--; continue;  // retry this slot as plain
+                            }
+                        }
+                        else
+                        {
+                            var combinedExtras = new List<string>(baseExtras);
+                            combinedExtras.AddRange(inputExclusions);
+                            (repValues, _) = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, combinedExtras);
+                        }
                         if (repValues != null)
                         {
                             testCases.Add((repLabel, repValues, literals));
                             var excl = BuildInputExclusion(repValues);
                             if (excl != null) inputExclusions.Add(excl);
                         }
-                        else break;
+                        else if (!useRel) break;  // plain repeats stop on UNSAT; relExhausted handled above
                     }
                 }
                 if (!verbose) Console.Write("\r                          \r");
