@@ -342,6 +342,63 @@ class Program
         SmtTranslator._adtDatatypes = adtDatatypes;
         SmtTranslator._adtConstructors = adtConstructors;
 
+        // Walk top-level const declarations (e.g. `const vowels: set<char> := {'a','e','i','o','u'}`)
+        // and capture their initialiser expression + Dafny type. The const is then emitted
+        // in each SMT query's preamble as `(define-fun <name> () <Sort> <RhsSmt>)`, so spec
+        // literals referencing the const (e.g. `xs[i] in vowels`) translate to a properly-
+        // sorted SMT identifier instead of an undeclared symbol that Z3 rejects with
+        // "unknown constant <name>" or routes through the seq fallback path.
+        var constInlines = new Dictionary<string, (string DafnyType, Expression Rhs)>();
+        foreach (var topDecl in DafnyParser.AllTopLevelDecls(program))
+        {
+            if (topDecl is TopLevelDeclWithMembers tld)
+            {
+                foreach (var member in tld.Members)
+                {
+                    if (member is ConstantField cf && !cf.IsGhost && cf.Name != "Repr")
+                    {
+                        // Access the initialiser Expression via reflection — across
+                        // Dafny versions the property is variously named "Rhs",
+                        // "Init", or exposed only as a field. Find any property/
+                        // field whose value is an Expression.
+                        Expression? rhsExpr = null;
+                        var t = cf.GetType();
+                        foreach (var prop in t.GetProperties())
+                        {
+                            try
+                            {
+                                if (typeof(Expression).IsAssignableFrom(prop.PropertyType))
+                                {
+                                    if (prop.GetValue(cf) is Expression e) { rhsExpr = e; break; }
+                                }
+                            } catch { }
+                        }
+                        if (rhsExpr == null)
+                        {
+                            foreach (var fld in t.GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance))
+                            {
+                                try
+                                {
+                                    if (typeof(Expression).IsAssignableFrom(fld.FieldType))
+                                    {
+                                        if (fld.GetValue(cf) is Expression e) { rhsExpr = e; break; }
+                                    }
+                                } catch { }
+                            }
+                        }
+                        if (rhsExpr != null)
+                        {
+                            var typeStr = (cf.Type?.ToString() ?? rhsExpr.Type?.ToString() ?? "").Trim();
+                            constInlines[cf.Name] = (typeStr, rhsExpr);
+                        }
+                    }
+                }
+            }
+        }
+        SmtTranslator._constInlines = constInlines;
+        if (constInlines.Count > 0)
+            Console.WriteLine($"[DafnyCBT] Top-level consts: {string.Join(", ", constInlines.Select(kv => $"{kv.Key}: {kv.Value.DafnyType}"))}");
+
         // datatypeNames retained for the per-method skip filter — only contains
         // datatypes still NOT supported (codata, generic, recursive, mutually rec).
         var datatypeNames = skippedDatatypeNames;

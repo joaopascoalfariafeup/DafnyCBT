@@ -89,6 +89,18 @@ static class SmtTranslator
     internal static Dictionary<string, List<(string CtorName, List<(string Name, string Type)> Formals)>> _adtDatatypes = new();
     internal static Dictionary<string, (string dtName, int ordinal)> _adtConstructors = new();
 
+    // Top-level const declarations with literal initialisers, stored as
+    // name → (Dafny type string, Rhs Expression). The Rhs is used by the AST
+    // path (ExprToSmt resolves an IdentifierExpr/NameSegment referring to a
+    // registered const by translating its Rhs in place). The Type is used by
+    // the string-based path and the preamble emitter to know the SMT sort.
+    // Without either piece, membership/access against a const collection
+    // (e.g. `x in vowels` where `vowels: set<char>` is a top-level const)
+    // emits SMT that either references the undeclared `vowels` symbol or
+    // routes the membership check through the seq-fallback path, which Z3
+    // either rejects or solves with arbitrary witnesses.
+    internal static Dictionary<string, (string DafnyType, Expression Rhs)> _constInlines = new();
+
     // Anti-trivial bias: bias Z3 away from special values (0, 1) when the spec
     // otherwise allows many solutions. Soft-asserts are ignored when hard constraints
     // force a specific value, so correctness is preserved. Toggled by --no-bias CLI.
@@ -153,9 +165,12 @@ static class SmtTranslator
         sb.AppendLine("(set-logic ALL)");
 
         // Set operation macros (sets encoded as (Array Int Bool))
-        var hasSetParam = inputs.Concat(outputs).Any(v => TypeUtils.IsSetType(v.Type));
-        var hasIntSet = inputs.Concat(outputs).Any(v => TypeUtils.IsSetType(v.Type) && !TypeUtils.IsStringElementSet(v.Type));
-        var hasStringSet = inputs.Concat(outputs).Any(v => TypeUtils.IsStringElementSet(v.Type));
+        var hasSetParam = inputs.Concat(outputs).Any(v => TypeUtils.IsSetType(v.Type))
+            || _constInlines.Values.Any(c => TypeUtils.IsSetType(c.DafnyType));
+        var hasIntSet = inputs.Concat(outputs).Any(v => TypeUtils.IsSetType(v.Type) && !TypeUtils.IsStringElementSet(v.Type))
+            || _constInlines.Values.Any(c => TypeUtils.IsSetType(c.DafnyType) && !TypeUtils.IsStringElementSet(c.DafnyType));
+        var hasStringSet = inputs.Concat(outputs).Any(v => TypeUtils.IsStringElementSet(v.Type))
+            || _constInlines.Values.Any(c => TypeUtils.IsStringElementSet(c.DafnyType));
         // Also enable the preamble when the spec contains set/multiset/map LITERALS
         // even if no input/output has a collection type. Without this, EmptySet etc.
         // would be undefined and Z3 would treat them as uninterpreted, letting it
@@ -170,10 +185,29 @@ static class SmtTranslator
         var allSpecExprs = (preClauses ?? Enumerable.Empty<Expression>())
             .Concat(postLiterals ?? Enumerable.Empty<Expression>())
             .Concat(preLiterals ?? Enumerable.Empty<Expression>());
-        var hasSetLiteral = walkAllExprs(allSpecExprs, e => e is SetDisplayExpr);
+        // Detect collection literals in spec, including those reached via top-level
+        // const references (e.g. `x in vowels` where `vowels` is a const set literal).
+        bool refersToConstOfKind<T>() where T : Expression
+        {
+            foreach (var (_, info) in _constInlines)
+                if (UnwrapExpr(info.Rhs) is T) return true;
+            return false;
+        }
+        bool anyRefersConst(Func<Expression, bool> isMatchingConstRef) =>
+            walkAllExprs(allSpecExprs, isMatchingConstRef);
+        var hasSetLiteral = walkAllExprs(allSpecExprs, e => e is SetDisplayExpr)
+            || (refersToConstOfKind<SetDisplayExpr>() && anyRefersConst(e =>
+                (e is IdentifierExpr ide && _constInlines.TryGetValue(ide.Name, out var sIde) && UnwrapExpr(sIde.Rhs) is SetDisplayExpr) ||
+                (e is NameSegment ns && _constInlines.TryGetValue(ns.Name, out var sNs) && UnwrapExpr(sNs.Rhs) is SetDisplayExpr)));
         if (hasSetLiteral) hasIntSet = true; // string-element sets handled below
-        var hasMultisetLiteral = walkAllExprs(allSpecExprs, e => e is MultiSetDisplayExpr);
-        var hasMapLiteral = walkAllExprs(allSpecExprs, e => e is MapDisplayExpr);
+        var hasMultisetLiteral = walkAllExprs(allSpecExprs, e => e is MultiSetDisplayExpr)
+            || (refersToConstOfKind<MultiSetDisplayExpr>() && anyRefersConst(e =>
+                (e is IdentifierExpr ide && _constInlines.TryGetValue(ide.Name, out var sIde) && UnwrapExpr(sIde.Rhs) is MultiSetDisplayExpr) ||
+                (e is NameSegment ns && _constInlines.TryGetValue(ns.Name, out var sNs) && UnwrapExpr(sNs.Rhs) is MultiSetDisplayExpr)));
+        var hasMapLiteral = walkAllExprs(allSpecExprs, e => e is MapDisplayExpr)
+            || (refersToConstOfKind<MapDisplayExpr>() && anyRefersConst(e =>
+                (e is IdentifierExpr ide && _constInlines.TryGetValue(ide.Name, out var sIde) && UnwrapExpr(sIde.Rhs) is MapDisplayExpr) ||
+                (e is NameSegment ns && _constInlines.TryGetValue(ns.Name, out var sNs) && UnwrapExpr(sNs.Rhs) is MapDisplayExpr)));
         if (hasIntSet)
         {
             sb.AppendLine();
@@ -216,6 +250,7 @@ static class SmtTranslator
 
         // Multiset operation macros (multisets encoded as (Array Int Int) â€” counts)
         var hasMultisetParam = inputs.Concat(outputs).Any(v => TypeUtils.IsMultisetType(v.Type))
+            || _constInlines.Values.Any(c => TypeUtils.IsMultisetType(c.DafnyType))
             || hasMultisetLiteral; // also enable when a `multiset{...}` literal appears in the spec
         if (hasMultisetParam)
         {
@@ -282,6 +317,7 @@ static class SmtTranslator
 
         // Map operation macros (maps encoded as domain (Array Int Bool) + values (Array Int V))
         var hasMapParam = inputs.Concat(outputs).Any(v => TypeUtils.IsMapType(v.Type))
+            || _constInlines.Values.Any(c => TypeUtils.IsMapType(c.DafnyType))
             || hasMapLiteral; // also enable when a `map[...]` literal appears in the spec
         if (hasMapParam)
         {
@@ -339,6 +375,28 @@ static class SmtTranslator
                 sb.AppendLine($"(declare-datatypes ({sortDecls}) ({string.Join(" ", ctorBlocks)}))");
                 sb.AppendLine();
             }
+        }
+
+        // Top-level const declarations (e.g. `const vowels: set<char> := {'a','e','i','o','u'}`).
+        // Emitted as `(define-fun <name> () <Sort> <RhsSmt>)` so spec literals
+        // referring to the const (e.g. `xs[i] in vowels`) translate to a properly-
+        // sorted SMT identifier instead of an undeclared symbol. Comes after the
+        // EmptySet/EmptyMultiset/EmptyMap macros (the const Rhs may reference them)
+        // and before input/output variable declarations.
+        if (_constInlines.Count > 0)
+        {
+            // Stable order: emit consts whose Rhs has no forward dependency first.
+            // For now we only support self-contained literal RHSs (set/multiset/map
+            // displays of primitive elements), so insertion order is fine.
+            foreach (var (cname, info) in _constInlines)
+            {
+                var smtSort = TypeUtils.DafnyTypeToSmt(info.DafnyType);
+                if (string.IsNullOrEmpty(smtSort)) continue;
+                var rhsSmt = ExprToSmt(info.Rhs, inputs, mutableNames, isPostContext: false, insideOld: false);
+                if (rhsSmt == null) continue;
+                sb.AppendLine($"(define-fun {cname} () {smtSort} {rhsSmt})");
+            }
+            sb.AppendLine();
         }
 
         // Declare variables for inputs and outputs.
@@ -1378,9 +1436,14 @@ static class SmtTranslator
                 // uninterpreted, letting Z3 fabricate spurious witnesses.
                 var rhsName = GetOriginalName(UnwrapExpr(bin.E1));
                 var rhsTypeStr = (bin.E1?.Type?.ToString() ?? "").Trim();
+                // Resolve top-level const reference to its Rhs Expression for kind-detection.
+                Expression? rhsConstExpr = null;
+                if (rhsName != null && _constInlines.TryGetValue(rhsName, out var crhs))
+                    rhsConstExpr = UnwrapExpr(crhs.Rhs);
                 bool rhsIsSet = TypeUtils.IsSetType(rhsTypeStr)
                     || (rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsSetType(v.Type)))
-                    || UnwrapExpr(bin.E1) is SetDisplayExpr;
+                    || UnwrapExpr(bin.E1) is SetDisplayExpr
+                    || rhsConstExpr is SetDisplayExpr;
                 if (rhsIsSet)
                 {
                     var setSmt = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
@@ -1391,7 +1454,8 @@ static class SmtTranslator
 
                 bool rhsIsMultiset = TypeUtils.IsMultisetType(rhsTypeStr)
                     || (rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsMultisetType(v.Type)))
-                    || UnwrapExpr(bin.E1) is MultiSetDisplayExpr;
+                    || UnwrapExpr(bin.E1) is MultiSetDisplayExpr
+                    || rhsConstExpr is MultiSetDisplayExpr;
                 if (rhsIsMultiset)
                 {
                     var msetSmt = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
@@ -1402,7 +1466,8 @@ static class SmtTranslator
 
                 bool rhsIsMap = TypeUtils.IsMapType(rhsTypeStr)
                     || (rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsMapType(v.Type)))
-                    || UnwrapExpr(bin.E1) is MapDisplayExpr;
+                    || UnwrapExpr(bin.E1) is MapDisplayExpr
+                    || rhsConstExpr is MapDisplayExpr;
                 if (rhsIsMap)
                 {
                     var mapSmt = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
@@ -1587,6 +1652,10 @@ static class SmtTranslator
             if (idExpr.Name == "Repr") return null;
             if (_enumConstructors.TryGetValue(idExpr.Name, out var enumInfo))
                 return enumInfo.ordinal.ToString();
+            // Top-level const: declared as `(define-fun <name> () <Sort> <Rhs>)`
+            // in the SMT preamble (see emitConstDecls), so the SMT name == const name.
+            if (_constInlines.ContainsKey(idExpr.Name))
+                return idExpr.Name;
             return RenameMutable(idExpr.Name, mutableNames, isPostContext, insideOld);
         }
         if (expr is NameSegment nameExpr)
@@ -1594,6 +1663,8 @@ static class SmtTranslator
             if (nameExpr.Name == "Repr") return null;
             if (_enumConstructors.TryGetValue(nameExpr.Name, out var enumInfo))
                 return enumInfo.ordinal.ToString();
+            if (_constInlines.ContainsKey(nameExpr.Name))
+                return nameExpr.Name;
             return RenameMutable(nameExpr.Name, mutableNames, isPostContext, insideOld);
         }
 
@@ -2978,13 +3049,15 @@ static class SmtTranslator
             var sliceLowerBound = notInMatch.Groups[6].Success ? notInMatch.Groups[6].Value : null;
             if (valExpr != null)
             {
-                // Check if RHS is a set
-                var isSet = inputs.Any(v => v.Name == seqName && TypeUtils.IsSetType(v.Type));
+                // Check if RHS is a set (input variable OR top-level const)
+                var isSet = inputs.Any(v => v.Name == seqName && TypeUtils.IsSetType(v.Type))
+                    || (_constInlines.TryGetValue(seqName, out var cInfoNi) && TypeUtils.IsSetType(cInfoNi.DafnyType));
                 if (isSet && !hasSlice)
                     return $"(not (select {seqName} {valExpr}))";
 
                 // Check if RHS is a multiset
-                var isMultisetNi = inputs.Any(v => v.Name == seqName && TypeUtils.IsMultisetType(v.Type));
+                var isMultisetNi = inputs.Any(v => v.Name == seqName && TypeUtils.IsMultisetType(v.Type))
+                    || (_constInlines.TryGetValue(seqName, out var cMsetNi) && TypeUtils.IsMultisetType(cMsetNi.DafnyType));
                 if (isMultisetNi && !hasSlice)
                     return $"(not (> (select {seqName} {valExpr}) 0))";
 
@@ -3020,18 +3093,21 @@ static class SmtTranslator
             var sliceLowerBound = inMatch.Groups[6].Success ? inMatch.Groups[6].Value : null;
             if (valExpr != null)
             {
-                // Check if RHS is a set
-                var isSet = inputs.Any(v => v.Name == seqName && TypeUtils.IsSetType(v.Type));
+                // Check if RHS is a set (input variable OR top-level const)
+                var isSet = inputs.Any(v => v.Name == seqName && TypeUtils.IsSetType(v.Type))
+                    || (_constInlines.TryGetValue(seqName, out var cInfoIn) && TypeUtils.IsSetType(cInfoIn.DafnyType));
                 if (isSet && !hasSlice)
                     return $"(select {seqName} {valExpr})";
 
                 // Check if RHS is a multiset
-                var isMultisetIn = inputs.Any(v => v.Name == seqName && TypeUtils.IsMultisetType(v.Type));
+                var isMultisetIn = inputs.Any(v => v.Name == seqName && TypeUtils.IsMultisetType(v.Type))
+                    || (_constInlines.TryGetValue(seqName, out var cMsetIn) && TypeUtils.IsMultisetType(cMsetIn.DafnyType));
                 if (isMultisetIn && !hasSlice)
                     return $"(> (select {seqName} {valExpr}) 0)";
 
                 // Check if RHS is a map (k in m tests domain membership)
-                var isMapIn = inputs.Any(v => v.Name == seqName && TypeUtils.IsMapType(v.Type));
+                var isMapIn = inputs.Any(v => v.Name == seqName && TypeUtils.IsMapType(v.Type))
+                    || (_constInlines.TryGetValue(seqName, out var cMapIn) && TypeUtils.IsMapType(cMapIn.DafnyType));
                 if (isMapIn && !hasSlice)
                     return $"(select {seqName}_domain {valExpr})";
 
