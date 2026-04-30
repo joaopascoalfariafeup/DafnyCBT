@@ -16,15 +16,17 @@ class Program
     // is richer when available).
     static string RelevanceMode = "ladder";
     public static bool VacuityCheckEnabled = false;
-    public static bool VacuityIsolated = false;
     public static bool ReverseBvaOrder = false;
     // Unroll depth for recursive functions during spec inlining. Default 1
     // (one level of substitution; residual recursive calls fall back to a
     // type-correct uninterpreted stub). Higher values fully unroll linear
     // recursions like ProdF(s) = s[0]*ProdF(s[1..]) up to N seq elements.
     public static int RecursiveUnrollDepth = 1;
+    // Per-candidate CEGIS attempt cap. Used for both isolated and plain modes.
+    // With Phase A's relevance-style query baking in the isolation precondition,
+    // 3 attempts is more than enough — the historical 10-attempt cap from the
+    // post-hoc shared-vacuous loop is no longer needed.
     const int VacuityCegisAttempts = 3;
-    const int VacuityCegisAttemptsIsolated = 10;
 
     static async Task<int> Main(string[] args)
     {
@@ -66,7 +68,7 @@ class Program
         noBiasOpt.AddAlias("-nb");
         var noRelevanceOpt = new Option<bool>("--no-relevance", "Disable per-literal relevance check (Phase 1r). Default: relevance ON.");
         noRelevanceOpt.AddAlias("-nr");
-        var vacuityOpt = new Option<bool>("--vacuity", "Enable per-literal vacuity check (Phase 1v). Default: OFF.");
+        var vacuityOpt = new Option<bool>("--vacuity", "Enable per-literal vacuity check (Phase 1v). For each safe candidate Q_k, try isolated mode first (find ins where Q_k is vacuous AND every other Q_j is non-vacuous → /Vik label) and fall back to non-isolated (Q_k vacuous but other Q_j may also be → /Vk label) when isolated is infeasible. Note: independently of this flag, every emitted test gets per-Q vacuity annotations (// VACUOUSLY TRUE) via a post-phase scan. Default: OFF.");
         vacuityOpt.AddAlias("-v1v");
         var noExistsDecompOpt = new Option<bool>("--no-exists-decomposition",
             "Disable decomposition of single-variable existential quantifiers (and negated foralls) into left-boundary / middle-range / right-boundary cases. The quantifier is kept as a single literal in the DNF clause. Default: decomposition ON.");
@@ -74,9 +76,6 @@ class Program
         var reverseBvaOrderOpt = new Option<bool>("--reverse-bva-order",
             "Run Phase 2b (categorical type/size coverage) before Phase 2 (refined-range BVA) instead of after. Default order is 2 → 2b. When reversed, Phase 2's per-clause dedup against Phase 2b keys is dropped; subsumption at solve-time still skips redundant entries. Useful for kill-curve ablation experiments.");
         reverseBvaOrderOpt.AddAlias("-rbva");
-        var vacuityIsolatedOpt = new Option<bool>("--vacuity-isolated",
-            "Enable isolation-mode vacuity (Phase 1v): emit /Vk only when ins makes Q_k vacuous AND no OTHER candidate Q_j is also vacuous on that ins. Implies --vacuity. Produces strictly more informative localization tests at the cost of extra Z3 calls per CEGIS attempt. Default: OFF.");
-        vacuityIsolatedOpt.AddAlias("-v1vi");
         var seedOpt = new Option<int?>("--seed",
             "Force a fixed Z3 random seed for every SMT query, overriding the per-method name hash and bypassing the --no-bias / skipBias gating. Useful for reproducibility experiments and seed-sensitivity studies. When omitted, the usual per-method deterministic seed is used (but only when bias is on).");
         var relevanceModeOpt = new Option<string>("--relevance-mode", () => "ladder",
@@ -92,7 +91,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, vacuityIsolatedOpt, noExistsDecompOpt, reverseBvaOrderOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, vacuityOpt, noExistsDecompOpt, reverseBvaOrderOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -128,10 +127,8 @@ class Program
             if (!relevanceEnabled)
                 Console.WriteLine("[DafnyCBT] Relevance check (Phase 1r): OFF");
             VacuityCheckEnabled = ctx.ParseResult.GetValueForOption(vacuityOpt);
-            VacuityIsolated = ctx.ParseResult.GetValueForOption(vacuityIsolatedOpt);
-            if (VacuityIsolated) VacuityCheckEnabled = true; // isolation implies vacuity
             if (VacuityCheckEnabled)
-                Console.WriteLine($"[DafnyCBT] Vacuity check (Phase 1v): ON{(VacuityIsolated ? " (isolated)" : "")}");
+                Console.WriteLine($"[DafnyCBT] Vacuity check (Phase 1v): ON (isolated with non-isolated fallback)");
             DnfEngine.DecomposeQuantifiers = !ctx.ParseResult.GetValueForOption(noExistsDecompOpt);
             if (!DnfEngine.DecomposeQuantifiers)
                 Console.WriteLine("[DafnyCBT] Existential quantifier decomposition: OFF");
@@ -2708,7 +2705,10 @@ class Program
                             if (maxTests > 0 && testCases.Count >= maxTests) break;
                             if (testCases.Count >= minTests) break;
 
-                            var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}/V{(VacuityIsolated ? "i" : "")}{k + 1}";
+                            // Tentative clauseLabel for verbose logging during CEGIS;
+                            // will be re-assigned with the correct V vs Vi suffix once
+                            // we know which mode produced the witness.
+                            var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}/Vi{k + 1}";
 
                             // Pre-CEGIS subsumption: if any prior test from THIS SAME clause
                             // has an ins that makes Q_k vacuous, skip entirely. Restrict to
@@ -2732,173 +2732,131 @@ class Program
                                 var probeRes = await Z3Runner.RunZ3(z3Path, probeSmt);
                                 var probeLines = probeRes.Split('\n').Select(l => l.Trim()).ToList();
                                 if (!probeLines.Any(l => l == "unsat")) continue;
-                                // Q_k vacuous in prior. In isolation mode, additionally require
-                                // that no other candidate Q_j is vacuous in the prior's ins.
-                                if (VacuityIsolated)
+                                // Q_k vacuous in prior — but with isolated-as-default policy,
+                                // we still want a /Vi_k witness when one exists. Subsume the
+                                // candidate only if the prior's ins ALSO makes every other Q_j
+                                // non-vacuous (i.e., the prior is itself isolated-equivalent).
+                                bool anyOtherVac = false;
+                                foreach (var j in candidates)
                                 {
-                                    bool anyOtherVac = false;
-                                    foreach (var j in candidates)
-                                    {
-                                        if (j == k) continue;
-                                        var probeSmtJ = SmtTranslator.BuildVacuityPinnedQuery(
-                                            inputs, outputs, fullPreLits, clause, priorValues, j, method, mutableNames);
-                                        if (probeSmtJ == null) continue;
-                                        var probeResJ = await Z3Runner.RunZ3(z3Path, probeSmtJ);
-                                        var probeLinesJ = probeResJ.Split('\n').Select(l => l.Trim()).ToList();
-                                        if (probeLinesJ.Any(l => l == "unsat")) { anyOtherVac = true; break; }
-                                    }
-                                    if (anyOtherVac) continue; // prior is shared-vacuous → does not subsume isolated /Vk
+                                    if (j == k) continue;
+                                    var probeSmtJ = SmtTranslator.BuildVacuityPinnedQuery(
+                                        inputs, outputs, fullPreLits, clause, priorValues, j, method, mutableNames);
+                                    if (probeSmtJ == null) continue;
+                                    var probeResJ = await Z3Runner.RunZ3(z3Path, probeSmtJ);
+                                    var probeLinesJ = probeResJ.Split('\n').Select(l => l.Trim()).ToList();
+                                    if (probeLinesJ.Any(l => l == "unsat")) { anyOtherVac = true; break; }
                                 }
+                                if (anyOtherVac) continue; // prior is shared-vacuous → does not subsume isolated /Vk
                                 priorVacuous = true;
                                 if (verbose) Console.WriteLine($"  Vacuity {clauseLabel}: skipped (prior test {testCases[ti].label} already exhibits vacuity)");
                             }
                             if (priorVacuous) { vacSkipped++; continue; }
 
-                            // CEGIS loop: Phase A finds ins satisfying the clause; Phase B
-                            // checks vacuity of Q_k under that ins. On Phase B SAT, block
-                            // this ins and retry. ISOLATION mode adds a check after Phase B
-                            // UNSAT: every OTHER candidate Q_j must be non-vacuous on this
-                            // ins, otherwise the witness is "shared-vacuous" and gets blocked.
-                            var excludedIns = new List<string>();
-                            Dictionary<string, string>? witness = null;
-                            int maxAttempts = VacuityIsolated ? VacuityCegisAttemptsIsolated : VacuityCegisAttempts;
-                            for (int attempt = 0; attempt < maxAttempts; attempt++)
+                            // Two-mode CEGIS: try ISOLATED first (Phase A is the relevance-
+                            // style query that bakes in non-vacuity for every other Q_j), then
+                            // fall back to PLAIN (Phase A is the bare SAT query — Q_k vacuous
+                            // but other Q_j may also be vacuous). The K-1 post-hoc isolation
+                            // checks are skipped: when Phase A's relevance query returns SAT,
+                            // it has already produced concrete alt-witnesses proving each
+                            // non-k Q_j non-vacuous on the chosen ins. So the post-hoc check
+                            // is strictly redundant under the relevance-baked Phase A.
+                            //
+                            // --vacuity-isolated disables the plain fallback: only /Vik tests
+                            // are emitted; if isolated fails, no test for this candidate.
+                            //
+                            // Each mode runs up to VacuityCegisAttempts (3) attempts.
+                            async Task<Dictionary<string, string>?> RunModeCEGIS(bool useIsolated)
                             {
-                                if (TimedOut()) break;
-                                var extraA = new List<string>(globalExtraConstraints);
-                                extraA.AddRange(excludedIns);
-                                // Apply anti-trivial bias to Phase A: the ins picked here
-                                // becomes the emitted test's input. Without bias, vacuity
-                                // witnesses often land on arr=[0] / x=0 which cancels many
-                                // arithmetic mutations (0+0 == 0-0). Phase 1 / 2b already
-                                // bias; matching here evens the playing field.
-                                // ISOLATION mode uses MAGNITUDE-ONLY bias: keeps the weight-3
-                                // magnitude/length caps (so values stay in [-10, 10] and
-                                // arrays don't explode in length — important for performance
-                                // and test readability) but drops the weight-1/2 ≠0/≠1 pushes
-                                // that conflict with isolation (uniform arrays like [X,X] are
-                                // required to make one literal vacuous while keeping the
-                                // others non-vacuous).
-                                bool savedBiasMagOnly = SmtTranslator.BiasMagnitudeOnly;
-                                if (VacuityIsolated) SmtTranslator.BiasMagnitudeOnly = true;
-                                string? smtA;
-                                try
+                                var excluded = new List<string>();
+                                for (int attempt = 0; attempt < VacuityCegisAttempts; attempt++)
                                 {
-                                    if (VacuityIsolated)
+                                    if (TimedOut()) return null;
+                                    var extraA = new List<string>(globalExtraConstraints);
+                                    extraA.AddRange(excluded);
+                                    // Magnitude-only bias in isolated mode: weight-3 caps
+                                    // (|n| ≤ 10, |arr| ≤ 8) but no weight-1/2 ≠0/≠1 pushes —
+                                    // those conflict with uniform-element witnesses like
+                                    // [X, X] needed for some isolated-vacuity shapes.
+                                    bool savedBiasMagOnly = SmtTranslator.BiasMagnitudeOnly;
+                                    if (useIsolated) SmtTranslator.BiasMagnitudeOnly = true;
+                                    string? smtA;
+                                    try
                                     {
-                                        // Bake the isolation property into Phase A: require ins
-                                        // where each OTHER candidate Q_j (j ≠ k) is non-vacuous,
-                                        // i.e. there exists an alt-witness satisfying ⋀_{i≠j} Q_i
-                                        // and ¬Q_j. This is exactly the relevance query with
-                                        // safeIndices = candidates ∖ {k}. Without it, Phase A
-                                        // picks the simplest model (often length-1 arrays where
-                                        // every Q_j is trivially vacuous), the post-hoc shared-
-                                        // vacuous rejection runs, and CEGIS attrits without ever
-                                        // finding the structural witness (e.g. [3,3] for /Vi3).
-                                        var nonKSafe = candidates.Where(j => j != k).ToList();
-                                        if (nonKSafe.Count == 0)
+                                        if (useIsolated)
                                         {
-                                            // No other candidates to keep non-vacuous — fall back
-                                            // to plain Phase A (post-hoc isolation can't reject).
+                                            var nonKSafe = candidates.Where(j => j != k).ToList();
+                                            if (nonKSafe.Count == 0)
+                                            {
+                                                // No other candidates — isolated == plain.
+                                                smtA = SmtTranslator.BuildSmt2Query(
+                                                    inputs, outputs, preClauses, clause, method, false,
+                                                    null, extraA, fullPreLits, mutableNames, skipBias: false);
+                                            }
+                                            else
+                                            {
+                                                smtA = SmtTranslator.BuildRelevanceQuery(
+                                                    inputs, outputs, fullPreLits, clause, method,
+                                                    mutableNames, nonKSafe, extraA);
+                                                // BuildRelevanceQuery returns null when all non-k
+                                                // indices are filtered (e.g. uninterp-fn refs).
+                                                // Treat as "isolated infeasible" — return null
+                                                // so the outer caller can fall back to plain.
+                                                if (string.IsNullOrEmpty(smtA)) return null;
+                                            }
+                                        }
+                                        else
+                                        {
                                             smtA = SmtTranslator.BuildSmt2Query(
                                                 inputs, outputs, preClauses, clause, method, false,
                                                 null, extraA, fullPreLits, mutableNames, skipBias: false);
                                         }
-                                        else
-                                        {
-                                            smtA = SmtTranslator.BuildRelevanceQuery(
-                                                inputs, outputs, fullPreLits, clause, method,
-                                                mutableNames, nonKSafe, extraA);
-                                            // BuildRelevanceQuery returns null if all non-k indices
-                                            // are filtered out (e.g. uninterpreted-fn refs). Fall
-                                            // back to plain Phase A in that case.
-                                            if (string.IsNullOrEmpty(smtA))
-                                                smtA = SmtTranslator.BuildSmt2Query(
-                                                    inputs, outputs, preClauses, clause, method, false,
-                                                    null, extraA, fullPreLits, mutableNames, skipBias: false);
-                                        }
                                     }
-                                    else
+                                    finally
                                     {
-                                        smtA = SmtTranslator.BuildSmt2Query(
-                                            inputs, outputs, preClauses, clause, method, false,
-                                            null, extraA, fullPreLits, mutableNames, skipBias: false);
+                                        SmtTranslator.BiasMagnitudeOnly = savedBiasMagOnly;
                                     }
-                                }
-                                finally
-                                {
-                                    SmtTranslator.BiasMagnitudeOnly = savedBiasMagOnly;
-                                }
-                                if (string.IsNullOrEmpty(smtA)) break;
-                                var resA = await Z3Runner.RunZ3(z3Path, smtA);
-                                var linesA = resA.Split('\n').Select(l => l.Trim()).ToList();
-                                if (!linesA.Any(l => l == "sat")) break;
-                                var insValues = TypeUtils.ParseZ3Model(resA, allVars);
-                                if (insValues.Count == 0) break;
+                                    if (string.IsNullOrEmpty(smtA)) return null;
+                                    var resA = await Z3Runner.RunZ3(z3Path, smtA);
+                                    var linesA = resA.Split('\n').Select(l => l.Trim()).ToList();
+                                    if (!linesA.Any(l => l == "sat")) return null;
+                                    var insValues = TypeUtils.ParseZ3Model(resA, allVars);
+                                    if (insValues.Count == 0) return null;
 
-                                var smtB = SmtTranslator.BuildVacuityPinnedQuery(
-                                    inputs, outputs, fullPreLits, clause, insValues, k, method, mutableNames);
-                                if (smtB == null) break;
-                                var resB = await Z3Runner.RunZ3(z3Path, smtB);
-                                var linesB = resB.Split('\n').Select(l => l.Trim()).ToList();
-                                bool kVacuous = linesB.Any(l => l == "unsat");
-
-                                if (kVacuous && VacuityIsolated)
-                                {
-                                    // Isolation: confirm no OTHER candidate is also vacuous.
-                                    bool sharedVacuous = false;
-                                    foreach (var j in candidates)
-                                    {
-                                        if (j == k) continue;
-                                        if (TimedOut()) break;
-                                        var smtBj = SmtTranslator.BuildVacuityPinnedQuery(
-                                            inputs, outputs, fullPreLits, clause, insValues, j, method, mutableNames);
-                                        if (smtBj == null) continue;
-                                        var resBj = await Z3Runner.RunZ3(z3Path, smtBj);
-                                        var linesBj = resBj.Split('\n').Select(l => l.Trim()).ToList();
-                                        if (linesBj.Any(l => l == "unsat")) { sharedVacuous = true; break; }
-                                    }
-                                    if (sharedVacuous)
-                                    {
-                                        // Block this ins and retry; we want an isolated witness.
-                                        var inBlockS = SmtTranslator.BuildInputBlockingClause(inputs, insValues, mutableNames);
-                                        if (string.IsNullOrEmpty(inBlockS)) break;
-                                        var strippedS = inBlockS.StartsWith("(assert ")
-                                            ? inBlockS.Substring("(assert ".Length, inBlockS.Length - "(assert ".Length - 1)
-                                            : inBlockS;
-                                        excludedIns.Add(strippedS);
-                                        // Additionally push toward STRUCTURALLY DIFFERENT models:
-                                        // for each sequence input, require strictly longer length
-                                        // than the rejected witness. Component blocks alone are
-                                        // too permissive — Z3 picks another small model that's
-                                        // also shared-vacuous. Length-floor breaks the pattern by
-                                        // forcing exploration of longer arrays where Q_j and Q_k
-                                        // are less likely to be simultaneously implied.
-                                        foreach (var kv in insValues)
-                                        {
-                                            if (!kv.Key.EndsWith("_len")) continue;
-                                            if (!int.TryParse(kv.Value, out int rejLen)) continue;
-                                            var seqName = kv.Key.Substring(0, kv.Key.Length - "_len".Length);
-                                            excludedIns.Add($"(> (seq.len {seqName}_seq) {rejLen})");
-                                        }
-                                        if (verbose) Console.WriteLine($"  Vacuity {clauseLabel}: shared-vacuous ins rejected (attempt {attempt + 1}/{maxAttempts})");
-                                        continue;
-                                    }
-                                    witness = insValues;
-                                    break;
+                                    var smtB = SmtTranslator.BuildVacuityPinnedQuery(
+                                        inputs, outputs, fullPreLits, clause, insValues, k, method, mutableNames);
+                                    if (smtB == null) return null;
+                                    var resB = await Z3Runner.RunZ3(z3Path, smtB);
+                                    var linesB = resB.Split('\n').Select(l => l.Trim()).ToList();
+                                    if (linesB.Any(l => l == "unsat"))
+                                        return insValues;  // Q_k vacuous → witness found
+                                    if (!linesB.Any(l => l == "sat")) return null; // UNKNOWN
+                                    // Phase B SAT → Q_k pruned for this ins; exclude + retry
+                                    var inBlock = SmtTranslator.BuildInputBlockingClause(inputs, insValues, mutableNames);
+                                    if (string.IsNullOrEmpty(inBlock)) return null;
+                                    var stripped = inBlock.StartsWith("(assert ")
+                                        ? inBlock.Substring("(assert ".Length, inBlock.Length - "(assert ".Length - 1)
+                                        : inBlock;
+                                    excluded.Add(stripped);
                                 }
-
-                                if (kVacuous) { witness = insValues; break; }
-                                if (!linesB.Any(l => l == "sat")) break; // unknown → give up
-                                // Phase B SAT → Q_k pruned for this ins; exclude + retry
-                                var inBlock = SmtTranslator.BuildInputBlockingClause(inputs, insValues, mutableNames);
-                                if (string.IsNullOrEmpty(inBlock)) break;
-                                // extra constraints are raw SMT predicates; strip leading "(assert " wrapper
-                                var stripped = inBlock.StartsWith("(assert ")
-                                    ? inBlock.Substring("(assert ".Length, inBlock.Length - "(assert ".Length - 1)
-                                    : inBlock;
-                                excludedIns.Add(stripped);
+                                return null;
                             }
+
+                            Dictionary<string, string>? witness = null;
+                            bool witnessIsolated = false;
+                            // Try isolated first.
+                            witness = await RunModeCEGIS(useIsolated: true);
+                            if (witness != null) witnessIsolated = true;
+                            // Fall back to non-isolated automatically when isolated is infeasible.
+                            if (witness == null)
+                            {
+                                witness = await RunModeCEGIS(useIsolated: false);
+                                if (witness != null && verbose)
+                                    Console.WriteLine($"  Vacuity {fullPreLabel}{{{ci + 1}}}/V{k + 1}: isolated infeasible — fell back to non-isolated witness");
+                            }
+
+                            // Now that we know the mode that produced the witness, finalise the label.
+                            clauseLabel = $"{fullPreLabel}{{{ci + 1}}}/V{(witnessIsolated ? "i" : "")}{k + 1}";
 
                             if (witness == null) { vacNoScenario++; continue; }
 
