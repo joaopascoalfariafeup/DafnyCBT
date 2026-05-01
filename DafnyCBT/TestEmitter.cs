@@ -1009,8 +1009,9 @@ static class TestEmitter
                 foreach (var lit in simplified)
                 {
                     var s = DnfEngine.ExprToString(lit);
-                    var tag = preKeySet.Contains(DnfEngine.CanonicalLiteralKey(s)) ? "PRE" : "POST";
-                    sb.AppendLine($"  //     {ApplyTypeParamMap(s, typeParamMap)}  // {tag}");
+                    var canonical = DnfEngine.CanonicalLiteralKey(s);
+                    var tag = preKeySet.Contains(canonical) ? "PRE" : "POST";
+                    sb.AppendLine($"  //     {ApplyTypeParamMap(canonical, typeParamMap)}  // {tag}");
                 }
             }
             if (vacuousIndex >= 0)

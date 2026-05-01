@@ -1357,6 +1357,65 @@ static class DnfEngine
             }
         }
 
+        // Phase E: integer hole-at-boundary strengthening.
+        // Pattern: `(x < N) && (x != N-1)` collapses to `x < N-1` (since the only
+        // integer at the boundary is excluded by the !=). Dually `(x > N) && (x != N+1)`
+        // → `x > N+1`. Strengthens the bound and drops the !=.
+        // Sound for INTEGER values only — for reals, `x < 0 && x != -1` admits e.g. -0.5
+        // which `x < -1` would rule out. Gate: both N and the hole must be integers
+        // (TryParseNumeric returning a value with no fractional part) and their
+        // difference must be exactly 1.
+        for (int i = 0; i < clause.Count; i++)
+        {
+            if (drop.Contains(i) || replace.ContainsKey(i)) continue;
+            if (parsed[i].op != "<" && parsed[i].op != ">") continue;
+            if (!TryParseNumeric(parsed[i].rhs!, out var vi) || vi != Math.Floor(vi)) continue;
+            for (int j = 0; j < clause.Count; j++)
+            {
+                if (i == j || drop.Contains(j) || replace.ContainsKey(j)) continue;
+                if (parsed[j].op != "!=" || parsed[j].lhs != parsed[i].lhs) continue;
+                if (!TryParseNumeric(parsed[j].rhs!, out var vj) || vj != Math.Floor(vj)) continue;
+                bool match = (parsed[i].op == "<" && vj == vi - 1)
+                          || (parsed[i].op == ">" && vj == vi + 1);
+                if (!match) continue;
+                // Strengthen i's bound to use the hole's value; drop j.
+                replace[i] = new LeafExpression($"{parsed[i].lhs} {parsed[i].op} {parsed[j].rhs}");
+                drop.Add(j);
+                break;
+            }
+        }
+
+        // Phase F: nat-typed-RHS subsumption.
+        // Pattern: `(x >= 0) && (x op rhs)` where `rhs` is a known non-negative
+        // expression (array.Length, |seq|, |set|, etc.) and op ∈ {>=, >, ==} drops
+        // `x >= 0` — the rhs's non-negativity guarantees `x >= 0` from the other
+        // literal. Same for `(0 <= x)` (canonicalized to `x >= 0`).
+        bool IsKnownNatExpr(string s)
+        {
+            s = s.Trim();
+            // array.Length / seq.Length / set.Cardinality / etc.
+            if (Regex.IsMatch(s, @"^[a-zA-Z_]\w*\.(?:Length|Count|Cardinality)$")) return true;
+            // |x| — cardinality of seq/set/multiset/map
+            if (Regex.IsMatch(s, @"^\|[^|]+\|$")) return true;
+            return false;
+        }
+        for (int i = 0; i < clause.Count; i++)
+        {
+            if (drop.Contains(i) || replace.ContainsKey(i)) continue;
+            if (parsed[i].op != ">=" || parsed[i].rhs != "0") continue;
+            // Look for another literal `parsed[i].lhs (>= | > | ==) <natExpr>`.
+            for (int j = 0; j < clause.Count; j++)
+            {
+                if (i == j || drop.Contains(j) || replace.ContainsKey(j)) continue;
+                if (parsed[j].lhs != parsed[i].lhs) continue;
+                var oj = parsed[j].op;
+                if (oj != ">=" && oj != ">" && oj != "==") continue;
+                if (!IsKnownNatExpr(parsed[j].rhs ?? "")) continue;
+                drop.Add(i);
+                break;
+            }
+        }
+
         if (drop.Count == 0 && replace.Count == 0) return clause;
         var result = new List<Expression>(clause.Count);
         for (int i = 0; i < clause.Count; i++)
