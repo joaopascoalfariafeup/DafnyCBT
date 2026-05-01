@@ -927,22 +927,6 @@ static class TestEmitter
             // Show the test condition as a comment (skip spec-only literals like fresh())
             foreach (var pre in preClauses)
                 sb.AppendLine($"  //   PRE:  {ApplyTypeParamMap(DnfEngine.ExprToString(pre), typeParamMap)}");
-            // DNF clause literals: extract `{N}` from the label and dump the per-clause
-            // conjunction of literals from `dnfClauses`. The Q1/Q2/... lines below show
-            // the original ensures; this line shows the specific DNF subset that this
-            // test is targeting (which can be a vacuous-region literal like `!(0 <= index)`
-            // when the spec is incomplete in that region).
-            var clauseMatch = Regex.Match(label, @"^\{(\d+)\}");
-            if (clauseMatch.Success && int.TryParse(clauseMatch.Groups[1].Value, out var clauseIdx)
-                && clauseIdx >= 1 && clauseIdx <= dnfClauses.Count)
-            {
-                var clauseLits = dnfClauses[clauseIdx - 1];
-                if (clauseLits.Count > 0)
-                {
-                    var conj = string.Join(" && ", clauseLits.Select(l => ApplyTypeParamMap(l, typeParamMap)));
-                    sb.AppendLine($"  //   DNF CLAUSE {{{clauseIdx}}}:  {conj}");
-                }
-            }
             // Vacuity label "{C}/V{k}" or "{C}/Vi{k}" (isolation mode) → mark
             // literal k (1-based) as the test's nominal vacuous target. Isolated
             // /Vi additionally guarantees no other candidate is vacuous on this
@@ -958,9 +942,7 @@ static class TestEmitter
             // Annotation pass result: __vacuous_indices__ holds the full set of
             // 0-indexed Q literals that are vacuously true for this test's ins
             // (computed via Phase B queries on every safe candidate, regardless
-            // of whether the test is /V/Vi or just /R/B/etc.). Used to tag
-            // every vacuous Q with VACUOUSLY TRUE — broader than the single
-            // label-derived index above.
+            // of whether the test is /V/Vi or just /R/B/etc.).
             var vacuousSet = new HashSet<int>();
             if (vacuousIndex >= 0) vacuousSet.Add(vacuousIndex);
             if (values.TryGetValue("__vacuous_indices__", out var vacIdxStr) && !string.IsNullOrEmpty(vacIdxStr))
@@ -968,22 +950,40 @@ static class TestEmitter
                 foreach (var part in vacIdxStr.Split(','))
                     if (int.TryParse(part.Trim(), out var v)) vacuousSet.Add(v);
             }
+            // DNF clause literals — the test objective. Replaces the previous
+            // POST Q1/Q2/... block which duplicated information already visible in
+            // the test body's `expect` statements (those carry either the per-clause
+            // literals when the output is unique, or the full original ensures
+            // otherwise). The clause literals here state *what region of the spec
+            // this test is targeting*, regardless of which form the runtime expects
+            // take.
+            var clauseMatch = Regex.Match(label, @"^\{(\d+)\}");
+            if (clauseMatch.Success && int.TryParse(clauseMatch.Groups[1].Value, out var clauseIdx)
+                && clauseIdx >= 1 && clauseIdx <= dnfClauses.Count)
+            {
+                var clauseLits = dnfClauses[clauseIdx - 1];
+                if (clauseLits.Count > 0)
+                {
+                    sb.AppendLine($"  //   DNF clause {{{clauseIdx}}} (test objective):");
+                    foreach (var lit in clauseLits)
+                        sb.AppendLine($"  //     {ApplyTypeParamMap(lit, typeParamMap)}");
+                }
+            }
             if (vacuousIndex >= 0)
             {
                 sb.AppendLine(isolated
                     ? $"  //   Vacuity (isolated): Q{vacuousIndex + 1} is vacuously true for this ins; every other candidate literal is non-vacuous, so any failure of this test must be attributable to one of the OTHER POST literals."
                     : $"  //   Vacuity: Q{vacuousIndex + 1} is vacuously true for this ins (forced true by the other literals).");
             }
-            int litIdx = 0;
-            foreach (var lit in literals)
+            // Vacuously-true ensures (broader set from the annotation pass): list
+            // the original-ensures indices that are trivially satisfied by these ins.
+            // Useful for SFL — the surviving literals are the ones the test really
+            // exercises. Skipped when empty or already covered by the single-Q
+            // /V/Vi summary line above.
+            if (vacuousSet.Count > 0 && !(vacuousSet.Count == 1 && vacuousIndex >= 0))
             {
-                if (!TypeUtils.IsSpecOnlyLiteral(lit))
-                {
-                    var tag = vacuousSet.Contains(litIdx) ? "  // VACUOUSLY TRUE" : "";
-                    var canonical = DnfEngine.CanonicalLiteralKey(lit);
-                    sb.AppendLine($"  //   POST Q{litIdx + 1}: {ApplyTypeParamMap(canonical, typeParamMap)}{tag}");
-                }
-                litIdx++;
+                var qs = string.Join(", ", vacuousSet.OrderBy(i => i).Select(i => "Q" + (i + 1)));
+                sb.AppendLine($"  //   Vacuously true on these ins: {qs}");
             }
 
             sb.AppendLine("  {");
