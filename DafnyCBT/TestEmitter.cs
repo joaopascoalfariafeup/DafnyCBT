@@ -924,9 +924,34 @@ static class TestEmitter
                 }
             }
 
-            // Show the test condition as a comment (skip spec-only literals like fresh())
+            // Decompose each precondition Expression into DNF. For chained relationals
+            // (`-100 <= x <= 100`) and conjunctions, this splits into one literal per
+            // conjunct, matching the granularity used for the post-side test objective.
+            // When the pre is genuinely disjunctive (multiple DNF clauses), fall back
+            // to printing the original-form requires text — we don't currently track
+            // which pre-DNF branch this test selected, so showing the union would be
+            // wrong; one PRE: line per requires keeps the spec text accurate.
+            var preLitsToShow = new List<string>();
+            bool preFallback = false;
             foreach (var pre in preClauses)
-                sb.AppendLine($"  //   PRE:  {ApplyTypeParamMap(DnfEngine.ExprToString(pre), typeParamMap)}");
+            {
+                var preDnf = DnfEngine.ExprToDnf(pre);
+                if (preDnf.Count == 1)
+                {
+                    foreach (var lit in preDnf[0])
+                        preLitsToShow.Add(DnfEngine.ExprToString(lit));
+                }
+                else
+                {
+                    preFallback = true;
+                    break;
+                }
+            }
+            if (preFallback)
+            {
+                foreach (var pre in preClauses)
+                    sb.AppendLine($"  //   PRE:  {ApplyTypeParamMap(DnfEngine.ExprToString(pre), typeParamMap)}");
+            }
             // Vacuity label "{C}/V{k}" or "{C}/Vi{k}" (isolation mode) → mark
             // literal k (1-based) as the test's nominal vacuous target. Isolated
             // /Vi additionally guarantees no other candidate is vacuous on this
@@ -958,16 +983,23 @@ static class TestEmitter
             // this test is targeting*, regardless of which form the runtime expects
             // take.
             var clauseMatch = Regex.Match(label, @"^\{(\d+)\}");
-            if (clauseMatch.Success && int.TryParse(clauseMatch.Groups[1].Value, out var clauseIdx)
+            int clauseIdx = -1;
+            List<string> postLits = new();
+            if (clauseMatch.Success && int.TryParse(clauseMatch.Groups[1].Value, out clauseIdx)
                 && clauseIdx >= 1 && clauseIdx <= dnfClauses.Count)
             {
-                var clauseLits = dnfClauses[clauseIdx - 1];
-                if (clauseLits.Count > 0)
-                {
-                    sb.AppendLine($"  //   DNF clause {{{clauseIdx}}} (test objective):");
-                    foreach (var lit in clauseLits)
-                        sb.AppendLine($"  //     {ApplyTypeParamMap(lit, typeParamMap)}");
-                }
+                postLits = dnfClauses[clauseIdx - 1];
+            }
+            if (preLitsToShow.Count > 0 || postLits.Count > 0)
+            {
+                var header = clauseIdx >= 1
+                    ? $"  //   DNF clause {{{clauseIdx}}} (test objective):"
+                    : "  //   Test objective:";
+                sb.AppendLine(header);
+                foreach (var lit in preLitsToShow)
+                    sb.AppendLine($"  //     {ApplyTypeParamMap(lit, typeParamMap)}  // PRE");
+                foreach (var lit in postLits)
+                    sb.AppendLine($"  //     {ApplyTypeParamMap(lit, typeParamMap)}  // POST");
             }
             if (vacuousIndex >= 0)
             {
