@@ -1310,6 +1310,7 @@ class Program
             }
         }
 
+        SmtTranslator.ResetPerMethodState();
         var preClauses = method.Req.Select(r => r.E).ToList();
 
         // Constructor requires must hold at runtime: even when test code overwrites

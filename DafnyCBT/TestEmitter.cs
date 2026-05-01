@@ -927,6 +927,22 @@ static class TestEmitter
             // Show the test condition as a comment (skip spec-only literals like fresh())
             foreach (var pre in preClauses)
                 sb.AppendLine($"  //   PRE:  {ApplyTypeParamMap(DnfEngine.ExprToString(pre), typeParamMap)}");
+            // DNF clause literals: extract `{N}` from the label and dump the per-clause
+            // conjunction of literals from `dnfClauses`. The Q1/Q2/... lines below show
+            // the original ensures; this line shows the specific DNF subset that this
+            // test is targeting (which can be a vacuous-region literal like `!(0 <= index)`
+            // when the spec is incomplete in that region).
+            var clauseMatch = Regex.Match(label, @"^\{(\d+)\}");
+            if (clauseMatch.Success && int.TryParse(clauseMatch.Groups[1].Value, out var clauseIdx)
+                && clauseIdx >= 1 && clauseIdx <= dnfClauses.Count)
+            {
+                var clauseLits = dnfClauses[clauseIdx - 1];
+                if (clauseLits.Count > 0)
+                {
+                    var conj = string.Join(" && ", clauseLits.Select(l => ApplyTypeParamMap(l, typeParamMap)));
+                    sb.AppendLine($"  //   DNF CLAUSE {{{clauseIdx}}}:  {conj}");
+                }
+            }
             // Vacuity label "{C}/V{k}" or "{C}/Vi{k}" (isolation mode) → mark
             // literal k (1-based) as the test's nominal vacuous target. Isolated
             // /Vi additionally guarantees no other candidate is vacuous on this

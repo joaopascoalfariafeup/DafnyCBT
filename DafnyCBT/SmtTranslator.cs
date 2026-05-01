@@ -82,8 +82,22 @@ static class SmtTranslator
     internal static HashSet<string> _ghostFunctions = new();
     // True if any postcondition literal could not be translated to SMT
     internal static bool _hasUntranslatedPost = false;
-    // Tracks precondition strings that were successfully translated to SMT
+    // Tracks precondition strings that were successfully translated to SMT.
+    // Accumulated across the queries of a single method (some helpers like
+    // BuildRelevanceQuery pass preLiterals as the preClauses positional, so per-query
+    // Clear would lose original-form entries). Reset between methods via ResetPerMethodState.
     internal static HashSet<string> _translatedPreConditions = new();
+
+    /// <summary>
+    /// Reset state that should not leak between methods (e.g. _translatedPreConditions,
+    /// which accumulates across the multiple SMT queries of one method but should not
+    /// carry over to the next method, since identical precondition strings on different
+    /// methods may translate differently).
+    /// </summary>
+    internal static void ResetPerMethodState()
+    {
+        _translatedPreConditions.Clear();
+    }
     // Enum datatype mappings (set by Program.cs before each method's SMT generation)
     internal static Dictionary<string, List<string>> _enumDatatypes = new();
     internal static Dictionary<string, (string dtName, int ordinal)> _enumConstructors = new();
@@ -852,11 +866,16 @@ static class SmtTranslator
 
         sb.AppendLine();
 
-        // Reset per-query state (well-formedness guards, uninterpreted functions, translation status)
+        // Reset per-query state (well-formedness guards, uninterpreted functions, translation status).
+        // _translatedPreConditions is intentionally NOT cleared here — it accumulates across the
+        // queries of a single method run so TestEmitter sees the union of "Z3-trustworthy" pre
+        // strings (some helper queries — e.g. BuildRelevanceQuery — call with preLiterals as the
+        // preClauses positional arg, so a per-query Clear would lose the original-form
+        // (`sorted(a)`) entries added by the main query). Cleared explicitly per-method by
+        // ResetPerMethodState.
         _wfGuards.Clear();
         _uninterpFuncs.Clear();
         _hasUntranslatedPost = false;
-        _translatedPreConditions.Clear();
 
         // Collect assertions in a separate buffer so we can discover uninterpreted functions first
         var assertions = new System.Text.StringBuilder();
