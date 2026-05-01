@@ -1105,8 +1105,14 @@ static class TestValidator
                 if (!string.IsNullOrEmpty(trailing)) return m.Value;
 
                 // Simple `outName == rhs` path — substitute or annotate with RHSVAL/VAL.
+                // Reject when the rhs contains a top-level `==>`, `<==>`, `&&`, or `||`:
+                // operators looser than `==` mean the expression is really a compound
+                // (e.g. `(index == -1) ==> forall i :: …`), not a simple equality.
+                // Without this guard, the regex matches the inner `==` and treats the
+                // implication's antecedent value as the RHS, truncating the postcondition
+                // (e.g. `expect index == -1 ==> forall ...` → `expect index == -1`).
                 var simpleM = Regex.Match(expr, @"^(\w+)\s*==(?!>)\s*(.+)$");
-                if (simpleM.Success)
+                if (simpleM.Success && !Program.ContainsTopLevelLooserOp(simpleM.Groups[2].Value.TrimEnd()))
                 {
                     var outName = simpleM.Groups[1].Value;
                     var rhs = simpleM.Groups[2].Value.TrimEnd();
@@ -1169,7 +1175,15 @@ static class TestValidator
                     RegexOptions.Multiline);
                 if (existingExpect.Success)
                 {
-                    var pinnedVal = NormalizeAdtPrefix(NormalizeSeqLiteral(existingExpect.Groups[1].Value));
+                    var pinnedRaw = existingExpect.Groups[1].Value;
+                    // If the existing expect's RHS contains a top-level looser operator
+                    // (==>, <==>, &&, ||), the postcondition is a compound (e.g.
+                    // `index == -1 ==> forall …`), not a simple equality. In that case
+                    // the spec deliberately admits multiple valid outputs, so injecting
+                    // an `expect X == observed; // observed from implementation` line
+                    // would over-pin and lock in the (possibly buggy) impl's output.
+                    if (Program.ContainsTopLevelLooserOp(pinnedRaw)) continue;
+                    var pinnedVal = NormalizeAdtPrefix(NormalizeSeqLiteral(pinnedRaw));
                     var observedNorm = NormalizeAdtPrefix(NormalizeSeqLiteral(val));
                     if (pinnedVal == observedNorm) continue;
                 }
@@ -1410,6 +1424,15 @@ static class TestValidator
                 // The spec admits multiple valid outputs — collapsing to a single observed
                 // value would make the test brittle to alternative-but-valid implementations.
                 if (rhs.Contains("||"))
+                    return m.Value;
+
+                // Skip when the rhs contains a top-level `==>`, `<==>`, `&&`, or `||` —
+                // those operators bind weaker than `==`, so the matched literal is really
+                // a compound (e.g. `(index == -1) ==> forall i :: …`), not a simple
+                // equality. Replacing rhs with the impl-observed value would truncate the
+                // compound and silently weaken the postcondition (e.g. `expect index == -1
+                // ==> forall ...` → `expect index == -1`).
+                if (Program.ContainsTopLevelLooserOp(rhs))
                     return m.Value;
 
                 // Replace if we captured the runtime value AND it's a valid injectable literal.
