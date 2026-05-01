@@ -1193,7 +1193,32 @@ static class DnfEngine
             foreach (var op in new[] { " <= ", " >= ", " == ", " != ", " < ", " > " })
             {
                 int i = FindTopLevelOperator(s, op);
-                if (i >= 0) return (s.Substring(0, i).Trim(), s.Substring(i + op.Length).Trim(), op.Trim());
+                if (i >= 0)
+                {
+                    var lhs = s.Substring(0, i).Trim();
+                    var rhs = s.Substring(i + op.Length).Trim();
+                    var opTrim = op.Trim();
+                    // Canonicalize orientation: if LHS parses as a numeric constant
+                    // and RHS doesn't, swap (and flip the op) so the variable is on
+                    // the left. Without this, `!(0 <= index)` canonicalizes to
+                    // `0 > index` (constant on LHS) and Phase D can't match it
+                    // against `index == -1` for redundancy detection.
+                    if (TryParseNumeric(lhs, out _) && !TryParseNumeric(rhs, out _))
+                    {
+                        var flipped = opTrim switch
+                        {
+                            "<"  => ">",
+                            "<=" => ">=",
+                            ">"  => "<",
+                            ">=" => "<=",
+                            "==" => "==",
+                            "!=" => "!=",
+                            _    => opTrim,
+                        };
+                        return (rhs, lhs, flipped);
+                    }
+                    return (lhs, rhs, opTrim);
+                }
             }
             return (null, null, null);
         }
