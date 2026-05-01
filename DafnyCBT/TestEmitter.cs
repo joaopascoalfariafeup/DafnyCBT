@@ -964,16 +964,16 @@ static class TestEmitter
                 vacuousIndex = vNum - 1;
                 isolated = vMatch.Groups[1].Value == "i";
             }
-            // Annotation pass result: __vacuous_indices__ holds the full set of
-            // 0-indexed Q literals that are vacuously true for this test's ins
-            // (computed via Phase B queries on every safe candidate, regardless
-            // of whether the test is /V/Vi or just /R/B/etc.).
-            var vacuousSet = new HashSet<int>();
-            if (vacuousIndex >= 0) vacuousSet.Add(vacuousIndex);
-            if (values.TryGetValue("__vacuous_indices__", out var vacIdxStr) && !string.IsNullOrEmpty(vacIdxStr))
+            // Annotation pass result: __vacuous_literals__ holds the canonical strings
+            // of every DNF-clause literal that is vacuously true on this test's ins
+            // (computed via Phase B queries on every safe candidate). Tag-by-string
+            // is robust against display-side simplification reordering / canonicalising
+            // the displayed literals — index-based tagging would lose alignment.
+            var vacuousLiterals = new HashSet<string>();
+            if (values.TryGetValue("__vacuous_literals__", out var vacLitStr) && !string.IsNullOrEmpty(vacLitStr))
             {
-                foreach (var part in vacIdxStr.Split(','))
-                    if (int.TryParse(part.Trim(), out var v)) vacuousSet.Add(v);
+                foreach (var s in vacLitStr.Split(''))
+                    if (!string.IsNullOrEmpty(s)) vacuousLiterals.Add(s);
             }
             // DNF clause literals — the test objective. Replaces the previous
             // POST Q1/Q2/... block which duplicated information already visible in
@@ -1011,24 +1011,18 @@ static class TestEmitter
                     var s = DnfEngine.ExprToString(lit);
                     var canonical = DnfEngine.CanonicalLiteralKey(s);
                     var tag = preKeySet.Contains(canonical) ? "PRE" : "POST";
-                    sb.AppendLine($"  //     {ApplyTypeParamMap(canonical, typeParamMap)}  // {tag}");
+                    var vacTag = vacuousLiterals.Contains(canonical) ? " (vacuously true on these ins)" : "";
+                    sb.AppendLine($"  //     {ApplyTypeParamMap(canonical, typeParamMap)}  // {tag}{vacTag}");
                 }
             }
-            if (vacuousIndex >= 0)
+            // /V or /Vi-labelled tests: state the SFL-relevant property — every other
+            // candidate literal is non-vacuous, so a failure must be due to one of
+            // the OTHER POST literals' implementation. The per-literal "(vacuously
+            // true on these ins)" tags above already mark which specific literal is
+            // vacuous, so this line just adds the isolation guarantee for /Vi.
+            if (vacuousIndex >= 0 && isolated)
             {
-                sb.AppendLine(isolated
-                    ? $"  //   Vacuity (isolated): Q{vacuousIndex + 1} is vacuously true for this ins; every other candidate literal is non-vacuous, so any failure of this test must be attributable to one of the OTHER POST literals."
-                    : $"  //   Vacuity: Q{vacuousIndex + 1} is vacuously true for this ins (forced true by the other literals).");
-            }
-            // Vacuously-true ensures (broader set from the annotation pass): list
-            // the original-ensures indices that are trivially satisfied by these ins.
-            // Useful for SFL — the surviving literals are the ones the test really
-            // exercises. Skipped when empty or already covered by the single-Q
-            // /V/Vi summary line above.
-            if (vacuousSet.Count > 0 && !(vacuousSet.Count == 1 && vacuousIndex >= 0))
-            {
-                var qs = string.Join(", ", vacuousSet.OrderBy(i => i).Select(i => "Q" + (i + 1)));
-                sb.AppendLine($"  //   Vacuously true on these ins: {qs}");
+                sb.AppendLine("  //   Vacuity (isolated): every other candidate literal is non-vacuous, so any failure of this test must be attributable to one of the OTHER POST literals.");
             }
 
             sb.AppendLine("  {");

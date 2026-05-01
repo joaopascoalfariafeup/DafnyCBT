@@ -3249,7 +3249,17 @@ class Program
                     if (linesB.Any(l => l == "unsat")) vacIndices.Add(k);
                 }
                 if (vacIndices.Count > 0)
+                {
                     tcValues["__vacuous_indices__"] = string.Join(",", vacIndices.Select(i => i.ToString()));
+                    // Also store the vacuous literals as canonical strings so TestEmitter
+                    // can tag them inline by string-matching, regardless of how display-side
+                    // simplification reorders / drops / canonicalises the literal list.
+                    var vacStrs = vacIndices
+                        .Where(i => i < tcClause.Count)
+                        .Select(i => DnfEngine.CanonicalLiteralKey(DnfEngine.ExprToString(tcClause[i])))
+                        .Where(s => !string.IsNullOrEmpty(s));
+                    tcValues["__vacuous_literals__"] = string.Join("", vacStrs);
+                }
             }
         }
 
