@@ -996,10 +996,22 @@ static class TestEmitter
                     ? $"  //   DNF clause {{{clauseIdx}}} (test objective):"
                     : "  //   Test objective:";
                 sb.AppendLine(header);
-                foreach (var lit in preLitsToShow)
-                    sb.AppendLine($"  //     {ApplyTypeParamMap(lit, typeParamMap)}  // PRE");
-                foreach (var lit in postLits)
-                    sb.AppendLine($"  //     {ApplyTypeParamMap(lit, typeParamMap)}  // POST");
+                // Cross-side simplification: a pre literal can be implied by a post
+                // literal (e.g. `-100 <= x` is implied by `x > 0`) and vice versa.
+                // The post-DNF cross-product simplifier (DropImpliedLiterals) only
+                // runs within a clause; here we apply it across the pre+post union
+                // for display, so the test objective shows just the strongest
+                // constraints. Tagging is by origin: pre-set keys → PRE, else POST.
+                var preKeySet = new HashSet<string>(preLitsToShow.Select(DnfEngine.CanonicalLiteralKey));
+                var combined = preLitsToShow.Concat(postLits)
+                    .Select(s => (Expression)new LeafExpression(s)).ToList();
+                var simplified = DnfEngine.DropImpliedLiterals(combined);
+                foreach (var lit in simplified)
+                {
+                    var s = DnfEngine.ExprToString(lit);
+                    var tag = preKeySet.Contains(DnfEngine.CanonicalLiteralKey(s)) ? "PRE" : "POST";
+                    sb.AppendLine($"  //     {ApplyTypeParamMap(s, typeParamMap)}  // {tag}");
+                }
             }
             if (vacuousIndex >= 0)
             {
