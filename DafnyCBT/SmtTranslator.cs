@@ -2621,6 +2621,27 @@ static class SmtTranslator
     private const int MAX_DAFNY_EXPR_TO_SMT_DEPTH = 200;
     private const int MAX_DAFNY_EXPR_TO_SMT_LEN = 20_000;
 
+    /// <summary>
+    /// Heuristic: does this Dafny expression string evaluate to a seq-typed value?
+    /// Used by the chain-comparison handler in DafnyExprToSmt to decide between
+    /// `(<= a b)` (numeric) and `(seq.prefixof a b)` (seq-prefix).
+    /// </summary>
+    static bool LooksLikeSeqOperand(string operand, List<(string Name, string Type)> inputs)
+    {
+        operand = operand.Trim();
+        // Slice expression: x[..], x[lo..hi], x[lo..], x[..hi].
+        if (System.Text.RegularExpressions.Regex.IsMatch(operand, @"^[a-zA-Z_]\w*\s*\[[^\[\]]*\.\.[^\[\]]*\]$")) return true;
+        // String literal.
+        if (operand.StartsWith("\"") && operand.EndsWith("\"")) return true;
+        // Seq display [a, b, c].
+        if (operand.StartsWith("[") && operand.EndsWith("]") && !operand.Contains("|")) return true;
+        // Bare identifier matching a seq/string/array input.
+        var inp = inputs.FirstOrDefault(i => i.Name == operand);
+        if (inp.Name != null && (TypeUtils.IsSeqType(inp.Type) || inp.Type == "string" || TypeUtils.IsArrayType(inp.Type)))
+            return true;
+        return false;
+    }
+
     internal static string? DafnyExprToSmt(string dafnyExpr, List<(string Name, string Type)> inputs)
     {
         if (dafnyExpr.Length > MAX_DAFNY_EXPR_TO_SMT_LEN) return null;
@@ -2993,7 +3014,25 @@ static class SmtTranslator
                     for (int ci = 1; ci < chainParts.Count; ci += 2)
                     {
                         var op = chainParts[ci]; // "<" or "<="
-                        conjuncts.Add($"({op} {smtParts[termIdx]} {smtParts[termIdx + 1]})");
+                        var leftOp = chainParts[ci - 1];
+                        var rightOp = chainParts[ci + 1];
+                        // Seq prefix-relation: when both operands look seq-typed (slice
+                        // expression, string literal, seq display, or seq-typed input),
+                        // emit seq.prefixof rather than raw `<=` / `<` — Z3 has no
+                        // built-in `<=` over (Seq T) and would otherwise treat the
+                        // assertion as uninterpreted.
+                        if ((op == "<=" || op == "<")
+                            && LooksLikeSeqOperand(leftOp, inputs) && LooksLikeSeqOperand(rightOp, inputs))
+                        {
+                            var pf = $"(seq.prefixof {smtParts[termIdx]} {smtParts[termIdx + 1]})";
+                            conjuncts.Add(op == "<="
+                                ? pf
+                                : $"(and {pf} (not (= {smtParts[termIdx]} {smtParts[termIdx + 1]})))");
+                        }
+                        else
+                        {
+                            conjuncts.Add($"({op} {smtParts[termIdx]} {smtParts[termIdx + 1]})");
+                        }
                         termIdx++;
                     }
                     if (conjuncts.Count == 1) return conjuncts[0];
@@ -3039,6 +3078,25 @@ static class SmtTranslator
                 {
                     if (sOp == "distinct")
                         return $"(not (= {left} {right}))";
+                    // Seq prefix-relation: <= / < between seq operands is the prefix
+                    // relation in Dafny, not a numeric comparison. Z3 has no built-in
+                    // `<=` over (Seq T) so emitting raw `<=` makes the assertion
+                    // uninterpreted. Detect seq operands via LooksLikeSeqOperand and
+                    // emit seq.prefixof. >= / > flipped accordingly (Dafny doesn't
+                    // expose them on seqs but pipeline rewrites can produce them).
+                    if (dOp == "<=" || dOp == "<" || dOp == ">=" || dOp == ">")
+                    {
+                        var leftStr = parts.Value.left;
+                        var rightStr = parts.Value.right;
+                        if (LooksLikeSeqOperand(leftStr, inputs) && LooksLikeSeqOperand(rightStr, inputs))
+                        {
+                            var (a, b) = (dOp == ">=" || dOp == ">") ? (right, left) : (left, right);
+                            var pf = $"(seq.prefixof {a} {b})";
+                            return (dOp == "<=" || dOp == ">=")
+                                ? pf
+                                : $"(and {pf} (not (= {a} {b})))";
+                        }
+                    }
                     return $"({sOp} {left} {right})";
                 }
             }

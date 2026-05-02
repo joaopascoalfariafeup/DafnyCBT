@@ -27,7 +27,7 @@ static class DnfEngine
     internal static List<List<Expression>> ExprToDnf(Expression expr)
     {
         UseFdnf = false;
-        return ExprToDnfInner(expr).pos;
+        return DedupClauses(ExprToDnfInner(expr).pos);
     }
 
     /// <summary>
@@ -36,7 +36,25 @@ static class DnfEngine
     internal static List<List<Expression>> ExprToFdnf(Expression expr)
     {
         UseFdnf = true;
-        return ExprToDnfInner(expr).pos;
+        return DedupClauses(ExprToDnfInner(expr).pos);
+    }
+
+    /// <summary>
+    /// Drop duplicate literals from each clause using canonical-key equality.
+    /// CrossProductPruned does this between merge steps; this normalises the
+    /// single-ensures path (which never goes through CrossProductPruned), where
+    /// inlining of (A &lt;==&gt; B) AND (A ==&gt; C) into A AND B AND C produces a
+    /// duplicated `A` literal that survives to display and SMT.
+    /// </summary>
+    static List<List<Expression>> DedupClauses(List<List<Expression>> dnf)
+    {
+        var result = new List<List<Expression>>(dnf.Count);
+        foreach (var clause in dnf)
+        {
+            var seen = new HashSet<string>();
+            result.Add(clause.Where(e => seen.Add(CanonicalLiteralKey(ExprToString(e)))).ToList());
+        }
+        return result;
     }
 
     /// <summary>
