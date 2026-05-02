@@ -267,6 +267,11 @@ class Program
             Console.Error.WriteLine($"Failed to parse: {ex.Message}");
             return;
         }
+        // Plumb SystemModuleManager into DnfEngine so its AST Substituter (used in
+        // quantifier-body decomposition for `offset → 0` style boundary substitution)
+        // can construct properly-resolved replacement expressions instead of
+        // falling back to string-based LeafExpression literals.
+        DnfEngine.SystemModuleManager = program.SystemModuleManager;
 
         if (program == null)
         {

@@ -1287,7 +1287,13 @@ static class TestValidator
             bool isArr = val.TrimStart().StartsWith("[")
                          || Regex.IsMatch(body, @"^\s*var\s+" + Regex.Escape(name) + @"\s*:=\s*new\s+[\w.<>]+\s*\[", RegexOptions.Multiline);
             var lhs = isArr ? $"{name}[..]" : name;
-            lines.Add($"{ind}expect {lhs} == {val}; // observed from implementation");
+            // Emit as a commented-out `expect` so the runtime impl value is visible
+            // without becoming a binding constraint — the spec admits other valid
+            // outputs whenever this injection fires (the post-check used the full
+            // postcondition rather than a Z3-pinned literal), so an active expect
+            // would over-pin to the impl's specific output and reject equally
+            // valid alternatives.
+            lines.Add($"{ind}// expect {lhs} == {val}; // observed from implementation");
         }
 
         // Insert after the last existing expect, so the "observed" lines come last.
@@ -1511,7 +1517,9 @@ static class TestValidator
                 var lhs = (arrayOutputNames != null && arrayOutputNames.Contains(varName))
                     ? $"{varName}[..]"
                     : varName;
-                var inject = $"    expect {lhs} == {value}; // observed from implementation";
+                // Emit as a commented-out `expect` (informational only). See the
+                // matching change in InjectRuntimeInfo above.
+                var inject = $"    // expect {lhs} == {value}; // observed from implementation";
                 // Test-block body (from CheckAndSplitTests) starts after `  {\n` and ends
                 // BEFORE `  }` — so it does NOT include the closing brace. We append the
                 // injected line after the last `expect ...;` line.

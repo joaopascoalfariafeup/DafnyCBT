@@ -2,6 +2,7 @@ using System.Text.RegularExpressions;
 using System.Xml.Schema;
 using Microsoft.Dafny;
 using RAST;
+using DafnyType = Microsoft.Dafny.Type;
 
 namespace DafnyCBT;
 
@@ -17,6 +18,14 @@ static class DnfEngine
     /// into left-boundary / middle-range / right-boundary cases. Used for ablation
     /// experiments measuring the contribution of quantifier decomposition.</summary>
     internal static bool DecomposeQuantifiers { get; set; } = true;
+
+    /// <summary>
+    /// Set by Program.cs after parsing. Required by the Dafny Substituter base
+    /// class used for AST-level variable substitution in quantifier-decomposition.
+    /// When null, SubstituteVarAst falls back to string-based substitution
+    /// (preserving the legacy LeafExpression behaviour).
+    /// </summary>
+    internal static SystemModuleManager? SystemModuleManager { get; set; }
 
     /// <summary>
     /// Decomposes a Dafny expression into Disjunctive Normal Form (DNF) or Full DNF (FDNF),
@@ -761,19 +770,24 @@ static class DnfEngine
         var effectiveHi = isStrictHi ? MakeSub(hi, 1) : hi;
 
         // Guard: effectiveLo <= effectiveHi ensures the range is non-empty.
-        var rangeGuard = ParseToLeafExpression($"{ExprToString(effectiveLo)} <= {ExprToString(effectiveHi)}");
+        // Constructed as a BinaryExpr (AST) rather than a LeafExpression so the
+        // SMT path handles it via the typed BinaryExpr branch.
+        var rangeGuard = (Expression)new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Le, effectiveLo, effectiveHi);
 
         // Clause 1 (left boundary): property[k := effectiveLo]
-        var leftProp = SubstituteVar(property, boundVar.Name, effectiveLo);
+        var leftProp = SubstituteVar(property, boundVar, effectiveLo);
 
         // Clause 2 (middle): exists with narrowed range excluding both boundaries
         // Range: effectiveLo+1 <= k < effectiveHi (i.e., effectiveLo+1 .. effectiveHi-1 inclusive)
+        // Still emitted as a LeafExpression — constructing a fully-typed ExistsExpr
+        // here is more invasive (requires re-resolution of a synthetic bound var),
+        // so this one stays string-form. The SMT translator's fallback handles it.
         var middleLo = MakeAdd(effectiveLo, 1);
         var middleStr = $"exists {boundVar.Name} :: {ExprToString(middleLo)} <= {boundVar.Name} < {ExprToString(effectiveHi)} && {ExprToString(property)}";
         var middleExpr = ParseToLeafExpression(middleStr);
 
         // Clause 3 (right boundary): property[k := effectiveHi]
-        var rightProp = SubstituteVar(property, boundVar.Name, effectiveHi);
+        var rightProp = SubstituteVar(property, boundVar, effectiveHi);
 
         var clauses = new List<List<Expression>>
         {
@@ -837,15 +851,31 @@ static class DnfEngine
     }
 
     /// <summary>
-    /// Substitute all references to a named variable with a replacement expression.
-    /// Returns a string-based leaf expression (since creating a fully typed AST clone
-    /// is complex — the string round-trip is pragmatic for now).
+    /// Substitute all references to a bound variable with a replacement expression.
+    /// Uses Dafny's Substituter base class (which handles every Expression subclass)
+    /// so the result is a proper AST tree — not a LeafExpression string. This matters
+    /// because LeafExpression literals reach SmtTranslator via the string-based
+    /// fallback path, which historically misencoded operators that depend on operand
+    /// types (e.g. `<=` between seqs as integer comparison instead of seq.prefixof).
+    /// Falls back to string substitution if SystemModuleManager hasn't been wired —
+    /// preserves the legacy behaviour during early-phase tooling tests.
     /// </summary>
-    static Expression SubstituteVar(Expression expr, string varName, Expression replacement)
+    static Expression SubstituteVar(Expression expr, BoundVar boundVar, Expression replacement)
+    {
+        if (SystemModuleManager == null)
+            return SubstituteVarStringFallback(expr, boundVar.Name, replacement);
+        var substMap = new Dictionary<IVariable, Expression> { { boundVar, replacement } };
+        var subst = new Substituter(null, substMap, new Dictionary<TypeParameter, DafnyType>(), null, SystemModuleManager);
+        return subst.Substitute(expr);
+    }
+
+    /// <summary>Legacy string-based substitution; used only when SystemModuleManager
+    /// isn't available and as the fallback for LeafExpression literals (which carry
+    /// pre-stringified text and have no AST structure to walk).</summary>
+    static Expression SubstituteVarStringFallback(Expression expr, string varName, Expression replacement)
     {
         var exprStr = ExprToString(expr);
         var replStr = ExprToString(replacement);
-        // Parenthesize replacement if it contains operators
         if (replStr.Contains(' ') && !replStr.StartsWith("("))
             replStr = $"({replStr})";
         var result = Regex.Replace(exprStr, @"\b" + Regex.Escape(varName) + @"\b", replStr);
@@ -853,26 +883,29 @@ static class DnfEngine
     }
 
     /// <summary>
-    /// Build expr + n (simplifying when possible).
+    /// Build expr + n. Returns a properly-typed AST node (LiteralExpr when expr is
+    /// a literal; BinaryExpr otherwise) so the result flows through ExprToSmt's
+    /// AST path instead of falling to the string-based DafnyExprToSmt fallback.
     /// </summary>
     static Expression MakeAdd(Expression expr, int n)
     {
+        if (n == 0) return expr;
         if (expr is LiteralExpr lit && lit.Value is System.Numerics.BigInteger bigVal)
             return new LiteralExpr(Token.NoToken, (int)bigVal + n);
-        // Fall back to string representation
-        var str = ExprToString(expr);
-        return ParseToLeafExpression(str == "0" ? n.ToString() : $"({str} + {n})");
+        var nLit = new LiteralExpr(Token.NoToken, n);
+        return new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Add, expr, nLit);
     }
 
     /// <summary>
-    /// Build expr - n (simplifying when possible).
+    /// Build expr - n. AST-typed result (see MakeAdd).
     /// </summary>
     static Expression MakeSub(Expression expr, int n)
     {
+        if (n == 0) return expr;
         if (expr is LiteralExpr lit && lit.Value is System.Numerics.BigInteger bigVal)
             return new LiteralExpr(Token.NoToken, (int)bigVal - n);
-        var str = ExprToString(expr);
-        return ParseToLeafExpression(n == 0 ? str : $"({str} - {n})");
+        var nLit = new LiteralExpr(Token.NoToken, n);
+        return new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Sub, expr, nLit);
     }
 
     /// <summary>
