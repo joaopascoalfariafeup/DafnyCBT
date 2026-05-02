@@ -1163,9 +1163,9 @@ static class TestValidator
                 var name = kv.Key;
                 var val = kv.Value;
 
-                // Already captured by an explicit `expect X == ...; // observed ...` line
-                var coveredPattern = @"^\s*expect\s+" + Regex.Escape(name) +
-                                     @"(?:\s*\[\.\.\])?\s*==.*//\s*observed";
+                // Already captured by an explicit `// actual: X == ...` line.
+                var coveredPattern = @"^\s*//\s*actual:\s+" + Regex.Escape(name) +
+                                     @"(?:\s*\[\.\.\])?\s*==";
                 if (Regex.IsMatch(body, coveredPattern, RegexOptions.Multiline)) continue;
 
                 // Already pinned by a plain spec-derived `expect X == val;` to the SAME value.
@@ -1287,13 +1287,14 @@ static class TestValidator
             bool isArr = val.TrimStart().StartsWith("[")
                          || Regex.IsMatch(body, @"^\s*var\s+" + Regex.Escape(name) + @"\s*:=\s*new\s+[\w.<>]+\s*\[", RegexOptions.Multiline);
             var lhs = isArr ? $"{name}[..]" : name;
-            // Emit as a commented-out `expect` so the runtime impl value is visible
-            // without becoming a binding constraint — the spec admits other valid
-            // outputs whenever this injection fires (the post-check used the full
-            // postcondition rather than a Z3-pinned literal), so an active expect
-            // would over-pin to the impl's specific output and reject equally
-            // valid alternatives.
-            lines.Add($"{ind}// expect {lhs} == {val}; // observed from implementation");
+            // Emit as a commented `// actual: ...` informational line. The runtime
+            // impl value is recorded for debugging but is NOT a binding constraint —
+            // the spec admits other valid outputs whenever this injection fires
+            // (the post-check used the full postcondition rather than a Z3-pinned
+            // literal). Using `// actual:` instead of `// expect ...` avoids the
+            // visual ambiguity of a commented-out `expect` (which read as if a
+            // contract had been temporarily disabled).
+            lines.Add($"{ind}// actual: {lhs} == {val}");
         }
 
         // Insert after the last existing expect, so the "observed" lines come last.
@@ -1517,9 +1518,9 @@ static class TestValidator
                 var lhs = (arrayOutputNames != null && arrayOutputNames.Contains(varName))
                     ? $"{varName}[..]"
                     : varName;
-                // Emit as a commented-out `expect` (informational only). See the
-                // matching change in InjectRuntimeInfo above.
-                var inject = $"    // expect {lhs} == {value}; // observed from implementation";
+                // Emit as a commented `// actual: ...` informational line. See
+                // the matching change in InjectRuntimeInfo above.
+                var inject = $"    // actual: {lhs} == {value}";
                 // Test-block body (from CheckAndSplitTests) starts after `  {\n` and ends
                 // BEFORE `  }` — so it does NOT include the closing brace. We append the
                 // injected line after the last `expect ...;` line.
