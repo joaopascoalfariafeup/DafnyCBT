@@ -1471,14 +1471,9 @@ static class TestEmitter
             if (!isBodyless)
             foreach (var lit in expectLiterals)
             {
-                // Match "outName == <expr>" at the start of the literal (but not <==> or ==>)
-                var m = Regex.Match(lit, @"^(\w+)\s*==\s*(?![>=])(.+)$", RegexOptions.Singleline);
-                if (!m.Success) continue;
-                var lhs = m.Groups[1].Value;
-                var rhs = m.Groups[2].Value.Trim();
-                // Reject when rhs contains a top-level ==>, <==>, &&, or || — these bind weaker
-                // than ==, so the literal is really "(outName == x) OP rhs", not a simple equality.
-                if (Program.ContainsTopLevelLooserOp(rhs)) continue;
+                // Match "outName == <expr>" only when it's a SIMPLE equality (no top-level
+                // ==> / <==> / && / ||) — see Program.TryMatchSimpleEquality.
+                if (!Program.TryMatchSimpleEquality(lit, out var lhs, out var rhs)) continue;
                 if (!outNames_set.Contains(lhs)) continue;
                 if (coveredOutputs.Contains(lhs)) continue; // Z3 already gave a concrete value
                 if (rhsCaptures.ContainsKey(lhs) || rhsInline.ContainsKey(lhs)) continue;
@@ -2159,24 +2154,19 @@ static class TestEmitter
                 // Emit if: mentions an uncovered output (or no-output in full-postcondition mode)
                 if (!mentionsAnyOutput || !mentionsOnlyCoveredOutputs)
                 {
-                    var litMatch = Regex.Match(lit, @"^(\w+)\s*==\s*(?![>=])(.+)$", RegexOptions.Singleline);
-                    // Treat as a valid outName==rhs match only if rhs has no top-level ==>, <==>, &&, ||
-                    // (those bind weaker than ==, so the literal is really an implication or conjunction).
-                    if (litMatch.Success && Program.ContainsTopLevelLooserOp(litMatch.Groups[2].Value))
-                        litMatch = Match.Empty;
-                    var lhsName = litMatch.Success ? litMatch.Groups[1].Value : null;
+                    bool isSimpleEq = Program.TryMatchSimpleEquality(lit, out var lhsName, out _);
                     // Skip entirely when LHS is an immutable input: input is pinned at declaration,
                     // so the literal is either a tautology (after RHS substitution) or redundant with
                     // an equivalent output-LHS postcondition (e.g. ProdF(f) == n already covers
                     // n == f[0] * ProdF(f[1..])).
-                    bool lhsIsImmutableInput = lhsName != null
+                    bool lhsIsImmutableInput = isSimpleEq
                         && method.Ins.Any(i => i.Name == lhsName)
                         && (mutableNames == null || !mutableNames.Contains(lhsName));
                     if (lhsIsImmutableInput)
                         continue;
-                    if (litMatch.Success && rhsCaptures.TryGetValue(lhsName!, out var checkVar))
+                    if (isSimpleEq && rhsCaptures.TryGetValue(lhsName, out var checkVar))
                         sb.AppendLine($"    expect {lhsName} == {checkVar};");
-                    else if (litMatch.Success && rhsInline.TryGetValue(lhsName!, out var inlineRhs))
+                    else if (isSimpleEq && rhsInline.TryGetValue(lhsName, out var inlineRhs))
                         sb.AppendLine($"    expect {lhsName} == {inlineRhs};");
                     else
                         sb.AppendLine($"    expect {lit};");

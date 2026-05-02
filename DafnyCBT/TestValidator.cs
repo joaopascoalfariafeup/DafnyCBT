@@ -867,24 +867,12 @@ static class TestValidator
         HashSet<string>? stringOutputNames = null,
         HashSet<string>? arrayOutputNames = null)
     {
-        // Skip disjunctive expects (e.g. `index == 0 || index == 1` from alt-enumeration).
-        // RHS captured by the regex below would include `|| ...`, producing a type-incorrect
-        // probe like `print "RHSVAL:...=", (0 || index == 1), ...`.
-        if (expr.Contains("||")) return null;
+        // Match `varName == <rhs>` as a SIMPLE equality (rejects compound expressions
+        // with top-level ==> / <==> / && / ||). See Program.TryMatchSimpleEquality.
+        if (!Program.TryMatchSimpleEquality(expr, out var varName, out var rhs)) return null;
 
-        // Match: varName == <expr> (top-level ==, NOT ==> implication)
-        var m = Regex.Match(expr, @"^(\w+)\s*==(?!>)\s*(.+)$");
-        if (!m.Success) return null;
-
-        var varName = m.Groups[1].Value;
-        var rhs = m.Groups[2].Value.Trim();
-
-        // Don't emit VAL for simple scalar literals — the expect is already concrete
+        // Don't emit VAL for simple scalar literals — the expect is already concrete.
         if (IsSimpleScalarLiteral(rhs)) return null;
-
-        // Skip when rhs contains a top-level ==>, <==>, &&, or || — those bind weaker than ==,
-        // so the expect is really "(varName == x) OP ..." and `(rhs)` is not a bool expression.
-        if (Program.ContainsTopLevelLooserOp(rhs)) return null;
 
         string valLine;
         string rhsValLine;
@@ -1105,17 +1093,10 @@ static class TestValidator
                 if (!string.IsNullOrEmpty(trailing)) return m.Value;
 
                 // Simple `outName == rhs` path — substitute or annotate with RHSVAL/VAL.
-                // Reject when the rhs contains a top-level `==>`, `<==>`, `&&`, or `||`:
-                // operators looser than `==` mean the expression is really a compound
-                // (e.g. `(index == -1) ==> forall i :: …`), not a simple equality.
-                // Without this guard, the regex matches the inner `==` and treats the
-                // implication's antecedent value as the RHS, truncating the postcondition
-                // (e.g. `expect index == -1 ==> forall ...` → `expect index == -1`).
-                var simpleM = Regex.Match(expr, @"^(\w+)\s*==(?!>)\s*(.+)$");
-                if (simpleM.Success && !Program.ContainsTopLevelLooserOp(simpleM.Groups[2].Value.TrimEnd()))
+                // See Program.TryMatchSimpleEquality for why a compound rhs (top-level
+                // ==> / <==> / && / ||) must be rejected here.
+                if (Program.TryMatchSimpleEquality(expr, out var outName, out var rhs))
                 {
-                    var outName = simpleM.Groups[1].Value;
-                    var rhs = simpleM.Groups[2].Value.TrimEnd();
                     string? expected = rhsVals != null && rhsVals.TryGetValue(outName, out var e) ? e : null;
                     string? actual = vals != null && vals.TryGetValue(outName, out var a) ? a : null;
                     if (expected != null)

@@ -1090,6 +1090,33 @@ class Program
     }
 
     /// <summary>
+    /// Match `outName == rhs` as a SIMPLE equality (not a compound expression).
+    /// Returns true and populates outName/rhs only when:
+    ///   - The expression starts with an identifier followed by `==` (not `==>`).
+    ///   - The rhs has no top-level operator looser than `==` (ContainsTopLevelLooserOp
+    ///     rejects `==>`, `<==>`, `&&`, `||`).
+    /// Without the looser-op guard, the regex's inner `==` would mis-split a compound
+    /// like `index == -1 ==> forall ...` into outName="index" / rhs="-1 ==> forall ...",
+    /// causing downstream code to truncate the implication or over-pin the lhs to the
+    /// runtime-observed value. Centralised here so all four-plus call sites use the
+    /// same definition; today's bug history shows that re-implementing the check
+    /// inline reliably re-introduces the truncation.
+    /// </summary>
+    public static bool TryMatchSimpleEquality(string expr, out string outName, out string rhs)
+    {
+        outName = "";
+        rhs = "";
+        var m = System.Text.RegularExpressions.Regex.Match(expr, @"^(\w+)\s*==(?!>)\s*(.+)$",
+            System.Text.RegularExpressions.RegexOptions.Singleline);
+        if (!m.Success) return false;
+        var candidateRhs = m.Groups[2].Value.TrimEnd();
+        if (ContainsTopLevelLooserOp(candidateRhs)) return false;
+        outName = m.Groups[1].Value;
+        rhs = candidateRhs;
+        return true;
+    }
+
+    /// <summary>
     /// Checks if two literals are complementary: L and !(L), or !(L) and L.
     /// </summary>
     static bool AreComplementary(string a, string b)
