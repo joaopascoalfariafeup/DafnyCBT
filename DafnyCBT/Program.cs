@@ -3266,6 +3266,12 @@ class Program
         // Convert Expression-based test cases to string-based for TestEmitter.
         // Restore original (non-inlined) literals for expect emission.
         var originalDnfClauses = DnfEngine.ToStringDnf(originalDnfExprs);
+        // Inlined DNF (post predicate inlining) — what test labels {N}/... index into.
+        // This is what TestEmitter needs to print the per-test "DNF clause objective":
+        // labels reference the *inlined* dnfExprs, so the un-inlined originalDnfClauses
+        // (which has fewer clauses when a predicate inlines into a conjunction of
+        // ==> / <==> / && / ||) doesn't line up with the labels.
+        var inlinedDnfClauses = DnfEngine.ToStringDnf(dnfExprs);
         var inlinedToOriginal = new Dictionary<string, string>();
         // Tracks clauses whose inlined-DNF expanded to more literals than the
         // original (typically because deeper unrolling produced an
@@ -3275,7 +3281,6 @@ class Program
         var clausesWithStructuralInlining = new HashSet<int>();
         if (predsToInline != null && predsToInline.Count > 0)
         {
-            var inlinedDnfClauses = DnfEngine.ToStringDnf(dnfExprs);
             for (int ci = 0; ci < originalDnfClauses.Count && ci < inlinedDnfClauses.Count; ci++)
             {
                 if (originalDnfClauses[ci].Count != inlinedDnfClauses[ci].Count)
@@ -3371,7 +3376,7 @@ class Program
         bool hasUninterpFuncs = hasNonInlinableFuncs || SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
         // Emit Dafny test file
-        var emitted = TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, originalDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo, inlinablePredicates, specExpects, isBodyless, preOnlyMode);
+        var emitted = TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, inlinedDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo, inlinablePredicates, specExpects, isBodyless, preOnlyMode);
         return (emitted, TimedOut());
     }
 

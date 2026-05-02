@@ -1592,30 +1592,45 @@ static class SmtTranslator
                 BinaryExpr.Opcode.Iff => $"(= {left} {right})",
                 BinaryExpr.Opcode.Eq => $"(= {left} {right})",
                 BinaryExpr.Opcode.Neq => $"(not (= {left} {right}))",
+                // Seq comparison (Dafny: <= is prefix relation, < is proper prefix).
+                // Z3 has no built-in `<=` over (Seq T) — emitting raw `<=` makes the
+                // assertion uninterpreted, so Z3 fabricates witnesses that pass
+                // regardless of whether `s1` is actually a prefix of `s2`. Use
+                // `seq.prefixof` instead. Dafny defines `<=` and `<` (but not `>=`,
+                // `>`) on seqs; treat the latter symmetrically anyway in case any
+                // pipeline rewrite produces them.
                 BinaryExpr.Opcode.Lt => IsMultisetExprAst(bin.E0, inputs)
                     ? $"(and (SubsetOfMultiset {left} {right}) (not (= {left} {right})))"
                     : IsStringSetExprAst(bin.E0, inputs)
                     ? $"(and (SubsetOfStr {left} {right}) (not (= {left} {right})))"
                     : IsSetExprAst(bin.E0, inputs)
-                    ? $"(and (SubsetOf {left} {right}) (not (= {left} {right})))" : $"(< {left} {right})",
+                    ? $"(and (SubsetOf {left} {right}) (not (= {left} {right})))"
+                    : IsSeqExprAst(bin.E0, inputs)
+                    ? $"(and (seq.prefixof {left} {right}) (not (= {left} {right})))" : $"(< {left} {right})",
                 BinaryExpr.Opcode.Le => IsMultisetExprAst(bin.E0, inputs)
                     ? $"(SubsetOfMultiset {left} {right})"
                     : IsStringSetExprAst(bin.E0, inputs)
                     ? $"(SubsetOfStr {left} {right})"
                     : IsSetExprAst(bin.E0, inputs)
-                    ? $"(SubsetOf {left} {right})" : $"(<= {left} {right})",
+                    ? $"(SubsetOf {left} {right})"
+                    : IsSeqExprAst(bin.E0, inputs)
+                    ? $"(seq.prefixof {left} {right})" : $"(<= {left} {right})",
                 BinaryExpr.Opcode.Gt => IsMultisetExprAst(bin.E0, inputs)
                     ? $"(and (SubsetOfMultiset {right} {left}) (not (= {left} {right})))"
                     : IsStringSetExprAst(bin.E0, inputs)
                     ? $"(and (SubsetOfStr {right} {left}) (not (= {left} {right})))"
                     : IsSetExprAst(bin.E0, inputs)
-                    ? $"(and (SubsetOf {right} {left}) (not (= {left} {right})))" : $"(> {left} {right})",
+                    ? $"(and (SubsetOf {right} {left}) (not (= {left} {right})))"
+                    : IsSeqExprAst(bin.E0, inputs)
+                    ? $"(and (seq.prefixof {right} {left}) (not (= {left} {right})))" : $"(> {left} {right})",
                 BinaryExpr.Opcode.Ge => IsMultisetExprAst(bin.E0, inputs)
                     ? $"(SubsetOfMultiset {right} {left})"
                     : IsStringSetExprAst(bin.E0, inputs)
                     ? $"(SubsetOfStr {right} {left})"
                     : IsSetExprAst(bin.E0, inputs)
-                    ? $"(SubsetOf {right} {left})" : $"(>= {left} {right})",
+                    ? $"(SubsetOf {right} {left})"
+                    : IsSeqExprAst(bin.E0, inputs)
+                    ? $"(seq.prefixof {right} {left})" : $"(>= {left} {right})",
                 BinaryExpr.Opcode.Add => IsMultisetExprAst(bin.E0, inputs)
                     ? $"(MultisetUnion {left} {right})"
                     : IsStringSetExprAst(bin.E0, inputs)
