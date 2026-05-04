@@ -1830,6 +1830,38 @@ class Program
         //   3. Qi references at least one output (or mutable-post) variable
         //   4. every output var in Qi also appears in some other literal Qj (j != i)
         //      — ensures outs_i is partially constrained, not free
+        // True when a clause has at least one feature the behavioural-relevance
+        // pass can act on: a `modifies`-listed mutable input, or a top-level
+        // forall literal whose range is extractable.
+        bool ClauseHasBehaviouralRelevanceHook(
+            List<Expression> clause,
+            List<(string Name, string Type)> ins,
+            HashSet<string> mutables)
+        {
+            // (a) any mutable param at all — modification-relevance can fire.
+            if (SmtTranslator.ModificationRelevance && mutables.Count > 0
+                && ins.Any(v => mutables.Contains(v.Name)))
+                return true;
+            // (b) any clause literal is a top-level forall with a recognisable
+            // bounded range — forall-non-vacuity can fire.
+            if (SmtTranslator.ForallNonVacuityRelevance)
+            {
+                foreach (var lit in clause)
+                {
+                    var unwrapped = lit;
+                    while (unwrapped is ParensExpression p) unwrapped = p.E;
+                    while (unwrapped is ConcreteSyntaxExpression cse && cse.ResolvedExpression != null)
+                        unwrapped = cse.ResolvedExpression;
+                    if (unwrapped is ForallExpr fe)
+                    {
+                        var (lo, hi, _, _) = DnfEngine.TryExtractForallRange(fe);
+                        if (lo != null && hi != null) return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         List<int> GetSafeRelevanceIndices(
             List<Expression> clause,
             List<(string Name, string Type)> ins,
@@ -1837,7 +1869,19 @@ class Program
             HashSet<string> mutables)
         {
             var result = new List<int>();
-            if (clause.Count < 2) return result;
+            // Single-literal clause: the per-literal "abstract bite" check is
+            // degenerate (no other literals to keep intact), but the behavioural-
+            // relevance pass (modification + forall non-vacuity) can still tighten
+            // the witness. Allow Phase 1r in that case so length-1 reverse-style
+            // no-op witnesses get filtered. Skip when neither hook applies and
+            // notify the caller via the empty result + verbose log there.
+            if (clause.Count == 0) return result;
+            if (clause.Count == 1)
+            {
+                if (ClauseHasBehaviouralRelevanceHook(clause, ins, mutables))
+                    result.Add(0);
+                return result;
+            }
             var outNames = outs.Select(o => o.Name)
                 .Concat(ins.Where(i => mutables.Contains(i.Name)).Select(i => i.Name))
                 .Distinct().ToList();
@@ -2632,7 +2676,16 @@ class Program
                         if (maxTests > 0 && testCases.Count >= maxTests) break;
                         var clause = dnfExprs[ci];
                         var safeIndices = GetSafeRelevanceIndices(clause, inputs, outputs, mutableNames);
-                        if (safeIndices.Count == 0) { relSkipped++; continue; }
+                        if (safeIndices.Count == 0)
+                        {
+                            relSkipped++;
+                            // Single-literal clause with no behavioural hook: notify so the user
+                            // knows Phase 1r had nothing to filter. Tests for this clause come
+                            // straight from the base solve (Phase 1) and from BVA / repeats.
+                            if (verbose && clause.Count == 1)
+                                Console.WriteLine($"  Relevance {{{ci + 1}}}: skipped (single-literal clause; no modifies and no forall — nothing for behavioural relevance to check)");
+                            continue;
+                        }
                         var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}/Rel";
                         if (testCases.Count > 0 &&
                             await IsAlreadyCovered(clause, fullPreLits, new List<Expression>(), new List<string>(), testCases))

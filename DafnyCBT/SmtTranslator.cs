@@ -3989,12 +3989,24 @@ static class SmtTranslator
                 var inp = inputs.FirstOrDefault(v => v.Name == name);
                 if (inp.Name == null) continue;
                 var type = inp.Type;
-                if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
+                if (TypeUtils.IsArrayType(type))
                 {
-                    // Pre/post are encoded as (Seq T) variables: name_pre, name_post.
-                    var preSeq = name + "_pre";
-                    var postSeq = name + "_post";
-                    diffs.Add($"(not (= {preSeq} {postSeq}))");
+                    // For an array `a`: SmtTranslator emits BOTH:
+                    //   (declare-const a_pre Int) (declare-const a_post Int)   ; reference
+                    //   (assert (= a_pre a_post))                              ; same array
+                    //   (declare-const a_pre_seq (Seq Int))                    ; pre-state contents
+                    //   (declare-const a_post_seq (Seq Int))                   ; post-state contents
+                    // The references are equal by construction (same array, just at different
+                    // times). The OBSERVABLE modification lives in the *_seq variables. Asserting
+                    // (not (= a_pre a_post)) contradicts the reference-equality assertion and
+                    // makes the relevance query trivially UNSAT — which is exactly the bug we
+                    // hit on Clover_reverse before this fix.
+                    diffs.Add($"(not (= {name}_pre_seq {name}_post_seq))");
+                }
+                else if (TypeUtils.IsSeqType(type))
+                {
+                    // Seq params: pre/post are the (Seq T) variables themselves (no _seq suffix).
+                    diffs.Add($"(not (= {name}_pre {name}_post))");
                 }
                 else
                 {
