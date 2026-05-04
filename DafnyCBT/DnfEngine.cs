@@ -866,7 +866,22 @@ static class DnfEngine
             return SubstituteVarStringFallback(expr, boundVar.Name, replacement);
         var substMap = new Dictionary<IVariable, Expression> { { boundVar, replacement } };
         var subst = new Substituter(null, substMap, new Dictionary<TypeParameter, DafnyType>(), null, SystemModuleManager);
-        return subst.Substitute(expr);
+        try
+        {
+            return subst.Substitute(expr);
+        }
+        catch (System.NullReferenceException)
+        {
+            // The Dafny Substituter walks every Expression subtype and dereferences
+            // fields like `.Type` and `.Origin`. On partially-resolved trees — for
+            // instance, those that already contain LeafExpression nodes (our string-
+            // form synthetic literals) from a prior decomposition step, or sub-trees
+            // copied without `.Type` populated — those dereferences hit a null and
+            // throw. We can't preempt every case, so fall back to the string-based
+            // substitution (which produces a LeafExpression result and is correct,
+            // just less typed). Catching only NRE keeps real bugs visible.
+            return SubstituteVarStringFallback(expr, boundVar.Name, replacement);
+        }
     }
 
     /// <summary>Legacy string-based substitution; used only when SystemModuleManager
