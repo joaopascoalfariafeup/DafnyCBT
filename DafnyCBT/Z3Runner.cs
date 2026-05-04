@@ -5,7 +5,17 @@ namespace DafnyCBT;
 
 static class Z3Runner
 {
-    static readonly int Z3_TIMEOUT_MS = 5000; // 5 seconds per query
+    /// <summary>
+    /// Per-Z3-query timeout in milliseconds. Settable via the --z3-query-timeout
+    /// CLI option (Program.cs wires it at startup). Default of 2 s is enough for
+    /// the vast majority of queries (which finish in &lt;200 ms); only genuinely-hard
+    /// queries hit the limit, and those typically remain UNKNOWN at higher
+    /// timeouts too. A lower default keeps method-budget violations rare on
+    /// methods with many DNF clauses (e.g. MergeLoop's 15 clauses × 3 phase queries
+    /// each = 45 queries, which at the previous 5 s default could blow a 60 s
+    /// per-method budget after just 12 hard queries).
+    /// </summary>
+    internal static int Z3QueryTimeoutMs { get; set; } = 2000;
 
     /// <summary>
     /// Cached Z3 path, resolved once on first use.
@@ -17,7 +27,7 @@ static class Z3Runner
         var psi = new ProcessStartInfo
         {
             FileName = z3Path,
-            Arguments = $"-in -smt2 -model -t:{Z3_TIMEOUT_MS}",
+            Arguments = $"-in -smt2 -model -t:{Z3QueryTimeoutMs}",
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -44,7 +54,7 @@ static class Z3Runner
         var errTask = process.StandardError.ReadToEndAsync();
         var allDone = Task.WhenAll(outputTask, errTask);
 
-        if (await Task.WhenAny(allDone, Task.Delay(Z3_TIMEOUT_MS + 2000)) != allDone)
+        if (await Task.WhenAny(allDone, Task.Delay(Z3QueryTimeoutMs + 2000)) != allDone)
         {
             // Timeout: kill the process tree to unblock the read tasks
             try { process.Kill(entireProcessTree: true); } catch { }
