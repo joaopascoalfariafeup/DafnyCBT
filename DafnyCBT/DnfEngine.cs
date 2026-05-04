@@ -637,6 +637,57 @@ static class DnfEngine
     }
 
     /// <summary>
+    /// For a positive `forall bv :: range ==> P(bv)` with a single bound variable,
+    /// extract the canonical `lo {≤|&lt;} bv {&lt;|≤} hi` range and return its bounds
+    /// plus strictness flags. Returns null lo/hi when the forall isn't of this
+    /// shape. Used by SmtTranslator's relevance-phase "forall must have non-empty
+    /// range" constraint — Phase 1r should not pick witnesses where some forall
+    /// in the clause is vacuously true via empty range.
+    ///
+    /// Implementation reuses the same matching patterns as TryDecomposeQuantifierBody
+    /// (kept inline to avoid disturbing the working decomposition code).
+    /// </summary>
+    internal static (Expression? lo, Expression? hi, bool isStrictLo, bool isStrictHi)
+        TryExtractForallRange(ForallExpr forall)
+    {
+        if (forall.BoundVars.Count != 1) return (null, null, false, true);
+        var boundVar = forall.BoundVars[0];
+        var body = Unwrap(forall.Term);
+        Expression rangeExpr = body is BinaryExpr { Op: BinaryExpr.Opcode.Imp } imp ? imp.E0 : body;
+        var conjuncts = FlattenConjuncts(rangeExpr);
+        Expression? lo = null, hi = null;
+        bool isStrictLo = false, isStrictHi = true;
+        for (int i = 0; i < conjuncts.Count; i++)
+        {
+            var c = Unwrap(conjuncts[i]);
+            if (c is ChainingExpression chain
+                && chain.Operands.Count == 3 && chain.Operators.Count == 2
+                && ReferencesVar(chain.Operands[1], boundVar.Name)
+                && !ReferencesVar(chain.Operands[0], boundVar.Name)
+                && !ReferencesVar(chain.Operands[2], boundVar.Name))
+            {
+                if (chain.Operators[0] == BinaryExpr.Opcode.Le || chain.Operators[0] == BinaryExpr.Opcode.Lt)
+                { lo = chain.Operands[0]; isStrictLo = chain.Operators[0] == BinaryExpr.Opcode.Lt; }
+                if (chain.Operators[1] == BinaryExpr.Opcode.Lt || chain.Operators[1] == BinaryExpr.Opcode.Le)
+                { hi = chain.Operands[2]; isStrictHi = chain.Operators[1] == BinaryExpr.Opcode.Lt; }
+            }
+            if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Le } leq
+                && ReferencesVar(leq.E1, boundVar.Name) && !ReferencesVar(leq.E0, boundVar.Name))
+            { lo = leq.E0; isStrictLo = false; }
+            else if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Lt } ltLo
+                && ReferencesVar(ltLo.E1, boundVar.Name) && !ReferencesVar(ltLo.E0, boundVar.Name))
+            { lo = ltLo.E0; isStrictLo = true; }
+            if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Lt } lt
+                && ReferencesVar(lt.E0, boundVar.Name) && !ReferencesVar(lt.E1, boundVar.Name))
+            { hi = lt.E1; isStrictHi = true; }
+            else if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Le } leHi
+                && ReferencesVar(leHi.E0, boundVar.Name) && !ReferencesVar(leHi.E1, boundVar.Name))
+            { hi = leHi.E1; isStrictHi = false; }
+        }
+        return (lo, hi, isStrictLo, isStrictHi);
+    }
+
+    /// <summary>
     /// Core AST-based decomposition. Given a bound variable and a body expression,
     /// tries to match patterns like: lo <=|< k [&&|&& k] <|<= hi && property(k)
     /// and produces 4 boundary clauses with effective boundary values

@@ -89,6 +89,24 @@ static class SmtTranslator
     internal static HashSet<string> _translatedPreConditions = new();
 
     /// <summary>
+    /// Phase 1r "behavioural relevance" — when true, the relevance query asserts
+    /// that some `modifies`-listed object actually changes between pre and post.
+    /// Filters out witnesses where the impl is allowed to be a no-op
+    /// (e.g. reverse on a length-1 array). Default ON; set false via
+    /// --no-modification-relevance to recover the looser behaviour.
+    /// </summary>
+    internal static bool ModificationRelevance { get; set; } = true;
+
+    /// <summary>
+    /// Phase 1r "forall non-vacuity" — when true, the relevance query asserts
+    /// that every top-level `forall i :: lo <= i &lt; hi ==> P(i)` clause literal
+    /// has a non-empty range (`lo &lt; hi`). Filters out witnesses where some
+    /// forall in the clause is vacuously true via empty range. Default ON;
+    /// set false via --no-forall-relevance.
+    /// </summary>
+    internal static bool ForallNonVacuityRelevance { get; set; } = true;
+
+    /// <summary>
     /// Reset state that should not leak between methods (e.g. _translatedPreConditions,
     /// which accumulates across the multiple SMT queries of one method but should not
     /// carry over to the next method, since identical precondition strings on different
@@ -3935,6 +3953,101 @@ static class SmtTranslator
     // ─────────────── Phase 1r: per-literal relevance check ───────────────
 
     /// <summary>
+    /// Emit "behavioural relevance" constraints into the Phase 1r query: assertions
+    /// that filter out witnesses where the test would be impotent — either the impl
+    /// is allowed to be a no-op (modifies-relevance) or some forall in the clause
+    /// has a vacuously-empty range (forall non-vacuity).
+    ///
+    /// Both checks are gated by their respective flags (ModificationRelevance and
+    /// ForallNonVacuityRelevance). Disabling them recovers the legacy behaviour.
+    ///
+    /// Called from BuildRelevanceQuery and BuildGroupRelevanceQuery just before
+    /// the final `(check-sat)`. Constraints reference the BASE outs (not the
+    /// shadow `outs_alt{idx}` blocks) — same inputs, same base outs, so an empty
+    /// range on the inputs would make every shadow vacuous too; the base check
+    /// is sufficient.
+    /// </summary>
+    internal static void EmitBehaviouralRelevanceConstraints(
+        System.Text.StringBuilder sb,
+        List<(string Name, string Type)> inputs,
+        List<(string Name, string Type)> outputs,
+        List<Expression> postLiterals,
+        HashSet<string> mutableNames)
+    {
+        // (1) Modification relevance: at least one mutable input/output differs
+        // between pre- and post-state. Skips length-1 reverse, no-op Set.add(x),
+        // etc. — tests where the impl could legitimately do nothing and the
+        // postcondition would still hold trivially.
+        if (ModificationRelevance && mutableNames.Count > 0)
+        {
+            var diffs = new List<string>();
+            foreach (var name in mutableNames)
+            {
+                // Find the type from inputs (mutable params) or class fields.
+                // For now handle the array-param case (most common); class-field
+                // mutability uses the same _pre/_post split.
+                var inp = inputs.FirstOrDefault(v => v.Name == name);
+                if (inp.Name == null) continue;
+                var type = inp.Type;
+                if (TypeUtils.IsArrayType(type) || TypeUtils.IsSeqType(type))
+                {
+                    // Pre/post are encoded as (Seq T) variables: name_pre, name_post.
+                    var preSeq = name + "_pre";
+                    var postSeq = name + "_post";
+                    diffs.Add($"(not (= {preSeq} {postSeq}))");
+                }
+                else
+                {
+                    // Scalar mutable: name_pre vs name_post.
+                    diffs.Add($"(not (= {name}_pre {name}_post))");
+                }
+            }
+            if (diffs.Count > 0)
+            {
+                var clause = diffs.Count == 1 ? diffs[0] : $"(or {string.Join(" ", diffs)})";
+                sb.AppendLine();
+                sb.AppendLine("; ─── Phase 1r: behavioural relevance — some modifies-listed value must change ───");
+                sb.AppendLine($"(assert {clause})");
+            }
+        }
+
+        // (2) Forall non-vacuity: every top-level forall literal in the clause
+        // must have a non-empty range. Skips length-0 array witnesses where a
+        // `forall i :: 0 <= i < a.Length ==> P(i)` is vacuously true.
+        if (ForallNonVacuityRelevance)
+        {
+            var rangeAsserts = new List<string>();
+            var inputsAndOutputs = inputs.Concat(outputs).ToList();
+            foreach (var lit in postLiterals)
+            {
+                var unwrapped = UnwrapExpr(lit);
+                if (unwrapped is not ForallExpr forall) continue;
+                var (lo, hi, isStrictLo, isStrictHi) = DnfEngine.TryExtractForallRange(forall);
+                if (lo == null || hi == null) continue;
+                ResetExprToSmtBudget();
+                var loSmt = ExprToSmt(lo, inputsAndOutputs, mutableNames, isPostContext: false);
+                var hiSmt = ExprToSmt(hi, inputsAndOutputs, mutableNames, isPostContext: false);
+                if (loSmt == null || hiSmt == null) continue;
+                // Pick comparator based on strictness: range non-empty iff
+                //   `lo <= i < hi` (default):           lo < hi
+                //   `lo < i < hi`  (strict lo):         lo + 1 < hi  ⇔  lo < hi (still works for ints)
+                //   `lo <= i <= hi`:                    lo <= hi
+                //   `lo < i <= hi`:                     lo < hi
+                var op = (!isStrictLo && !isStrictHi) ? "<=" : "<";
+                rangeAsserts.Add($"({op} {loSmt} {hiSmt})");
+            }
+            if (rangeAsserts.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("; ─── Phase 1r: forall non-vacuity — every clause forall has a non-empty range ───");
+                foreach (var a in rangeAsserts)
+                    sb.AppendLine($"(assert {a})");
+            }
+        }
+    }
+
+
+    /// <summary>
     /// Builds an SMT query that proves the LAST literal of a clause is relevant
     /// (strictly prunes solutions). Asks for (ins, outs1, outs2) such that:
     ///   pre(ins) ∧ Q1..Qm(ins, outs1) ∧ Q1..¬Qm(ins, outs2) ∧ outs1 ≠ outs2
@@ -4049,6 +4162,8 @@ static class SmtTranslator
             if (ineq == null) return null;
             sb.AppendLine(ineq);
         }
+
+        EmitBehaviouralRelevanceConstraints(sb, inputs, outputs, postLiterals, mutableNames);
 
         sb.AppendLine();
         sb.AppendLine("(check-sat)");
@@ -4171,6 +4286,8 @@ static class SmtTranslator
         var ineq = BuildOutputInequalityClause(inputs, outputs, mutableNames, suffix);
         if (ineq == null) return null;
         sb.AppendLine(ineq);
+
+        EmitBehaviouralRelevanceConstraints(sb, inputs, outputs, postLiterals, mutableNames);
 
         sb.AppendLine();
         sb.AppendLine("(check-sat)");
