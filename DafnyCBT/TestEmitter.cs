@@ -1539,20 +1539,30 @@ static class TestEmitter
                         }
                     }
                 }
-                // Skip PRE-CHECK if the expression cannot be evaluated at runtime:
-                //   1. References a `ghost predicate` / `ghost function` — Dafny rejects
-                //      `if !(ghost-expr) { return; }` (the rewritten form) with
-                //      "return statement is not allowed in this context, because it is
-                //      guarded by a specification-only expression".
-                //   2. Uses an unbounded `exists`/`forall` over `int` (or otherwise
-                //      lacks an obvious finite bound) — also a specification-only expression.
-                bool refsGhostFn = SmtTranslator._ghostFunctions
-                    .Any(g => Regex.IsMatch(preStr, @"(?<![a-zA-Z_0-9.])" + Regex.Escape(g) + @"(?=\s*\()"));
+                // Skip PRE-CHECK only when the precondition's surface form contains an
+                // unbounded `exists`/`forall` over `int` (or otherwise lacks an obvious
+                // finite bound). Such expressions are specification-only and Dafny
+                // rejects `if !(spec-only) { return; }` with "return statement is not
+                // allowed in this context, because it is guarded by a specification-only
+                // expression".
+                //
+                // We do NOT skip for references to user-declared ghost predicates: the
+                // test source has `ghost` stripped from `ghost predicate`/`ghost function`
+                // declarations (see top of EmitDafnyTests), so they are runtime-callable
+                // in the emitted test even when their AST flag IsGhost was set. (Earlier
+                // we conservatively skipped these too, but that suppressed PRE-CHECK for
+                // perfectly compilable predicates like InvSubSet, leaving tests that ran
+                // without their preconditions verified — and reported as spurious-FAILING
+                // when the impl produced outputs only valid for an actual pre-state.)
+                //
+                // If a stripped predicate's body still contains an unbounded quantifier
+                // (so it can't actually be compiled), the emitted `expect` will fail at
+                // build time and the test will be classified as syntax/type error — same
+                // outcome as today's silent skip, but with the diagnostic visible.
                 bool hasQuantifier = Regex.IsMatch(preStr, @"\b(exists|forall)\b");
-                if (refsGhostFn || hasQuantifier)
+                if (hasQuantifier)
                 {
-                    var reason = refsGhostFn ? "uses ghost predicate" : "uses unbounded quantifier";
-                    sb.AppendLine($"    // PRE-CHECK skipped ({reason}, not runtime-evaluable): {preStr}");
+                    sb.AppendLine($"    // PRE-CHECK skipped (uses unbounded quantifier, not runtime-evaluable): {preStr}");
                 }
                 else
                 {
