@@ -183,7 +183,12 @@ static class BoundaryAnalysis
 
     /// <summary>
     /// Phase 3 single-fault categorical tiers for one variable.
-    /// Type-based defaults: nat/int 0/1/&gt;=2, seq/set size 0/1/&gt;=2, enum per-ctor, bool true/false.
+    /// Type-based defaults: nat/T 0/1/2/&gt;=3, seq/set/multiset/map size 0/1/2/&gt;=3,
+    /// int positive/zero/negative, enum per-ctor, bool true/false.
+    /// The 4-way split for size-bearing types (was 3-way: 0/1/&gt;=2) separates the
+    /// smallest non-trivial case (=2 — single swap, single iteration) from the
+    /// general case (&gt;=3 — non-trivial loop body, fixed midpoint), which often
+    /// exercises distinct code paths in algorithms like reverse, sort, search.
     /// Dedupe-key (dafnyKey) used by caller to prune against clause literals.
     /// Input vs output handled via smtName (caller supplies; kind only affects mutable-post naming).
     /// </summary>
@@ -193,8 +198,13 @@ static class BoundaryAnalysis
             List<string> classLiterals,
             HashSet<string> mutableNames,
             Dictionary<string, List<string>>? enumDatatypes,
-            VarKind kind)
+            VarKind kind,
+            int tierCount = 4)
     {
+        // Size-bearing types emit `tierCount` tiers: =0, =1, ..., =tierCount-2, >=tierCount-1.
+        // Default 4 (matches --tiers 4 default): =0, =1, =2, >=3.
+        // For sign-based int and bool/enum types, tierCount has no effect.
+        if (tierCount < 2) tierCount = 2;
         var result = new List<(string, List<string>, string?)>();
         // Mutable inputs use _pre suffix for the pre-state SMT name.
         string smtScalar = kind == VarKind.MutablePost ? $"{varName}_post"
@@ -203,9 +213,10 @@ static class BoundaryAnalysis
 
         if (varType == "nat" || varType == "T")
         {
-            result.Add(($"{varName}=0", new List<string> { $"(= {smtScalar} 0)" }, $"{varName} == 0"));
-            result.Add(($"{varName}=1", new List<string> { $"(= {smtScalar} 1)" }, $"{varName} == 1"));
-            result.Add(($"{varName}>=2", new List<string> { $"(>= {smtScalar} 2)" }, $"{varName} >= 2"));
+            for (int v = 0; v < tierCount - 1; v++)
+                result.Add(($"{varName}={v}", new List<string> { $"(= {smtScalar} {v})" }, $"{varName} == {v}"));
+            int lastV = tierCount - 1;
+            result.Add(($"{varName}>={lastV}", new List<string> { $"(>= {smtScalar} {lastV})" }, $"{varName} >= {lastV}"));
         }
         else if (varType == "int")
         {
@@ -234,17 +245,19 @@ static class BoundaryAnalysis
             var smtBase = (kind == VarKind.Input && mutableNames.Contains(varName)) ? $"{varName}_pre"
                 : (kind == VarKind.MutablePost) ? $"{varName}_post" : varName;
             var smtSeq = TypeUtils.SeqSmtName(smtBase, varType);
-            result.Add(($"|{varName}|=0", new List<string> { $"(= (seq.len {smtSeq}) 0)" }, $"|{varName}| == 0"));
-            result.Add(($"|{varName}|=1", new List<string> { $"(= (seq.len {smtSeq}) 1)" }, $"|{varName}| == 1"));
-            result.Add(($"|{varName}|>=2", new List<string> { $"(>= (seq.len {smtSeq}) 2)" }, $"|{varName}| >= 2"));
+            for (int sz = 0; sz < tierCount - 1; sz++)
+                result.Add(($"|{varName}|={sz}", new List<string> { $"(= (seq.len {smtSeq}) {sz})" }, $"|{varName}| == {sz}"));
+            int lastSz = tierCount - 1;
+            result.Add(($"|{varName}|>={lastSz}", new List<string> { $"(>= (seq.len {smtSeq}) {lastSz})" }, $"|{varName}| >= {lastSz}"));
         }
         else if (TypeUtils.IsSetType(varType) || TypeUtils.IsMultisetType(varType) || TypeUtils.IsMapType(varType))
         {
             var smtBase = (kind == VarKind.Input && mutableNames.Contains(varName)) ? $"{varName}_pre"
                 : (kind == VarKind.MutablePost) ? $"{varName}_post" : varName;
-            result.Add(($"|{varName}|=0", new List<string> { $"(= {smtBase}_card 0)" }, $"|{varName}| == 0"));
-            result.Add(($"|{varName}|=1", new List<string> { $"(= {smtBase}_card 1)" }, $"|{varName}| == 1"));
-            result.Add(($"|{varName}|>=2", new List<string> { $"(>= {smtBase}_card 2)" }, $"|{varName}| >= 2"));
+            for (int sz = 0; sz < tierCount - 1; sz++)
+                result.Add(($"|{varName}|={sz}", new List<string> { $"(= {smtBase}_card {sz})" }, $"|{varName}| == {sz}"));
+            int lastSz = tierCount - 1;
+            result.Add(($"|{varName}|>={lastSz}", new List<string> { $"(>= {smtBase}_card {lastSz})" }, $"|{varName}| >= {lastSz}"));
         }
         return result;
     }

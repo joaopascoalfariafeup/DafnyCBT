@@ -1985,7 +1985,7 @@ class Program
                     void EmitCats(string vname, string vtype, BoundaryAnalysis.VarKind kind)
                     {
                         var tiers = BoundaryAnalysis.ComputeCategoricalTiers(
-                            vname, vtype, classLits, mutableNames, enumDatatypes, kind);
+                            vname, vtype, classLits, mutableNames, enumDatatypes, kind, tierCount);
                         foreach (var (tlabel, tconstraints, dkey) in tiers)
                         {
                             var key = $"{pi}|{ci}|{tlabel}";
@@ -3082,99 +3082,148 @@ class Program
 
             if (testCases.Count < minTests && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
             {
-                // --- Phase 3: repeats ---
-                int effectiveRepeat = Math.Max(3, (int)Math.Ceiling((double)minTests / Math.Max(testCases.Count, 1)));
-                Console.WriteLine($"  Phase 3: repeats (up to {effectiveRepeat} per condition)");
+                // --- Phase 3: round-robin repeats ---
+                // Iterate every distinct ScheduleEntry that produced a test in original
+                // schedule order (Phase 1r/Rel first, then Phase 2 BVA, then Phase 2b
+                // tiers). Each base keeps its full label and extras: round-robin tries
+                // one repeat per base per round; bases that return plain UNSAT are
+                // dropped permanently. Singleton tiers (|a|=0, /B<value>) self-eliminate
+                // on the first round at the cost of one Z3 query each.
+                Console.WriteLine($"  Phase 3: round-robin repeats (target {minTests} tests)");
 
-                var baseConditions = new List<(string baseLabel, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, List<string> baseExtras, string baseKey)>();
-                var seenBaseKeys = new HashSet<string>();
+                // Match schedule entries to the tests they produced (by exact label).
+                // Dedupe by label — schedule entries can collide on label across pi
+                // (precondition combinations) and we only want one base per label.
+                var emittedLabels = new HashSet<string>(testCases.Select(tc => tc.label));
+                var bases = new List<(string label, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, List<string> extras, string baseKey)>();
+                var seenBaseLabels = new HashSet<string>();
                 foreach (var (label, literals, preLits, exclusions, extras, _, _) in testSchedule)
                 {
+                    if (!emittedLabels.Contains(label)) continue;
+                    if (!seenBaseLabels.Add(label)) continue;
                     var baseKey = ScheduleKey(literals, exclusions, preLits);
-                    if (seenBaseKeys.Add(baseKey))
-                    {
-                        var baseLabel = label.Contains("/B") ? label.Substring(0, label.IndexOf("/B")) : label;
-                        // Preserve tier extras (e.g. |a|>=2) but drop boundary-variant
-                        // extras: if the label contained /B, those extras are boundary
-                        // pins that must not propagate into repeats (they'd fix one
-                        // value, defeating the repeat's diversity purpose).
-                        var baseExtras = label.Contains("/B") ? new List<string>() : new List<string>(extras);
-                        baseConditions.Add((baseLabel, literals, preLits, exclusions, baseExtras, baseKey));
-                    }
+                    bases.Add((label, literals, preLits, exclusions, new List<string>(extras), baseKey));
+                }
+                // Phase 1r writes /Rel tests directly to testCases without a matching
+                // schedule entry. Add them as bases too — the relevance context is
+                // keyed by baseKey, so we look it up via ScheduleKey on the schedule's
+                // (now-skipped) Phase 1 fallback entry, or via a synthetic entry built
+                // from the relevance context itself.
+                foreach (var (lbl, _, lits) in testCases)
+                {
+                    if (!lbl.EndsWith("/Rel")) continue;
+                    if (!seenBaseLabels.Add(lbl)) continue;
+                    // Find the matching schedule entry (the Phase 1 plain entry that was
+                    // skipped because /Rel covered it) by extracting the clause prefix.
+                    var clausePrefix = lbl.Substring(0, lbl.LastIndexOf("/Rel"));
+                    var schedMatch = testSchedule.FirstOrDefault(e => e.label == clausePrefix || e.label.StartsWith(clausePrefix + "/"));
+                    if (schedMatch.literals == null) continue;
+                    var baseKey = ScheduleKey(schedMatch.literals, schedMatch.exclusions, schedMatch.preLiterals);
+                    bases.Add((lbl, schedMatch.literals, schedMatch.preLiterals, schedMatch.exclusions, new List<string>(), baseKey));
                 }
 
-                foreach (var (baseLabel, literals, preLits, exclusions, baseExtras, baseKey) in baseConditions)
+                if (bases.Count == 0)
                 {
-                    if (testCases.Count >= minTests || TimedOut()) break;
-                    if (maxTests > 0 && testCases.Count >= maxTests) break;
-                    var inputExclusions = baseConditionExclusions.ContainsKey(baseKey)
-                        ? baseConditionExclusions[baseKey] : new List<string>();
-                    int found = inputExclusions.Count;
-                    // Repeat budget per base: at least (effectiveRepeat - found) more, plus enough
-                    // to reach minTests overall when prior phases emitted tier solutions that
-                    // filled `found` but left the global total short.
-                    int shortfall = Math.Max(0, minTests - testCases.Count);
-                    int needed = Math.Max(effectiveRepeat - found, shortfall);
+                    Console.WriteLine($"  Phase 3 complete: {testCases.Count} test(s) (no candidate bases)");
+                }
+                else
+                {
+                    // Per-base mutable state.
+                    var perBaseExclusions = bases.ToDictionary(b => b.label, b => new List<string>(
+                        baseConditionExclusions.TryGetValue(b.baseKey, out var prior) ? prior : Enumerable.Empty<string>()));
+                    var perBaseRoundIdx = bases.ToDictionary(b => b.label, b => 0);
+                    var perBaseRelExhausted = bases.ToDictionary(b => b.label, b => false);
 
-                    // If a relevance witness was registered for this clause, every other
-                    // repeat is issued as a /Rel-style query (same safeIndices + mode as
-                    // Phase 1r, plus the accumulating input-exclusion). Genuine relevance
-                    // witnesses, not plain SAT repeats — addresses the /Rel/R* labelling
-                    // problem and the diversity loss when Phase 3 picks trivial models.
-                    bool hasRelContext = relevanceContextByBaseKey.TryGetValue(baseKey, out var relCtx);
-                    bool relExhausted = false;  // set when a /Rel-style query returns UNSAT/UNKNOWN
-
-                    for (int rep = 0; rep < needed; rep++)
+                    // Cross-base input deduplication. A SAT result whose input fingerprint
+                    // matches an already-seen test is NOT added; instead, the duplicate's
+                    // input is pushed onto the base's exclusion list to force a different
+                    // witness next round. Bases that keep producing duplicates eventually
+                    // hit UNSAT and drop naturally. Loop terminates on unique count, not
+                    // raw count — this is the "continue after dedup" behavior.
+                    var seenInputs = new HashSet<string>();
+                    foreach (var (_, vals, _) in testCases)
                     {
-                        if (testCases.Count >= minTests || TimedOut()) break;
+                        var fp = BuildInputExclusion(vals);
+                        if (fp != null) seenInputs.Add(fp);
+                    }
+
+                    var active = new List<string>(bases.Select(b => b.label));
+                    while (active.Count > 0 && testCases.Count < minTests && !TimedOut())
+                    {
                         if (maxTests > 0 && testCases.Count >= maxTests) break;
-                        bool useRel = hasRelContext && !relExhausted && (rep % 2 == 1);
-                        var repLabel = useRel
-                            ? $"{relCtx.ClauseLabel}/R{found + rep + 1}"
-                            : $"{baseLabel}/R{found + rep + 1}";
-                        Dictionary<string, string>? repValues = null;
-                        if (useRel)
+                        var nextActive = new List<string>();
+                        foreach (var label in active)
                         {
-                            // /Rel-style repeat: re-issue the relevance query with
-                            // accumulating input-exclusion. Use the same mode (ladder
-                            // collapses to combined here — no fallback path; if combined
-                            // fails, mark exhausted and let plain repeats fill the rest).
-                            var smt = relCtx.Mode == "group"
-                                ? SmtTranslator.BuildGroupRelevanceQuery(
-                                    inputs, outputs, relCtx.FullPreLits, relCtx.Clause,
-                                    method, mutableNames, relCtx.SafeIndices, inputExclusions)
-                                : SmtTranslator.BuildRelevanceQuery(
-                                    inputs, outputs, relCtx.FullPreLits, relCtx.Clause,
-                                    method, mutableNames, relCtx.SafeIndices, inputExclusions);
-                            if (string.IsNullOrEmpty(smt)) { relExhausted = true; rep--; continue; }
-                            if (verbose) Console.WriteLine($"  Solving {repLabel} (relevance-style)...");
-                            var z3Result = await Z3Runner.RunZ3(z3Path, smt);
-                            var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
-                            if (lines.Any(l => l == "sat"))
+                            if (testCases.Count >= minTests || TimedOut()) break;
+                            if (maxTests > 0 && testCases.Count >= maxTests) { nextActive.Add(label); continue; }
+
+                            var b = bases.First(x => x.label == label);
+                            var inputExclusions = perBaseExclusions[label];
+                            int rep = perBaseRoundIdx[label]++;
+                            bool hasRel = relevanceContextByBaseKey.TryGetValue(b.baseKey, out var relCtx);
+                            bool useRel = hasRel && !perBaseRelExhausted[label] && (rep % 2 == 1);
+                            // Avoid awkward /Rel/Rel suffix when the base label itself ends in /Rel.
+                            var relSuffix = b.label.EndsWith("/Rel") ? "" : "/Rel";
+                            var repLabel = useRel
+                                ? $"{b.label}{relSuffix}/R{inputExclusions.Count + 1}"
+                                : $"{b.label}/R{inputExclusions.Count + 1}";
+
+                            Dictionary<string, string>? repValues = null;
+                            if (useRel)
                             {
-                                repValues = TypeUtils.ParseZ3Model(z3Result, allVars);
-                                if (repValues.Count == 0) repValues = null;
+                                var smt = relCtx!.Mode == "group"
+                                    ? SmtTranslator.BuildGroupRelevanceQuery(
+                                        inputs, outputs, relCtx.FullPreLits, relCtx.Clause,
+                                        method, mutableNames, relCtx.SafeIndices, inputExclusions)
+                                    : SmtTranslator.BuildRelevanceQuery(
+                                        inputs, outputs, relCtx.FullPreLits, relCtx.Clause,
+                                        method, mutableNames, relCtx.SafeIndices, inputExclusions);
+                                if (string.IsNullOrEmpty(smt))
+                                {
+                                    perBaseRelExhausted[label] = true;
+                                    nextActive.Add(label); continue;
+                                }
+                                if (verbose) Console.WriteLine($"  Solving {repLabel} (relevance-style)...");
+                                var z3Result = await Z3Runner.RunZ3(z3Path, smt);
+                                var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
+                                if (lines.Any(l => l == "sat"))
+                                {
+                                    repValues = TypeUtils.ParseZ3Model(z3Result, allVars);
+                                    if (repValues.Count == 0) repValues = null;
+                                }
+                                else
+                                {
+                                    perBaseRelExhausted[label] = true;
+                                    if (verbose) Console.WriteLine($"  {repLabel}: {(lines.Any(l => l == "unsat") ? "UNSAT" : "UNKNOWN")} — will try plain next round");
+                                    nextActive.Add(label); continue;  // /Rel UNSAT doesn't drop the base
+                                }
                             }
                             else
                             {
-                                relExhausted = true;
-                                if (verbose) Console.WriteLine($"  {repLabel}: {(lines.Any(l => l == "unsat") ? "UNSAT" : "UNKNOWN")} — falling back to plain repeats");
-                                rep--; continue;  // retry this slot as plain
+                                var combinedExtras = new List<string>(b.extras);
+                                combinedExtras.AddRange(inputExclusions);
+                                (repValues, _) = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, b.literals, b.preLits, b.exclusions, combinedExtras);
                             }
+
+                            if (repValues != null)
+                            {
+                                var fp = BuildInputExclusion(repValues);
+                                if (fp != null && !seenInputs.Add(fp))
+                                {
+                                    // Duplicate input across bases. Don't add; push exclusion
+                                    // so this base picks a different witness next round.
+                                    inputExclusions.Add(fp);
+                                    if (verbose) Console.WriteLine($"  {repLabel}: duplicate input — retry next round with stricter exclusion");
+                                    nextActive.Add(label);
+                                    continue;
+                                }
+                                testCases.Add((repLabel, repValues, b.literals));
+                                if (fp != null) inputExclusions.Add(fp);
+                                nextActive.Add(label);  // base survives; another round
+                            }
+                            // else: plain UNSAT (or /Rel that produced no values) → drop the base
                         }
-                        else
-                        {
-                            var combinedExtras = new List<string>(baseExtras);
-                            combinedExtras.AddRange(inputExclusions);
-                            (repValues, _) = await SolveOne(repLabel, testSchedule.Count, testSchedule.Count, literals, preLits, exclusions, combinedExtras);
-                        }
-                        if (repValues != null)
-                        {
-                            testCases.Add((repLabel, repValues, literals));
-                            var excl = BuildInputExclusion(repValues);
-                            if (excl != null) inputExclusions.Add(excl);
-                        }
-                        else if (!useRel) break;  // plain repeats stop on UNSAT; relExhausted handled above
+                        active = nextActive;
                     }
                 }
                 if (!verbose) Console.Write("\r                          \r");
