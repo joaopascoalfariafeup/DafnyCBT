@@ -73,9 +73,16 @@ class Program
         noRelevanceOpt.AddAlias("-nr");
         var vacuityOpt = new Option<bool>("--vacuity", "Enable per-literal vacuity check (Phase 1v). For each safe candidate Q_k, try isolated mode first (find ins where Q_k is vacuous AND every other Q_j is non-vacuous → /Vik label) and fall back to non-isolated (Q_k vacuous but other Q_j may also be → /Vk label) when isolated is infeasible. Note: independently of this flag, every emitted test gets per-Q vacuity annotations (// VACUOUSLY TRUE) via a post-phase scan. Default: OFF.");
         vacuityOpt.AddAlias("-v1v");
+        var existsDecompOpt = new Option<bool>("--exists-decomposition",
+            "Enable decomposition of single-variable existential quantifiers (and negated foralls) into two mutually-exclusive DNF clauses: (A) the first element satisfies the predicate; (B) the first does NOT satisfy and some k > lo does. Mirrors the standard `A || B` ↦ `A`, `!A ∧ B` rule. Default: OFF — the quantifier stays as a single literal in the DNF clause.");
+        existsDecompOpt.AddAlias("-ed");
+        // Legacy alias kept so existing scripts using --no-exists-decomposition / -ned
+        // don't break. It is now a no-op (decomposition is OFF by default), included
+        // only to avoid CLI parse errors.
         var noExistsDecompOpt = new Option<bool>("--no-exists-decomposition",
-            "Disable decomposition of single-variable existential quantifiers (and negated foralls) into left-boundary / middle-range / right-boundary cases. The quantifier is kept as a single literal in the DNF clause. Default: decomposition ON.");
+            "Deprecated. Decomposition is now OFF by default; this flag is a no-op. Use --exists-decomposition / -ed to enable the new 2-way split.");
         noExistsDecompOpt.AddAlias("-ned");
+        noExistsDecompOpt.IsHidden = true;
         var reverseBvaOrderOpt = new Option<bool>("--reverse-bva-order",
             "Run Phase 2b (categorical type/size coverage) before Phase 2 (refined-range BVA) instead of after. Default order is 2 → 2b. When reversed, Phase 2's per-clause dedup against Phase 2b keys is dropped; subsumption at solve-time still skips redundant entries. Useful for kill-curve ablation experiments.");
         reverseBvaOrderOpt.AddAlias("-rbva");
@@ -94,7 +101,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, vacuityOpt, noExistsDecompOpt, reverseBvaOrderOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, vacuityOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -135,9 +142,9 @@ class Program
             VacuityCheckEnabled = ctx.ParseResult.GetValueForOption(vacuityOpt);
             if (VacuityCheckEnabled)
                 Console.WriteLine($"[DafnyCBT] Vacuity check (Phase 1v): ON (isolated with non-isolated fallback)");
-            DnfEngine.DecomposeQuantifiers = !ctx.ParseResult.GetValueForOption(noExistsDecompOpt);
-            if (!DnfEngine.DecomposeQuantifiers)
-                Console.WriteLine("[DafnyCBT] Existential quantifier decomposition: OFF");
+            DnfEngine.DecomposeQuantifiers = ctx.ParseResult.GetValueForOption(existsDecompOpt);
+            if (DnfEngine.DecomposeQuantifiers)
+                Console.WriteLine("[DafnyCBT] Existential quantifier decomposition: ON (2-way mutually-exclusive split)");
             ReverseBvaOrder = ctx.ParseResult.GetValueForOption(reverseBvaOrderOpt);
             if (ReverseBvaOrder)
                 Console.WriteLine("[DafnyCBT] BVA order: Phase 2b → Phase 2 (reversed)");

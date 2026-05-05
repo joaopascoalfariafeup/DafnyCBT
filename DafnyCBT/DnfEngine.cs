@@ -17,7 +17,7 @@ static class DnfEngine
     /// of forall quantifiers) are kept as a single literal instead of being split
     /// into left-boundary / middle-range / right-boundary cases. Used for ablation
     /// experiments measuring the contribution of quantifier decomposition.</summary>
-    internal static bool DecomposeQuantifiers { get; set; } = true;
+    internal static bool DecomposeQuantifiers { get; set; } = false;
 
     /// <summary>
     /// Set by Program.cs after parsing. Required by the Dafny Substituter base
@@ -594,10 +594,14 @@ static class DnfEngine
     // ───────── quantifier decomposition (AST-based) ─────────
 
     /// <summary>
-    /// Try to decompose an exists quantifier into boundary cases at AST level.
+    /// Try to decompose an exists quantifier into mutually-exclusive cases at AST level.
     /// Pattern: exists k :: lo <=|< k <|<= hi && body(k)
-    /// Computes effective boundaries (adjusting for strict inequalities) and produces
-    /// 3 DNF clauses: body[k/effLo], exists k :: effLo+1 <= k < effHi && body, body[k/effHi]
+    /// Produces 2 mutually-exclusive DNF clauses, mirroring the standard `A || B` rule
+    /// (`A`, `!A ∧ B`):
+    ///   A: body[k/effLo]                                                  (first satisfies)
+    ///   B: !body[k/effLo] ∧ exists k :: effLo+1 <= k <= effHi && body     (first doesn't, some k > effLo does)
+    /// The right-boundary case from the older 3-way split is absorbed into B's range —
+    /// in practice it rarely produced a different witness from the left-boundary case.
     /// </summary>
     static List<List<Expression>>? TryDecomposeExists(ExistsExpr existsExpr)
     {
@@ -820,31 +824,31 @@ static class DnfEngine
         var effectiveLo = isStrictLo ? MakeAdd(lo, 1) : lo;
         var effectiveHi = isStrictHi ? MakeSub(hi, 1) : hi;
 
-        // Guard: effectiveLo <= effectiveHi ensures the range is non-empty.
-        // Constructed as a BinaryExpr (AST) rather than a LeafExpression so the
-        // SMT path handles it via the typed BinaryExpr branch.
-        var rangeGuard = (Expression)new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Le, effectiveLo, effectiveHi);
+        // Range guards built as typed BinaryExprs so the SMT path handles them via
+        // the typed BinaryExpr branch (no LeafExpression fallback).
+        //   aGuard:  effectiveLo <= effectiveHi                  (range non-empty — at least one element)
+        //   bGuard:  effectiveLo + 1 <= effectiveHi              (at least two elements — needed so some k > lo exists)
+        var aGuard = (Expression)new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Le, effectiveLo, effectiveHi);
+        var afterLo = MakeAdd(effectiveLo, 1);
+        var bGuard = (Expression)new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Le, afterLo, effectiveHi);
 
-        // Clause 1 (left boundary): property[k := effectiveLo]
+        // Clause A (first satisfies): property[k := effectiveLo]
         var leftProp = SubstituteVar(property, boundVar, effectiveLo);
 
-        // Clause 2 (middle): exists with narrowed range excluding both boundaries
-        // Range: effectiveLo+1 <= k < effectiveHi (i.e., effectiveLo+1 .. effectiveHi-1 inclusive)
-        // Still emitted as a LeafExpression — constructing a fully-typed ExistsExpr
-        // here is more invasive (requires re-resolution of a synthetic bound var),
-        // so this one stays string-form. The SMT translator's fallback handles it.
-        var middleLo = MakeAdd(effectiveLo, 1);
-        var middleStr = $"exists {boundVar.Name} :: {ExprToString(middleLo)} <= {boundVar.Name} < {ExprToString(effectiveHi)} && {ExprToString(property)}";
-        var middleExpr = ParseToLeafExpression(middleStr);
-
-        // Clause 3 (right boundary): property[k := effectiveHi]
-        var rightProp = SubstituteVar(property, boundVar, effectiveHi);
+        // Clause B (first doesn't, some k > lo does):
+        //   !property[k := effectiveLo]   (mutual-exclusion with A)
+        //   ∧ exists k :: effectiveLo+1 <= k <= effectiveHi && property
+        // The existential is emitted as a LeafExpression — constructing a fully-typed
+        // ExistsExpr here would require re-resolution of a synthetic bound var; the
+        // SMT translator's string-form fallback handles it.
+        var notLeftProp = Negate(leftProp);
+        var bExistsStr = $"exists {boundVar.Name} :: {ExprToString(afterLo)} <= {boundVar.Name} <= {ExprToString(effectiveHi)} && {ExprToString(property)}";
+        var bExistsExpr = ParseToLeafExpression(bExistsStr);
 
         var clauses = new List<List<Expression>>
         {
-            new List<Expression> { rangeGuard, leftProp },
-            new List<Expression> { middleExpr },
-            new List<Expression> { rangeGuard, rightProp },
+            new List<Expression> { aGuard, leftProp },
+            new List<Expression> { bGuard, notLeftProp, bExistsExpr },
         };
 
         return clauses;
