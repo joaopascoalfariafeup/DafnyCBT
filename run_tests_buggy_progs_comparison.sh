@@ -34,14 +34,15 @@ run() {
     $BIN $IN -o "$out" $COMMON $extra >& "$log"
 }
 
-run full         "--vacuity"
-run no_bias_no_vacuity      "--no-bias"
-run no_relevance_no_vacuity "--no-relevance"
+#run full         "--vacuity"
 run no_vacuity   ""
-run baseline     "--no-bias --no-relevance"
-#run reverse_bva                  "--vacuity --reverse-bva-order"   # full + reorder
 #run reverse_bva_no_vacuity       "--reverse-bva-order"             # no_vacuity + reorder
-#run no_exists_decomp_no_vacuity "--no-exists-decomposition"
+#run reverse_bva                  "--vacuity --reverse-bva-order"   # full + reorder
+#run no_bias_no_vacuity      "--no-bias"
+#run no_relevance_no_vacuity "--no-relevance"
+#run baseline     "--no-bias --no-relevance"
+
+run exists_decomp_no_vacuity "--exists-decomposition"
 
 echo "[$(date +%H:%M:%S)] done. Logs:"
 ls -la "${LOG_BASE}"_{full,no_bias,no_relevance,no_vacuity,baseline}_log.txt
