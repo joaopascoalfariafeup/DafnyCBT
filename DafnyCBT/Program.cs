@@ -2414,6 +2414,39 @@ class Program
             return $"(not {conjunction})";
         }
 
+        // For a Phase-3 base whose label is an open-length tier — `/O|<var>|>=K` —
+        // returns an SMT assertion excluding the length the current witness used,
+        // so the next round's anti-trivial bias picks a strictly larger length
+        // (K, K+1, K+2, …). Returns null when the label isn't an open tier, the
+        // var isn't an array/seq, or the length isn't recoverable from the model.
+        // Singleton tiers (`|*|=K`) and BVA boundary tiers (`/B…`) don't match the
+        // pattern, so they aren't progressed (their constraint already pins the
+        // length on each round).
+        string? BuildOpenTierLengthExclusion(
+            string baseLabel,
+            Dictionary<string, string> values,
+            List<(string Name, string Type)> inputs,
+            HashSet<string> mutableNames)
+        {
+            var m = Regex.Match(baseLabel, @"/O\|([^|]+)\|>=(\d+)\b");
+            if (!m.Success) return null;
+            var varName = m.Groups[1].Value;
+            var inp = inputs.FirstOrDefault(v => v.Name == varName);
+            if (inp.Name == null) return null;
+            if (!TypeUtils.IsArrayType(inp.Type) && !TypeUtils.IsSeqType(inp.Type)) return null;
+
+            // Length key in the model: `<name>_len` (or `<name>_pre_len` for
+            // mutable arrays). Try the unsuffixed form first.
+            string? lenStr = null;
+            if (values.TryGetValue($"{varName}_len", out var s1)) lenStr = s1;
+            else if (mutableNames.Contains(varName) && values.TryGetValue($"{varName}_pre_len", out var s2)) lenStr = s2;
+            if (lenStr == null || !int.TryParse(lenStr, out var len)) return null;
+
+            var smtBase = mutableNames.Contains(varName) ? $"{varName}_pre" : varName;
+            var smtSeq = TypeUtils.SeqSmtName(smtBase, inp.Type);
+            return $"(not (= (seq.len {smtSeq}) {len}))";
+        }
+
         // Build a positive SMT conjunction pinning a prior test case's inputs + outputs.
         // Used for subsumption pruning: if a new (clause, tier) goal is satisfied under
         // this pin, a prior test case already covers it and we can skip calling Z3 for it.
@@ -3219,6 +3252,16 @@ class Program
                                 }
                                 testCases.Add((repLabel, repValues, b.literals));
                                 if (fp != null) inputExclusions.Add(fp);
+
+                                // Length progression: for an open-length tier base
+                                // (label like /O|<var>|>=K), append a length-only
+                                // exclusion so the next round's anti-trivial bias
+                                // picks a strictly larger length. Walks the open tier
+                                // K, K+1, K+2, ... until UNSAT (the base then drops
+                                // via the normal mechanism).
+                                var lenExcl = BuildOpenTierLengthExclusion(b.label, repValues, inputs, mutableNames);
+                                if (lenExcl != null) inputExclusions.Add(lenExcl);
+
                                 nextActive.Add(label);  // base survives; another round
                             }
                             // else: plain UNSAT (or /Rel that produced no values) → drop the base
