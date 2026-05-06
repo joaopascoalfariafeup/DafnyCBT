@@ -92,6 +92,57 @@ static class BoundaryAnalysis
                 result.Add(($"{varName}={rel}", new List<string> { $"(= {smtName} {rel})" }, null));
                 result.Add(($"{varName}={rel}+1", new List<string> { $"(= {smtName} (+ {rel} 1))" }, null));
             }
+
+            // Middle-of-range tier: strictly between lo and hi. Fires only when
+            // BOTH a lower bound and an upper bound (numeric or relational) are
+            // extractable. Forces non-boundary `varName` — for FIND-style methods
+            // where the bug only manifests when `f` is in the middle of [0, N-1]
+            // and the array is length ≥ 4. Subsumption pruning skips this tier
+            // when an existing test already lies in the strict interior. The
+            // strict `<` case (e.g. `f < N`) needs an inline scan since
+            // ExtractRelationalBounds only matches non-strict `<=`.
+            string? hiSmt = null;
+            if (hi.HasValue)
+                hiSmt = hi.Value < 0 ? $"(- {-hi.Value})" : hi.Value.ToString();
+            else if (relUpperExprs.Count > 0)
+                hiSmt = relUpperExprs[0];  // already from `<=`, so strictly-less is `< rel`.
+            else
+            {
+                // Inline scan for strict `<` upper: scalar `name < other` or
+                // length-form `name < other.Length` / `name < |other|`.
+                var others = inputs.Where(v => v.Name != varName).ToList();
+                foreach (var lit in cleanLits)
+                {
+                    foreach (var v in others)
+                    {
+                        if (v.Type == "int" || v.Type == "nat")
+                        {
+                            if (Regex.IsMatch(lit, $@"\b{Regex.Escape(varName)}\s*<\s*{Regex.Escape(v.Name)}\b(?!\.)"))
+                            { hiSmt = $"(- {v.Name} 1)"; break; }
+                        }
+                        else if (TypeUtils.IsArrayType(v.Type) || TypeUtils.IsSeqType(v.Type))
+                        {
+                            var smtBase = mutableNames.Contains(v.Name) ? $"{v.Name}_pre" : v.Name;
+                            var smtLen = $"{smtBase}_len";
+                            if (Regex.IsMatch(lit, $@"\b{Regex.Escape(varName)}\s*<\s*{Regex.Escape(v.Name)}\.Length\b") ||
+                                Regex.IsMatch(lit, $@"\b{Regex.Escape(varName)}\s*<\s*\|{Regex.Escape(v.Name)}\|"))
+                            { hiSmt = $"(- {smtLen} 1)"; break; }
+                        }
+                    }
+                    if (hiSmt != null) break;
+                }
+            }
+            string? loSmt = null;
+            if (lo.HasValue)
+                loSmt = lo.Value < 0 ? $"(- {-lo.Value})" : lo.Value.ToString();
+            else if (relLowerExprs.Count > 0)
+                loSmt = relLowerExprs[0];
+            if (loSmt != null && hiSmt != null)
+            {
+                result.Add(($"{varName}=mid",
+                    new List<string> { $"(and (> {smtName} {loSmt}) (< {smtName} {hiSmt}))" },
+                    null));
+            }
         }
 
         return result;
