@@ -2198,6 +2198,22 @@ static class SmtTranslator
         {
             var setType = setDisplay.Type?.ToString() ?? "";
             var isStrSet = TypeUtils.IsStringElementSet(setType);
+            // Fallback: if the AST type wasn't resolved, infer string-set from
+            // the first element's declared type. `{car}` where car: string in
+            // inputs should yield EmptySetStr — without this, `(store EmptySet
+            // car true)` mismatches because EmptySet is (Array Int Bool) but
+            // car is (Seq Int).
+            if (!isStrSet && setDisplay.Elements.Count > 0)
+            {
+                var firstElem = UnwrapExpr(setDisplay.Elements[0]);
+                var firstName = GetOriginalName(firstElem);
+                if (firstName != null)
+                {
+                    var match = inputs.FirstOrDefault(v => v.Name == firstName);
+                    if (match != default && (match.Type == "string" || match.Type == "seq<char>"))
+                        isStrSet = true;
+                }
+            }
             var emptyName = isStrSet ? "EmptySetStr" : "EmptySet";
             if (setDisplay.Elements.Count == 0)
                 return emptyName;
@@ -3159,6 +3175,24 @@ static class SmtTranslator
                                 ? pf
                                 : $"(and {pf} (not (= {a} {b})))";
                         }
+                    }
+                    // Empty-set sort fixup (string path mirror of the AST-path fixup):
+                    // `==` between a string-set and `{}` should compare to EmptySetStr,
+                    // not the int-element EmptySet. Detect string-set side either by
+                    // declared type or by the SMT shape (result of SetIntersectionStr
+                    // etc.).
+                    if (dOp == "==" || dOp == "!=")
+                    {
+                        bool e0Str = IsStringSetExpr(parts.Value.left, inputs)
+                            || left.StartsWith("(SetIntersectionStr ")
+                            || left.StartsWith("(SetUnionStr ")
+                            || left.StartsWith("(SetDifferenceStr ");
+                        bool e1Str = IsStringSetExpr(parts.Value.right, inputs)
+                            || right.StartsWith("(SetIntersectionStr ")
+                            || right.StartsWith("(SetUnionStr ")
+                            || right.StartsWith("(SetDifferenceStr ");
+                        if (left == "EmptySet" && e1Str) left = "EmptySetStr";
+                        else if (right == "EmptySet" && e0Str) right = "EmptySetStr";
                     }
                     return $"({sOp} {left} {right})";
                 }

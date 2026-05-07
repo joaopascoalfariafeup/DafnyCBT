@@ -2345,8 +2345,18 @@ class Program
                     }
                     if (values.TryGetValue(prefix + "_members", out var membersStr))
                     {
+                        bool isStrSet = TypeUtils.IsStringElementSet(type);
                         foreach (var m in membersStr.Split(','))
-                            eqParts.Add($"(select {prefix} {m})");
+                        {
+                            // For set<string>, the SMT domain is (Seq Int), not Z3's
+                            // built-in String. Quoted string literals like "b" must be
+                            // converted to the (seq.unit <ascii>) / seq.++ encoding so
+                            // `(select prefix "b")` doesn't trip "domain sort String
+                            // and parameter (Seq Int) do not match" in Phase-3 input
+                            // exclusions.
+                            var memSmt = isStrSet ? StringMemberToSeqInt(m) : m;
+                            eqParts.Add($"(select {prefix} {memSmt})");
+                        }
                     }
                 }
                 else if (TypeUtils.IsMultisetType(type))
@@ -2404,6 +2414,22 @@ class Program
                 }
             }
             return eqParts;
+        }
+
+        // Converts a string member like `"b"` (or unquoted `b`) into the
+        // (Seq Int) encoding used for set<string> elements: `(seq.unit 98)` for
+        // a single char; `(seq.++ (seq.unit a) (seq.unit b))` for multi-char.
+        // Without this, model values from set<string> get re-emitted as Z3 String
+        // literals in input-exclusion clauses and cause sort-mismatch errors.
+        static string StringMemberToSeqInt(string member)
+        {
+            member = member.Trim();
+            if (member.Length >= 2 && member.StartsWith("\"") && member.EndsWith("\""))
+                member = member.Substring(1, member.Length - 2);
+            if (member.Length == 0) return "(as seq.empty (Seq Int))";
+            if (member.Length == 1) return $"(seq.unit {(int)member[0]})";
+            var units = member.Select(c => $"(seq.unit {(int)c})");
+            return $"(seq.++ {string.Join(" ", units)})";
         }
 
         string? BuildInputExclusion(Dictionary<string, string> values)
