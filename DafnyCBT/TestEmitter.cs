@@ -215,17 +215,50 @@ static class TestEmitter
     // --comment-uncompilable.
     static string RewriteChainedForallBounds(string lit)
     {
-        var pat = @"(\b\d+\b|\b\w+\b|\|\w+\||\b\w+\.Length\b)\s*<=\s*(\b\w+\b)\s*<=\s*(\b\w+\b)\s*<=\s*(\b\d+\b|\b\w+\b|\|\w+\||\b\w+\.Length\b)";
-        return System.Text.RegularExpressions.Regex.Replace(lit, pat, m =>
+        // Compound-token alternative comes BEFORE bare-identifier so that
+        // `a.Length` matches as a single token rather than `a` followed by
+        // dangling `.Length`. Without this, `0 <= i <= j <= a.Length < c.Length`
+        // produced a broken rewrite where `a.Length` got truncated to `a` and
+        // the leftover `.Length < c.Length` glommed onto `j`.
+        var token = @"(?:\b\w+\.Length\b|\|\w+\||\b\d+\b|\b\w+\b)";
+        // 4-link `<=` chain (5 operands): `LO <= V1 <= V2 <= V3 <= HI`. Generalise
+        // beyond the original 3-link case by emitting independent bounds for each
+        // interior var plus the per-step relation as filters. Tried BEFORE the
+        // 3-link pattern so the longer match wins.
+        var pat4 = $@"({token})\s*<=\s*(\b\w+\b)\s*<=\s*(\b\w+\b)\s*<=\s*(\b\w+\b)\s*<=\s*({token})";
+        lit = System.Text.RegularExpressions.Regex.Replace(lit, pat4, m =>
+        {
+            var lo = m.Groups[1].Value; var v1 = m.Groups[2].Value;
+            var v2 = m.Groups[3].Value; var v3 = m.Groups[4].Value;
+            var hi = m.Groups[5].Value;
+            if (v1 == v2 || v2 == v3 || v1 == v3) return m.Value;
+            return $"{lo} <= {v1} <= {hi} && {lo} <= {v2} <= {hi} && {lo} <= {v3} <= {hi} "
+                 + $"&& {v1} <= {v2} && {v2} <= {v3}";
+        });
+        // Mixed 4-link chain `LO <= V1 <= V2 <= HI < HI2` — `j <= a.Length < c.Length`
+        // pattern. Last segment uses strict `<`. Treat HI2 as just an upper bound
+        // on HI, not on the variables.
+        var pat3plus = $@"({token})\s*<=\s*(\b\w+\b)\s*<=\s*(\b\w+\b)\s*<=\s*({token})\s*<\s*({token})";
+        lit = System.Text.RegularExpressions.Regex.Replace(lit, pat3plus, m =>
+        {
+            var lo = m.Groups[1].Value; var v1 = m.Groups[2].Value;
+            var v2 = m.Groups[3].Value; var hi = m.Groups[4].Value;
+            var hi2 = m.Groups[5].Value;
+            if (v1 == v2) return m.Value;
+            return $"{lo} <= {v1} <= {hi} && {lo} <= {v2} <= {hi} && {v1} <= {v2} && {hi} < {hi2}";
+        });
+        // 3-link chain (4 operands): `LO <= V1 <= V2 <= HI`. Original pattern.
+        var pat3 = $@"({token})\s*<=\s*(\b\w+\b)\s*<=\s*(\b\w+\b)\s*<=\s*({token})";
+        lit = System.Text.RegularExpressions.Regex.Replace(lit, pat3, m =>
         {
             var lo = m.Groups[1].Value;
             var v1 = m.Groups[2].Value;
             var v2 = m.Groups[3].Value;
             var hi = m.Groups[4].Value;
-            // Skip when v1 and v2 are the same identifier (degenerate, no chain).
             if (v1 == v2) return m.Value;
             return $"{lo} <= {v1} <= {hi} && {lo} <= {v2} <= {hi} && {v1} <= {v2}";
         });
+        return lit;
     }
 
     static string StripOldWrappers(string expr)
