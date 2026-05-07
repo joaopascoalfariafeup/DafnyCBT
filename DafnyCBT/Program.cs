@@ -1982,8 +1982,37 @@ class Program
                     int simpleMask = 1 << ci;
                     var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}";
 
+                    // Frame-only detection. A variable is "frame-only" for this clause
+                    // if it's mentioned in the postcondition exclusively in `v == old(v)`
+                    // form (the autocontracts/explicit "unchanged" assertion). For such
+                    // variables the method's spec doesn't depend on the variable's value
+                    // beyond pre==post, so categorical tiers (=0 / =1 / >=K / true/false /
+                    // enum constructors) only consume budget without exploring distinct
+                    // behavior. Skipping them frees the budget for axes that matter
+                    // (e.g. more diverse |carPark| values, more `car` strings) — the
+                    // canonical example is a method like enterCarPark that touches
+                    // `carPark` but only asserts `subscriptions == old(subscriptions)`,
+                    // `weekend == old(weekend)`, etc.
+                    bool IsFrameOnlyInClause(string vname)
+                    {
+                        var nameEsc = Regex.Escape(vname);
+                        var mentionPat = $@"\b{nameEsc}\b";
+                        var framePat1 = $@"^\s*{nameEsc}\s*==\s*old\s*\(\s*{nameEsc}\s*\)\s*$";
+                        var framePat2 = $@"^\s*old\s*\(\s*{nameEsc}\s*\)\s*==\s*{nameEsc}\s*$";
+                        bool mentioned = false;
+                        foreach (var lit in clauseLitStrings)
+                        {
+                            if (!Regex.IsMatch(lit, mentionPat)) continue;
+                            mentioned = true;
+                            if (Regex.IsMatch(lit, framePat1) || Regex.IsMatch(lit, framePat2)) continue;
+                            return false;  // appears in a non-frame position → not frame-only
+                        }
+                        return mentioned;  // mentioned everywhere only as frame; skip tiers
+                    }
+
                     void EmitCats(string vname, string vtype, BoundaryAnalysis.VarKind kind)
                     {
+                        if (IsFrameOnlyInClause(vname)) return;
                         var tiers = BoundaryAnalysis.ComputeCategoricalTiers(
                             vname, vtype, classLits, mutableNames, enumDatatypes, kind, tierCount);
                         foreach (var (tlabel, tconstraints, dkey) in tiers)

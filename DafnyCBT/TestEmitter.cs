@@ -1006,10 +1006,17 @@ static class TestEmitter
                 var combined = preLitsToShow.Concat(postLits)
                     .Select(s => (Expression)new LeafExpression(s)).ToList();
                 var simplified = DnfEngine.DropImpliedLiterals(combined);
+                // Dedup by canonical key, preserving first-occurrence order.
+                // Cross-product of multiple `requires Valid()` (autocontracts adds
+                // one implicitly + the user may write it explicitly) and `requires
+                // true` left identical literals in the comment block; the underlying
+                // SMT was already deduped, this just brings the comment in line.
+                var seen = new HashSet<string>();
                 foreach (var lit in simplified)
                 {
                     var s = DnfEngine.ExprToString(lit);
                     var canonical = DnfEngine.CanonicalLiteralKey(s);
+                    if (!seen.Add(canonical)) continue;
                     var tag = preKeySet.Contains(canonical) ? "PRE" : "POST";
                     var vacTag = vacuousLiterals.Contains(canonical) ? " (vacuously true on these ins)" : "";
                     sb.AppendLine($"  //     {ApplyTypeParamMap(canonical, typeParamMap)}  // {tag}{vacTag}");
