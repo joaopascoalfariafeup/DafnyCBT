@@ -17,6 +17,7 @@ class Program
     static string RelevanceMode = "ladder";
     public static bool VacuityCheckEnabled = false;
     public static bool ReverseBvaOrder = false;
+    public static bool LiteralBvaEnabled = false;
     // Unroll depth for recursive functions during spec inlining. Default 1
     // (one level of substitution; residual recursive calls fall back to a
     // type-correct uninterpreted stub). Higher values fully unroll linear
@@ -86,6 +87,9 @@ class Program
         var reverseBvaOrderOpt = new Option<bool>("--reverse-bva-order",
             "Run Phase 2b (categorical type/size coverage) before Phase 2 (refined-range BVA) instead of after. Default order is 2 → 2b. When reversed, Phase 2's per-clause dedup against Phase 2b keys is dropped; subsumption at solve-time still skips redundant entries. Useful for kill-curve ablation experiments.");
         reverseBvaOrderOpt.AddAlias("-rbva");
+        var literalBvaOpt = new Option<bool>("--literal-bva",
+            "Phase 2 BVA: scan every relational post-clause literal `E1 op E2` (with op ∈ {<, ≤, >, ≥}) and emit boundary (`E1 = E2`) and strict-companion (`E1 > E2` / `E1 < E2`) tiers, regardless of whether E1 or E2 is a bare variable. Targets ROR-mutated `≥` → `==` bugs whose witness lies strictly above/below a relational bound (e.g. `|carPark| > normalSpaces - badParkingBuffer`). Default OFF — uses the legacy variable-centric extractor.");
+        literalBvaOpt.AddAlias("-lbva");
         var seedOpt = new Option<int?>("--seed",
             "Force a fixed Z3 random seed for every SMT query, overriding the per-method name hash and bypassing the --no-bias / skipBias gating. Useful for reproducibility experiments and seed-sensitivity studies. When omitted, the usual per-method deterministic seed is used (but only when bias is on).");
         var relevanceModeOpt = new Option<string>("--relevance-mode", () => "ladder",
@@ -101,7 +105,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, vacuityOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, vacuityOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -148,6 +152,9 @@ class Program
             ReverseBvaOrder = ctx.ParseResult.GetValueForOption(reverseBvaOrderOpt);
             if (ReverseBvaOrder)
                 Console.WriteLine("[DafnyCBT] BVA order: Phase 2b → Phase 2 (reversed)");
+            LiteralBvaEnabled = ctx.ParseResult.GetValueForOption(literalBvaOpt);
+            if (LiteralBvaEnabled)
+                Console.WriteLine("[DafnyCBT] Phase 2 BVA: literal-centric (E1 op E2 boundary + strict-companion tiers)");
             SmtTranslator.ForcedSeed = ctx.ParseResult.GetValueForOption(seedOpt);
             RecursiveUnrollDepth = Math.Max(1, ctx.ParseResult.GetValueForOption(unrollDepthOpt));
             if (RecursiveUnrollDepth > 1)
@@ -1952,6 +1959,65 @@ class Program
                     {
                         foreach (var (fname, ftype) in mutableFieldsList)
                             EmitPins(fname, ftype, BoundaryAnalysis.VarKind.MutablePost);
+                    }
+
+                    // Literal-centric Phase 2 BVA (--literal-bva): scan every relational
+                    // post-clause literal `E1 op E2` (op ∈ {<, ≤, >, ≥}) and emit
+                    // boundary + strict-companion tiers regardless of whether E1 or E2
+                    // is a bare variable. Targets ROR-mutated `≥` → `==` bugs whose
+                    // witness lies strictly above/below a relational bound on a
+                    // *compound* expression — e.g. `|carPark| > normalSpaces -
+                    // badParkingBuffer`, which the variable-centric path can't reach
+                    // because |carPark| isn't a variable name. Subsumption pruning at
+                    // solve-time handles overlap with the existing variable-centric
+                    // tiers.
+                    if (LiteralBvaEnabled)
+                    {
+                        var allInputs = inputs.Concat(outputs).ToList();
+                        foreach (var lit in clause)
+                        {
+                            // Find an inner relational BinaryExpr — including under
+                            // `old(...)` wrappers and unary negation. Top-level only
+                            // (we don't drill into &&/||).
+                            var inner = lit;
+                            while (inner is ParensExpression p) inner = p.E;
+                            while (inner is ConcreteSyntaxExpression cse && cse.ResolvedExpression != null)
+                                inner = cse.ResolvedExpression;
+                            if (inner is BinaryExpr bin
+                                && (bin.Op == BinaryExpr.Opcode.Lt
+                                 || bin.Op == BinaryExpr.Opcode.Le
+                                 || bin.Op == BinaryExpr.Opcode.Gt
+                                 || bin.Op == BinaryExpr.Opcode.Ge))
+                            {
+                                SmtTranslator.ResetExprToSmtBudget();
+                                var leftSmt = SmtTranslator.ExprToSmt(bin.E0, allInputs, mutableNames, isPostContext: true);
+                                SmtTranslator.ResetExprToSmtBudget();
+                                var rightSmt = SmtTranslator.ExprToSmt(bin.E1, allInputs, mutableNames, isPostContext: true);
+                                if (leftSmt == null || rightSmt == null) continue;
+                                // Skip pure constant comparisons (no semantic content).
+                                if (Regex.IsMatch(leftSmt, @"^\s*-?\d+(\.\d+)?\s*$") &&
+                                    Regex.IsMatch(rightSmt, @"^\s*-?\d+(\.\d+)?\s*$")) continue;
+
+                                // Boundary tier: equality. Pins E1 = E2 — exercises the
+                                // exact-at-boundary regime that ROR mutations often miss.
+                                var litLabel = $"{DnfEngine.ExprToString(bin.E0)}{(bin.Op switch {
+                                    BinaryExpr.Opcode.Lt => "<",
+                                    BinaryExpr.Opcode.Le => "<=",
+                                    BinaryExpr.Opcode.Gt => ">",
+                                    BinaryExpr.Opcode.Ge => ">=",
+                                    _ => "?"
+                                })}{DnfEngine.ExprToString(bin.E1)}";
+                                var eqLabel = $"L:{litLabel}=";
+                                var strictLabel = $"L:{litLabel}{(bin.Op == BinaryExpr.Opcode.Ge || bin.Op == BinaryExpr.Opcode.Gt ? ">" : "<")}";
+                                schedule.Add(($"{clauseLabel}/B{eqLabel}",
+                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"(= {leftSmt} {rightSmt})" }, simpleMask, pi));
+                                emitted.Add($"{pi}|{ci}|{eqLabel}");
+                                var strictOp = (bin.Op == BinaryExpr.Opcode.Ge || bin.Op == BinaryExpr.Opcode.Gt) ? ">" : "<";
+                                schedule.Add(($"{clauseLabel}/B{strictLabel}",
+                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"({strictOp} {leftSmt} {rightSmt})" }, simpleMask, pi));
+                                emitted.Add($"{pi}|{ci}|{strictLabel}");
+                            }
+                        }
                     }
                 }
             }
