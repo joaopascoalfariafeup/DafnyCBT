@@ -444,6 +444,13 @@ static class SmtTranslator
         var allVars = inputs.Concat(outputs).ToList();
         foreach (var (name, type) in allVars)
         {
+            // Skip names already emitted as `(define-fun {name} () ... <literal>)` via
+            // the const-inline pass above. Class const fields with literal initializers
+            // (e.g. `const totalSpaces: nat := 10`) get added to `inputs` by the
+            // class-field-as-synthetic-input glue, which would otherwise produce a
+            // duplicate `(declare-const {name} ...)` here and trip a Z3 "named
+            // expression already defined" error. (See car_park.dfy.)
+            if (_constInlines.ContainsKey(name)) continue;
             if (mutableNames.Contains(name) && TypeUtils.IsArrayType(type))
             {
                 var smtType = TypeUtils.DafnyTypeToSmt(type);

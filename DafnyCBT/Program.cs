@@ -3166,6 +3166,13 @@ class Program
                         baseConditionExclusions.TryGetValue(b.baseKey, out var prior) ? prior : Enumerable.Empty<string>()));
                     var perBaseRoundIdx = bases.ToDictionary(b => b.label, b => 0);
                     var perBaseRelExhausted = bases.ToDictionary(b => b.label, b => false);
+                    // Consecutive-duplicate counter: how many rounds in a row the base has
+                    // produced an already-seen input. Drops the base after MAX_DUPS to
+                    // protect against pathological cases where Z3 emits the same model
+                    // every round despite accumulating exclusions (e.g. SMT errors that
+                    // cause Z3's parser to fall back to a fixed model — see car_park).
+                    var perBaseConsecDups = bases.ToDictionary(b => b.label, b => 0);
+                    const int MAX_CONSECUTIVE_DUPS = 3;
 
                     // Cross-base input deduplication. A SAT result whose input fingerprint
                     // matches an already-seen test is NOT added; instead, the duplicate's
@@ -3246,12 +3253,23 @@ class Program
                                     // Duplicate input across bases. Don't add; push exclusion
                                     // so this base picks a different witness next round.
                                     inputExclusions.Add(fp);
+                                    perBaseConsecDups[label]++;
+                                    if (perBaseConsecDups[label] >= MAX_CONSECUTIVE_DUPS)
+                                    {
+                                        // No-progress drop: Z3 keeps producing the same model
+                                        // despite accumulating exclusions (e.g. SMT errors
+                                        // pinning a partial model, or genuinely-saturated
+                                        // input space). Drop the base.
+                                        if (verbose) Console.WriteLine($"  {repLabel}: dropped after {MAX_CONSECUTIVE_DUPS} consecutive duplicates (no progress)");
+                                        continue;
+                                    }
                                     if (verbose) Console.WriteLine($"  {repLabel}: duplicate input — retry next round with stricter exclusion");
                                     nextActive.Add(label);
                                     continue;
                                 }
                                 testCases.Add((repLabel, repValues, b.literals));
                                 if (fp != null) inputExclusions.Add(fp);
+                                perBaseConsecDups[label] = 0;  // fresh witness — reset counter
 
                                 // Length progression: for an open-length tier base
                                 // (label like /O|<var>|>=K), append a length-only
