@@ -2264,12 +2264,22 @@ static class TestEmitter
                         && (mutableNames == null || !mutableNames.Contains(lhsName));
                     if (lhsIsImmutableInput)
                         continue;
+                    // Comment out vacuously-true literals: they pass trivially on this
+                    // input (the post-vacuity scan tagged them in the comment block
+                    // above), so the runtime expect adds noise without checking
+                    // anything. Keep the text in commented form for transparency
+                    // (so the reader can see what would have been asserted and why
+                    // it was skipped).
+                    var litCanonical = DnfEngine.CanonicalLiteralKey(lit);
+                    bool isVacuous = vacuousLiterals.Contains(litCanonical);
+                    var prefix = isVacuous ? "    // expect " : "    expect ";
+                    var suffix = isVacuous ? "; // VACUOUSLY TRUE on these inputs" : ";";
                     if (isSimpleEq && rhsCaptures.TryGetValue(lhsName, out var checkVar))
-                        sb.AppendLine($"    expect {lhsName} == {checkVar};");
+                        sb.AppendLine($"{prefix}{lhsName} == {checkVar}{suffix}");
                     else if (isSimpleEq && rhsInline.TryGetValue(lhsName, out var inlineRhs))
-                        sb.AppendLine($"    expect {lhsName} == {inlineRhs};");
+                        sb.AppendLine($"{prefix}{lhsName} == {inlineRhs}{suffix}");
                     else
-                        sb.AppendLine($"    expect {RewriteUnboundedForalls(lit)};");
+                        sb.AppendLine($"{prefix}{RewriteUnboundedForalls(lit)}{suffix}");
                 }
             }
 
