@@ -3729,9 +3729,69 @@ class Program
         // Force literal expects when non-inlinable functions are present (full postcondition as expect)
         bool hasUninterpFuncs = hasNonInlinableFuncs || SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
+        // Compute the runtime-callable closure: starting from function/predicate
+        // calls in the test method's contract (Req/Ens/Decreases), BFS into
+        // each callee's body. The result is the set of names that *must* be
+        // non-ghost so the generated test's `expect` lines compile. Names NOT
+        // in the closure (e.g. helper predicates only used in lemma contracts
+        // or method invariants) stay ghost — keeping those in their natural
+        // ghost context lets Dafny skip compilability checks on their bodies
+        // (which often contain unbounded foralls or chained ranges that the
+        // runtime compiler can't handle).
+        var runtimeCallable = ComputeRuntimeCallableClosure(method, program);
+        if (verbose && runtimeCallable.Count > 0)
+            Console.WriteLine($"  Runtime-callable closure ({runtimeCallable.Count}): {string.Join(", ", runtimeCallable)}");
+
         // Emit Dafny test file
-        var emitted = TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, inlinedDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo, inlinablePredicates, specExpects, isBodyless, preOnlyMode);
+        var emitted = TestEmitter.EmitDafnyTests(filePath, methodName, method, source, dedupedStr, inlinedDnfClauses, preClauses, hasArrayParam, hasUninterpFuncs, mutableNames, enumDatatypes, classInfo, inlinablePredicates, specExpects, isBodyless, preOnlyMode, runtimeCallable);
         return (emitted, TimedOut());
+    }
+
+    /// <summary>
+    /// Closure of function/predicate names that must be runtime-callable.
+    /// Starts from function calls in the test method's contract and BFS-extends
+    /// through each callee's body. Functions only used in lemma contracts or
+    /// helper-method invariants don't enter the closure and stay ghost.
+    /// </summary>
+    static HashSet<string> ComputeRuntimeCallableClosure(Method method, Microsoft.Dafny.Program? program)
+    {
+        var closure = new HashSet<string>();
+        if (program == null) return closure;
+        // Index every Function/Predicate by name across the whole program (we'll
+        // BFS into bodies). Methods/lemmas are excluded — those are statement-
+        // level constructs we don't emit `expect <method>(...)` for.
+        var allFuncs = new Dictionary<string, Function>();
+        foreach (var topDecl in DafnyParser.AllTopLevelDecls(program))
+        {
+            if (topDecl is TopLevelDeclWithMembers cls)
+                foreach (var member in cls.Members)
+                    if (member is Function f && !allFuncs.ContainsKey(f.Name))
+                        allFuncs[f.Name] = f;
+        }
+        var queue = new Queue<string>();
+        void Seed(Expression? e)
+        {
+            if (e == null) return;
+            foreach (var n in FindFunctionCalls(e))
+                if (closure.Add(n)) queue.Enqueue(n);
+        }
+        // Seed from test method's contract only (NOT body — body is
+        // `Body`/`StmtBody`, which contains invariants, asserts, lemma calls,
+        // and other ghost-context spec we don't want to chase).
+        foreach (var req in method.Req) Seed(req.E);
+        foreach (var ens in method.Ens) Seed(ens.E);
+        if (method.Decreases?.Expressions != null)
+            foreach (var d in method.Decreases.Expressions) Seed(d);
+        // BFS into function bodies.
+        while (queue.Count > 0)
+        {
+            var name = queue.Dequeue();
+            if (!allFuncs.TryGetValue(name, out var func)) continue;
+            if (func.Body == null) continue;
+            foreach (var n in FindFunctionCalls(func.Body))
+                if (closure.Add(n)) queue.Enqueue(n);
+        }
+        return closure;
     }
 
     /// <summary>

@@ -949,7 +949,8 @@ static class TestEmitter
         List<(string name, List<string> paramNames, string body, bool isClassMember)>? inlinablePredicates = null,
         Dictionary<string, string>? specExpects = null,
         bool isBodyless = false,
-        bool preOnlyMode = false)
+        bool preOnlyMode = false,
+        HashSet<string>? runtimeCallableNames = null)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("// Auto-generated test cases by DafnyCBT");
@@ -960,10 +961,34 @@ static class TestEmitter
             sb.AppendLine($"// PRE-ONLY MODE: postconditions ignored — only preconditions and runtime crashes are checked.");
         sb.AppendLine();
 
-        // Include original source, removing 'ghost' from fields, constants, functions, and predicates
-        // so they can be assigned and used in 'expect' statements at runtime
-        var testSource = Regex.Replace(originalSource, @"\bghost\s+function\b", "function");
-        testSource = Regex.Replace(testSource, @"\bghost\s+predicate\b", "predicate");
+        // Selective ghost stripping: only strip `ghost` from functions/predicates
+        // that are reachable from the test method's contract (transitive closure
+        // computed in Program.cs). Functions used only in lemma contracts or
+        // helper-method invariants stay ghost — keeping their natural ghost
+        // context lets Dafny skip compilability checks on their bodies (which
+        // often contain unbounded foralls or chained-bound foralls). When
+        // runtimeCallableNames is null (caller didn't compute closure), fall
+        // back to the legacy all-strip behaviour.
+        var testSource = originalSource;
+        if (runtimeCallableNames != null)
+        {
+            foreach (var name in runtimeCallableNames)
+            {
+                var esc = Regex.Escape(name);
+                // Allow optional `method` qualifier (predicate method) and any
+                // {: attr} attributes between `function`/`predicate` and the name.
+                testSource = Regex.Replace(testSource, $@"\bghost\s+(function|predicate)((?:\s+method)?(?:\s+\{{:[^}}]*\}})*)\s+{esc}\b",
+                    m => $"{m.Groups[1].Value}{m.Groups[2].Value} {name}");
+            }
+        }
+        else
+        {
+            testSource = Regex.Replace(testSource, @"\bghost\s+function\b", "function");
+            testSource = Regex.Replace(testSource, @"\bghost\s+predicate\b", "predicate");
+        }
+        // Field- and parameter-level ghost stripping is always needed: tests
+        // assign to ghost fields and bind to ghost return values, so these
+        // strips are independent of which functions are runtime-callable.
         testSource = Regex.Replace(testSource, @"\bghost\s+var\b", "var");
         testSource = Regex.Replace(testSource, @"\bghost\s+const\b", "var"); // var so test code can assign it
         // Strip 'ghost' from in/out parameter declarations (e.g. `returns (ghost m: int, p: int)`
