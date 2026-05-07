@@ -21,7 +21,7 @@ BIN=publish/DafnyCBT
 IN=test/buggy_progs/in/
 OUT_BASE=test/buggy_progs
 LOG_BASE=test/buggy_progs
-N=10
+N=20
 SEED=42
 COMMON="-n $N --seed $SEED"
 
@@ -34,15 +34,15 @@ run() {
     $BIN $IN -o "$out" $COMMON $extra >& "$log"
 }
 
-#run full         "--vacuity"
-run no_vacuity   ""
-#run reverse_bva_no_vacuity       "--reverse-bva-order"             # no_vacuity + reorder
-#run reverse_bva                  "--vacuity --reverse-bva-order"   # full + reorder
+run lbva   "-lbva"
+run _default_   ""
 #run no_bias_no_vacuity      "--no-bias"
 #run no_relevance_no_vacuity "--no-relevance"
 #run baseline     "--no-bias --no-relevance"
 
-run exists_decomp_no_vacuity "--exists-decomposition"
+#run full         "--vacuity"
+#run reverse_bva_no_vacuity       "--reverse-bva-order"             # no_vacuity + reorder
+#run exists_decomp_no_vacuity "--exists-decomposition"
 
 echo "[$(date +%H:%M:%S)] done. Logs:"
 ls -la "${LOG_BASE}"_{full,no_bias,no_relevance,no_vacuity,baseline}_log.txt
