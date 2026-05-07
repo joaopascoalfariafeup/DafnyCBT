@@ -34,6 +34,15 @@ static class SmtTranslator
         return false;
     }
 
+    static bool IsStringSetExpr(string dafnyExpr, List<(string Name, string Type)> inputs)
+    {
+        dafnyExpr = dafnyExpr.Trim();
+        var match = inputs.FirstOrDefault(v => v.Name == dafnyExpr);
+        if (match != default && TypeUtils.IsStringElementSet(match.Type))
+            return true;
+        return false;
+    }
+
     static bool IsMultisetExpr(string dafnyExpr, List<(string Name, string Type)> inputs)
     {
         dafnyExpr = dafnyExpr.Trim();
@@ -1595,6 +1604,27 @@ static class SmtTranslator
 
             var left = ExprToSmt(bin.E0, inputs, mutableNames, isPostContext, insideOld);
             var right = ExprToSmt(bin.E1, inputs, mutableNames, isPostContext, insideOld);
+            // Sort-fixup for {} compared against string-element sets: SetDisplayExpr
+            // for `{}` doesn't always have a resolved Type, so it falls back to the
+            // int-element `EmptySet` constant. When the other side is a string-set
+            // (e.g. class field of type set<string>) — either by AST type lookup OR
+            // because the translated SMT is a string-set operation result — retype
+            // `EmptySet` → `EmptySetStr`. Without this, Z3 reports
+            // "Sorts (Array (Seq Int) Bool) and (Array Int Bool) are incompatible".
+            if ((bin.Op == BinaryExpr.Opcode.Eq || bin.Op == BinaryExpr.Opcode.Neq)
+                && left != null && right != null)
+            {
+                bool e0Str = IsStringSetExprAst(bin.E0, inputs)
+                    || left.StartsWith("(SetIntersectionStr ")
+                    || left.StartsWith("(SetUnionStr ")
+                    || left.StartsWith("(SetDifferenceStr ");
+                bool e1Str = IsStringSetExprAst(bin.E1, inputs)
+                    || right.StartsWith("(SetIntersectionStr ")
+                    || right.StartsWith("(SetUnionStr ")
+                    || right.StartsWith("(SetDifferenceStr ");
+                if (left == "EmptySet" && e1Str) left = "EmptySetStr";
+                else if (right == "EmptySet" && e0Str) right = "EmptySetStr";
+            }
             // For && and ||: tolerate one side being untranslatable
             if (left == null && right == null) goto fallback;
             if (bin.Op == BinaryExpr.Opcode.And)
@@ -2259,6 +2289,14 @@ static class SmtTranslator
         if (expr is OldExpr oldE) return GetOriginalName(oldE.Expr);
         if (expr is IdentifierExpr id) return id.Name;
         if (expr is NameSegment ns) return ns.Name;
+        // `this.field` access (typically in autocontracts class postconditions)
+        // arrives as MemberSelectExpr with Obj = ThisExpr; for our purposes
+        // (looking up a synthetic class-field input by name) just return the
+        // member name. Without this, `carPark * reservedCarPark` in a class
+        // post fell through the IsSetExprAst dispatch and got translated as
+        // SMT integer `*` against (Array (Seq Int) Bool) operands — sort error.
+        if (expr is MemberSelectExpr mse && mse.Obj is ThisExpr)
+            return mse.MemberName;
         return null;
     }
 
@@ -3487,6 +3525,19 @@ static class SmtTranslator
                 var right = DafnyExprToSmt(rightStr, inputs);
                 if (left != null && right != null)
                 {
+                    // Set/multiset/string-set intersection dispatch — matches the AST
+                    // path's handling of `*`. Without this, `carPark * reservedCarPark`
+                    // (set<string> * set<string>) gets translated as Z3 integer `*`
+                    // and produces a sort-mismatch error.
+                    if (op == "*")
+                    {
+                        if (IsMultisetExpr(leftStr, inputs))
+                            return $"(MultisetIntersection {left} {right})";
+                        if (IsStringSetExpr(leftStr, inputs))
+                            return $"(SetIntersectionStr {left} {right})";
+                        if (IsSetExpr(leftStr, inputs))
+                            return $"(SetIntersection {left} {right})";
+                    }
                     var sOp = op switch { "/" => "div", "%" => "mod", _ => op };
                     return $"({sOp} {left} {right})";
                 }
