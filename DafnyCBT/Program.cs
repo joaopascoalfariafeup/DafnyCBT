@@ -813,6 +813,10 @@ class Program
                         allTestCode.AppendLine();
                         allTestCode.Append(testCode.Substring(idx));
                     }
+                    else
+                    {
+                        Console.Error.WriteLine($"  WARNING: TestsFor{method.Name} marker not found in generated test code; output may be missing this method's tests.");
+                    }
                 }
             }
             else
