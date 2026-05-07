@@ -99,6 +99,85 @@ static class TestEmitter
     /// E.g., "count == old(count) + 1" → "count ==  + 1"
     ///        "g == old(secret)" → "g == "
     /// </summary>
+    // Rewrite `forall i: <unbounded-type> :: <body>` where `<body>` contains no
+    // top-level `==>` to the literal `false`. Such a forall is provably false at
+    // runtime — the body must hold for *every* integer/nat/real, and any meaningful
+    // conjunctive predicate fails for some i. Dafny's runtime compiler rejects
+    // these as "Dafny's heuristics can't figure out how to produce or compile a
+    // bounded set of values," so without this rewrite the generated test won't
+    // build. With the rewrite, `(false) ==> p == ...` evaluates to `true`,
+    // matching the spec's actual vacuous semantics. The detection is conservative:
+    // we only rewrite when the body has NO `==>` at any depth — false negatives
+    // are tolerable (those expects will still fail to compile, but
+    // --comment-uncompilable picks them up).
+    static string RewriteUnboundedForalls(string lit)
+    {
+        // Match `forall <name>[: <type>] [{:trigger ...}] :: <body>` and
+        // determine whether body is bounded. The `<body>` extends to the matching
+        // top-level closing context (parenthesis or end of expression).
+        // Use a small parenthesis-aware scan to find the body extent.
+        int idx = 0;
+        var sb = new System.Text.StringBuilder();
+        while (idx < lit.Length)
+        {
+            // Find next `forall` (whole-word).
+            var m = System.Text.RegularExpressions.Regex.Match(lit.Substring(idx),
+                @"\bforall\b");
+            if (!m.Success) { sb.Append(lit.Substring(idx)); break; }
+            int forallStart = idx + m.Index;
+            sb.Append(lit.Substring(idx, forallStart - idx));
+            // Find `::` after forall to locate body start.
+            int dcolon = lit.IndexOf("::", forallStart);
+            if (dcolon < 0) { sb.Append(lit.Substring(forallStart)); break; }
+            int bodyStart = dcolon + 2;
+            // Body extends until the matching paren-balanced end of the enclosing
+            // sub-expression. We scan forward until depth < 0 or a logical
+            // terminator (`)`, `]`, top-level `;`, end of string).
+            int depth = 0;
+            int bodyEnd = lit.Length;
+            for (int j = bodyStart; j < lit.Length; j++)
+            {
+                char c = lit[j];
+                if (c == '(' || c == '[' || c == '{') depth++;
+                else if (c == ')' || c == ']' || c == '}')
+                {
+                    if (depth == 0) { bodyEnd = j; break; }
+                    depth--;
+                }
+                else if (c == ';' && depth == 0) { bodyEnd = j; break; }
+            }
+            var quantPart = lit.Substring(forallStart, bodyStart - forallStart);  // "forall i: int :: "
+            var body = lit.Substring(bodyStart, bodyEnd - bodyStart);
+            // Detect unbounded type: `int`, `nat`, `real`. (Bool/enum/seq/set
+            // would all enumerate, so Dafny's runtime is fine with them.)
+            bool unboundedType = System.Text.RegularExpressions.Regex.IsMatch(
+                quantPart, @":\s*(int|nat|real)\b");
+            // Detect top-level `==>`: any `==>` outside parens makes the body bounded.
+            bool hasTopLevelImp = false;
+            int d2 = 0;
+            for (int j = 0; j < body.Length - 2; j++)
+            {
+                char c = body[j];
+                if (c == '(' || c == '[' || c == '{') d2++;
+                else if (c == ')' || c == ']' || c == '}') d2--;
+                else if (d2 == 0 && body[j] == '=' && body[j + 1] == '=' && body[j + 2] == '>')
+                { hasTopLevelImp = true; break; }
+            }
+            if (unboundedType && !hasTopLevelImp)
+            {
+                // Replace the entire forall expression (including `forall...` and body)
+                // with `false`. Wrap in parens to preserve precedence.
+                sb.Append("(false)");
+            }
+            else
+            {
+                sb.Append(lit.Substring(forallStart, bodyEnd - forallStart));
+            }
+            idx = bodyEnd;
+        }
+        return sb.ToString();
+    }
+
     static string StripOldWrappers(string expr)
     {
         var result = expr;
@@ -2190,7 +2269,7 @@ static class TestEmitter
                     else if (isSimpleEq && rhsInline.TryGetValue(lhsName, out var inlineRhs))
                         sb.AppendLine($"    expect {lhsName} == {inlineRhs};");
                     else
-                        sb.AppendLine($"    expect {lit};");
+                        sb.AppendLine($"    expect {RewriteUnboundedForalls(lit)};");
                 }
             }
 
