@@ -80,17 +80,27 @@ static class BoundaryAnalysis
                 result.Add(($"{varName}={v}", new List<string> { $"(= {smtName} {smtVal})" }, $"{varName} == {v}"));
             }
 
-            // Symbolic relational upper bounds: emit =rel and =rel-1.
+            // Symbolic relational upper bounds: emit =rel, =rel-1, AND >rel.
+            // The `>rel` (strictly above the spec-derived upper bound) tier targets
+            // ROR-mutated bugs where `>=` becomes `==` (or similar): the buggy code
+            // catches the boundary but admits values strictly above. The class
+            // invariant Valid() may be loose enough to admit those values, so a
+            // method's spec-violation is exposable. Without `>rel` BVA only ever
+            // tested at and just-below the boundary, never strictly above.
             foreach (var rel in relUpperExprs)
             {
                 result.Add(($"{varName}={rel}", new List<string> { $"(= {smtName} {rel})" }, null));
                 result.Add(($"{varName}={rel}-1", new List<string> { $"(= {smtName} (- {rel} 1))" }, null));
+                result.Add(($"{varName}>{rel}", new List<string> { $"(> {smtName} {rel})" }, null));
             }
-            // Symbolic relational lower bounds: emit =rel and =rel+1.
+            // Symbolic relational lower bounds: emit =rel, =rel+1, AND <rel.
+            // Mirror of the upper case — covers ROR-mutated `<=` → `==` bugs from
+            // the lower direction.
             foreach (var rel in relLowerExprs)
             {
                 result.Add(($"{varName}={rel}", new List<string> { $"(= {smtName} {rel})" }, null));
                 result.Add(($"{varName}={rel}+1", new List<string> { $"(= {smtName} (+ {rel} 1))" }, null));
+                result.Add(($"{varName}<{rel}", new List<string> { $"(< {smtName} {rel})" }, null));
             }
 
             // Middle-of-range tier: strictly between lo and hi. Fires only when

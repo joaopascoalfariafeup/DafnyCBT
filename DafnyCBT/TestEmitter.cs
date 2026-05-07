@@ -1011,11 +1011,15 @@ static class TestEmitter
                 // one implicitly + the user may write it explicitly) and `requires
                 // true` left identical literals in the comment block; the underlying
                 // SMT was already deduped, this just brings the comment in line.
+                // Also suppress trivial `true` literals — they appear when the user
+                // writes `requires true` (style placeholder) and add no information
+                // to the test objective comment.
                 var seen = new HashSet<string>();
                 foreach (var lit in simplified)
                 {
                     var s = DnfEngine.ExprToString(lit);
                     var canonical = DnfEngine.CanonicalLiteralKey(s);
+                    if (canonical.Trim() == "true") continue;
                     if (!seen.Add(canonical)) continue;
                     var tag = preKeySet.Contains(canonical) ? "PRE" : "POST";
                     var vacTag = vacuousLiterals.Contains(canonical) ? " (vacuously true on these ins)" : "";
