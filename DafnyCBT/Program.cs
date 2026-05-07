@@ -1974,48 +1974,122 @@ class Program
                     if (LiteralBvaEnabled)
                     {
                         var allInputs = inputs.Concat(outputs).ToList();
+
+                        // Collect every relational BinaryExpr in the precondition AND the
+                        // post-DNF clause. Pre literals reach the boundary regime for
+                        // input-side bounds (e.g. `requires 0 <= k <= n` in CalcComb);
+                        // post literals reach output-side bounds (e.g. `|carPark| >=
+                        // normalSpaces - badParkingBuffer` in car_park).
+                        Expression Unwrap(Expression e)
+                        {
+                            while (e is ParensExpression p) e = p.E;
+                            while (e is ConcreteSyntaxExpression cse && cse.ResolvedExpression != null)
+                                e = cse.ResolvedExpression;
+                            return e;
+                        }
+                        bool IsRelOp(BinaryExpr.Opcode op) =>
+                            op == BinaryExpr.Opcode.Lt || op == BinaryExpr.Opcode.Le
+                            || op == BinaryExpr.Opcode.Gt || op == BinaryExpr.Opcode.Ge;
+
+                        var rels = new List<(BinaryExpr bin, bool isPre)>();
+                        foreach (var lit in fullPreLits)
+                        {
+                            var inner = Unwrap(lit);
+                            if (inner is BinaryExpr b && IsRelOp(b.Op)) rels.Add((b, true));
+                        }
                         foreach (var lit in clause)
                         {
-                            // Find an inner relational BinaryExpr — including under
-                            // `old(...)` wrappers and unary negation. Top-level only
-                            // (we don't drill into &&/||).
-                            var inner = lit;
-                            while (inner is ParensExpression p) inner = p.E;
-                            while (inner is ConcreteSyntaxExpression cse && cse.ResolvedExpression != null)
-                                inner = cse.ResolvedExpression;
-                            if (inner is BinaryExpr bin
-                                && (bin.Op == BinaryExpr.Opcode.Lt
-                                 || bin.Op == BinaryExpr.Opcode.Le
-                                 || bin.Op == BinaryExpr.Opcode.Gt
-                                 || bin.Op == BinaryExpr.Opcode.Ge))
-                            {
-                                SmtTranslator.ResetExprToSmtBudget();
-                                var leftSmt = SmtTranslator.ExprToSmt(bin.E0, allInputs, mutableNames, isPostContext: true);
-                                SmtTranslator.ResetExprToSmtBudget();
-                                var rightSmt = SmtTranslator.ExprToSmt(bin.E1, allInputs, mutableNames, isPostContext: true);
-                                if (leftSmt == null || rightSmt == null) continue;
-                                // Skip pure constant comparisons (no semantic content).
-                                if (Regex.IsMatch(leftSmt, @"^\s*-?\d+(\.\d+)?\s*$") &&
-                                    Regex.IsMatch(rightSmt, @"^\s*-?\d+(\.\d+)?\s*$")) continue;
+                            var inner = Unwrap(lit);
+                            if (inner is BinaryExpr b && IsRelOp(b.Op)) rels.Add((b, false));
+                        }
 
-                                // Boundary tier: equality. Pins E1 = E2 — exercises the
-                                // exact-at-boundary regime that ROR mutations often miss.
-                                var litLabel = $"{DnfEngine.ExprToString(bin.E0)}{(bin.Op switch {
-                                    BinaryExpr.Opcode.Lt => "<",
-                                    BinaryExpr.Opcode.Le => "<=",
-                                    BinaryExpr.Opcode.Gt => ">",
-                                    BinaryExpr.Opcode.Ge => ">=",
-                                    _ => "?"
-                                })}{DnfEngine.ExprToString(bin.E1)}";
-                                var eqLabel = $"L:{litLabel}=";
-                                var strictLabel = $"L:{litLabel}{(bin.Op == BinaryExpr.Opcode.Ge || bin.Op == BinaryExpr.Opcode.Gt ? ">" : "<")}";
-                                schedule.Add(($"{clauseLabel}/B{eqLabel}",
-                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"(= {leftSmt} {rightSmt})" }, simpleMask, pi));
-                                emitted.Add($"{pi}|{ci}|{eqLabel}");
-                                var strictOp = (bin.Op == BinaryExpr.Opcode.Ge || bin.Op == BinaryExpr.Opcode.Gt) ? ">" : "<";
-                                schedule.Add(($"{clauseLabel}/B{strictLabel}",
-                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"({strictOp} {leftSmt} {rightSmt})" }, simpleMask, pi));
-                                emitted.Add($"{pi}|{ci}|{strictLabel}");
+                        string? TranslateExpr(Expression e, bool postCtx)
+                        {
+                            SmtTranslator.ResetExprToSmtBudget();
+                            return SmtTranslator.ExprToSmt(e, allInputs, mutableNames, isPostContext: postCtx);
+                        }
+                        bool IsConstSmt(string s) => Regex.IsMatch(s, @"^\s*-?\d+(\.\d+)?\s*$");
+
+                        // Per-literal: boundary + strict-companion. The strict-companion
+                        // direction depends on the relation: `≥`/`>` → strictly-above,
+                        // `≤`/`<` → strictly-below.
+                        foreach (var (bin, isPre) in rels)
+                        {
+                            var leftSmt = TranslateExpr(bin.E0, !isPre);
+                            var rightSmt = TranslateExpr(bin.E1, !isPre);
+                            if (leftSmt == null || rightSmt == null) continue;
+                            if (IsConstSmt(leftSmt) && IsConstSmt(rightSmt)) continue;
+                            var litStr = $"{DnfEngine.ExprToString(bin.E0)}{(bin.Op switch {
+                                BinaryExpr.Opcode.Lt => "<",
+                                BinaryExpr.Opcode.Le => "<=",
+                                BinaryExpr.Opcode.Gt => ">",
+                                BinaryExpr.Opcode.Ge => ">=",
+                                _ => "?"
+                            })}{DnfEngine.ExprToString(bin.E1)}";
+                            var eqLabel = $"L:{litStr}=";
+                            var strictOp = (bin.Op == BinaryExpr.Opcode.Ge || bin.Op == BinaryExpr.Opcode.Gt) ? ">" : "<";
+                            var strictLabel = $"L:{litStr}{strictOp}";
+                            schedule.Add(($"{clauseLabel}/B{eqLabel}",
+                                clause, fullPreLits, new List<Expression>(), new List<string> { $"(= {leftSmt} {rightSmt})" }, simpleMask, pi));
+                            emitted.Add($"{pi}|{ci}|{eqLabel}");
+                            schedule.Add(($"{clauseLabel}/B{strictLabel}",
+                                clause, fullPreLits, new List<Expression>(), new List<string> { $"({strictOp} {leftSmt} {rightSmt})" }, simpleMask, pi));
+                            emitted.Add($"{pi}|{ci}|{strictLabel}");
+                        }
+
+                        // Chained-relation detection: pairs (L1, L2) where L1 is `LO op1
+                        // EXP` and L2 is `EXP op2 HI` (op1, op2 ∈ {<, ≤}) and `EXP` is
+                        // structurally identical on both sides. Emit a `mid` tier for
+                        // strict-inside, plus boundary tiers `EXP=LO` / `EXP=HI` when the
+                        // strictness allows them. Generalises the variable-centric mid
+                        // synthesis to any expression EXP — handles `0 <= k <= n` (k bare),
+                        // `lo <= |s| <= hi` (cardinality), `m < arr[i] < M` (indexed
+                        // access), etc. Equality keyed on `DnfEngine.ExprToString` —
+                        // string-canonical comparison is sufficient here.
+                        bool IsLeOrLt(BinaryExpr.Opcode op) =>
+                            op == BinaryExpr.Opcode.Le || op == BinaryExpr.Opcode.Lt;
+                        for (int li = 0; li < rels.Count; li++)
+                        {
+                            var (b1, _) = rels[li];
+                            if (!IsLeOrLt(b1.Op)) continue;  // L1 must be `LO op EXP`
+                            var l1RhsKey = DnfEngine.ExprToString(b1.E1);
+                            for (int lj = 0; lj < rels.Count; lj++)
+                            {
+                                if (li == lj) continue;
+                                var (b2, _) = rels[lj];
+                                if (!IsLeOrLt(b2.Op)) continue;  // L2 must be `EXP op HI`
+                                var l2LhsKey = DnfEngine.ExprToString(b2.E0);
+                                if (l1RhsKey != l2LhsKey) continue;
+                                // Chain found: LO=b1.E0, EXP=b1.E1 (=b2.E0), HI=b2.E1.
+                                bool strictLo = b1.Op == BinaryExpr.Opcode.Lt;
+                                bool strictHi = b2.Op == BinaryExpr.Opcode.Lt;
+                                var loSmt = TranslateExpr(b1.E0, postCtx: true);
+                                var expSmt = TranslateExpr(b1.E1, postCtx: true);
+                                var hiSmt = TranslateExpr(b2.E1, postCtx: true);
+                                if (loSmt == null || expSmt == null || hiSmt == null) continue;
+                                var expLabel = DnfEngine.ExprToString(b1.E1);
+                                var rangeLabel = $"L:{DnfEngine.ExprToString(b1.E0)}{(strictLo ? "<" : "<=")}{expLabel}{(strictHi ? "<" : "<=")}{DnfEngine.ExprToString(b2.E1)}";
+                                // mid: strictly-inside.
+                                var midLabel = $"{rangeLabel}/mid";
+                                schedule.Add(($"{clauseLabel}/B{midLabel}",
+                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (> {expSmt} {loSmt}) (< {expSmt} {hiSmt}))" }, simpleMask, pi));
+                                emitted.Add($"{pi}|{ci}|{midLabel}");
+                                // Boundary EXP=LO (only when L1 is non-strict; for `LO <
+                                // EXP`, EXP=LO is UNSAT given the precondition).
+                                if (!strictLo)
+                                {
+                                    var lLabel = $"{rangeLabel}/=lo";
+                                    schedule.Add(($"{clauseLabel}/B{lLabel}",
+                                        clause, fullPreLits, new List<Expression>(), new List<string> { $"(= {expSmt} {loSmt})" }, simpleMask, pi));
+                                    emitted.Add($"{pi}|{ci}|{lLabel}");
+                                }
+                                if (!strictHi)
+                                {
+                                    var hLabel = $"{rangeLabel}/=hi";
+                                    schedule.Add(($"{clauseLabel}/B{hLabel}",
+                                        clause, fullPreLits, new List<Expression>(), new List<string> { $"(= {expSmt} {hiSmt})" }, simpleMask, pi));
+                                    emitted.Add($"{pi}|{ci}|{hLabel}");
+                                }
                             }
                         }
                     }
