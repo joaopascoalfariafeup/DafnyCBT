@@ -588,6 +588,22 @@ class Program
         bool first = true;
         var generatedTestMethods = new List<string>(); // track names for Main
 
+        // Pre-compute the program-wide runtime-callable closure: union of every
+        // tested method's contract-reachable functions/predicates. We pass this
+        // union to EVERY method's EmitDafnyTests call because the source file in
+        // the output is determined by the FIRST method emitted (subsequent
+        // methods only append their TestsFor block). Using only the first
+        // method's closure would leave functions ghost that later methods'
+        // tests need runtime-callable, producing
+        // "a call to a ghost predicate is allowed only in specification contexts"
+        // errors during --check (witnessed on MergeSort: TestsForMergeLoop calls
+        // InvSorted, which MergeSort's contract doesn't reach).
+        var programWideRuntimeCallable = new HashSet<string>();
+        foreach (var m in methods)
+            programWideRuntimeCallable.UnionWith(ComputeRuntimeCallableClosure(m, program));
+        if (programWideRuntimeCallable.Count > 0 && verbose)
+            Console.WriteLine($"[DafnyCBT] Program-wide runtime-callable closure ({programWideRuntimeCallable.Count}): {string.Join(", ", programWideRuntimeCallable)}");
+
         foreach (var method in methods)
         {
             Console.WriteLine();
@@ -782,7 +798,7 @@ class Program
 
             Console.WriteLine($"  Generating tests via Boogie/Z3...");
 
-            var (testCode, timedOut) = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program, isBodyless);
+            var (testCode, timedOut) = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, timeoutSecs, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program, isBodyless, runtimeCallableOverride: programWideRuntimeCallable);
 
             // Automatic fallback: if first attempt produced no tests and timed out, retry in
             // pre-only mode (postconditions ignored, inputs from preconditions only). Catches
@@ -791,7 +807,7 @@ class Program
             {
                 var retryBudget = timeoutSecs > 0 ? Math.Max(30, timeoutSecs / 2) : 0;
                 Console.WriteLine($"  Full-spec solve timed out with 0 tests — retrying in pre-only mode (budget {retryBudget}s)...");
-                (testCode, _) = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, retryBudget, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program, isBodyless, preOnlyMode: true);
+                (testCode, _) = await GenerateTests(file.FullName, method.Name, source, uri, verbose, method, useAllComb, useBoundary, tiers, useRepeat, inlinablePredicates, minTests, progressive, z3Path, maxTests, retryBudget, hasNonInlinableFuncs, enumDatatypes, enumConstructors, classInfoMap.GetValueOrDefault(method), program, isBodyless, preOnlyMode: true, runtimeCallableOverride: programWideRuntimeCallable);
             }
 
             if (!string.IsNullOrWhiteSpace(testCode))
@@ -1159,7 +1175,8 @@ class Program
     static async Task<(string code, bool timedOut)> GenerateTests(string filePath, string methodName, string source, Uri uri, bool verbose, Method method, bool allCombinations, bool boundary, int tierCount = 4, int repeat = 1,
         List<(string name, List<string> paramNames, string body, bool isClassMember)>? inlinablePredicates = null, int minTests = 4, bool progressive = false, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool hasNonInlinableFuncs = false,
         Dictionary<string, List<string>>? enumDatatypes = null, Dictionary<string, (string dtName, int ordinal)>? enumConstructors = null,
-        ClassInfo? classInfo = null, Microsoft.Dafny.Program? program = null, bool isBodyless = false, bool preOnlyMode = false)
+        ClassInfo? classInfo = null, Microsoft.Dafny.Program? program = null, bool isBodyless = false, bool preOnlyMode = false,
+        HashSet<string>? runtimeCallableOverride = null)
     {
         z3Path ??= Z3Runner.FindZ3Path();
         enumDatatypes ??= new Dictionary<string, List<string>>();
@@ -3733,16 +3750,14 @@ class Program
         // Force literal expects when non-inlinable functions are present (full postcondition as expect)
         bool hasUninterpFuncs = hasNonInlinableFuncs || SmtTranslator._uninterpFuncs.Count > 0 || SmtTranslator._hasUntranslatedPost;
 
-        // Compute the runtime-callable closure: starting from function/predicate
-        // calls in the test method's contract (Req/Ens/Decreases), BFS into
-        // each callee's body. The result is the set of names that *must* be
-        // non-ghost so the generated test's `expect` lines compile. Names NOT
-        // in the closure (e.g. helper predicates only used in lemma contracts
-        // or method invariants) stay ghost — keeping those in their natural
-        // ghost context lets Dafny skip compilability checks on their bodies
-        // (which often contain unbounded foralls or chained ranges that the
-        // runtime compiler can't handle).
-        var runtimeCallable = ComputeRuntimeCallableClosure(method, program);
+        // Runtime-callable closure: prefer the program-wide union supplied by
+        // the caller (Run() pre-computes it across every tested method, so the
+        // emitted source's selective ghost stripping covers calls that any
+        // method's TestsFor block makes — not just this method's). Fall back
+        // to per-method closure when the caller doesn't supply one (e.g.
+        // direct GenerateTests invocation in tests).
+        var runtimeCallable = runtimeCallableOverride
+            ?? ComputeRuntimeCallableClosure(method, program);
         if (verbose && runtimeCallable.Count > 0)
             Console.WriteLine($"  Runtime-callable closure ({runtimeCallable.Count}): {string.Join(", ", runtimeCallable)}");
 
