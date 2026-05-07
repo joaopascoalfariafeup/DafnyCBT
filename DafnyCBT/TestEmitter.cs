@@ -152,6 +152,25 @@ static class TestEmitter
             // would all enumerate, so Dafny's runtime is fine with them.)
             bool unboundedType = System.Text.RegularExpressions.Regex.IsMatch(
                 quantPart, @":\s*(int|nat|real)\b");
+            // `forall <vars> | <range> :: <body>` syntax — the `|` introduces an
+            // explicit range filter that bounds the variables. Even with unbounded
+            // types, Dafny treats this as compilable when the range gives finite
+            // bounds. Skip the rewrite-to-false and let the chained-bound
+            // rewrite (RewriteChainedForallBounds) handle the range expansion.
+            // Look for a top-level `|` between `forall` and `::`.
+            bool hasRangeBar = false;
+            int qDepth = 0;
+            for (int j = forallStart + 6 /*after "forall"*/; j < dcolon; j++)
+            {
+                char c = lit[j];
+                if (c == '(' || c == '[' || c == '{') qDepth++;
+                else if (c == ')' || c == ']' || c == '}') qDepth--;
+                else if (qDepth == 0 && c == '|'
+                         && (j + 1 >= lit.Length || lit[j + 1] != '|')
+                         && (j == 0 || lit[j - 1] != '|'))
+                { hasRangeBar = true; break; }
+            }
+            if (hasRangeBar) unboundedType = false;
             // Detect top-level `==>`: any `==>` outside parens makes the body bounded.
             bool hasTopLevelImp = false;
             int d2 = 0;
@@ -176,6 +195,37 @@ static class TestEmitter
             idx = bodyEnd;
         }
         return sb.ToString();
+    }
+
+    // Rewrite chained-bound forall ranges of the form `LO <= v1 <= v2 <= HI`
+    // (Dafny's `forall ... | ... :: ...` syntax, with cross-dependent bounds)
+    // into the independent-bound form Dafny's runtime compiler can enumerate:
+    //   `LO <= v1 <= HI && LO <= v2 <= HI && v1 <= v2`
+    // The original chain is rejected at compile time with "Dafny's heuristics
+    // can't figure out how to produce or compile a bounded set of values for
+    // 'i'" because i's upper bound is the variable j and j's lower bound is
+    // the variable i — neither has a constant-bounded range. The rewrite is
+    // semantics-preserving (transitively equivalent) and gives each variable
+    // an independent finite range plus a filter on their relation.
+    //
+    // Conservative pattern: only rewrites the 3-link chain `LO <= V1 <= V2 <= HI`
+    // (one chain per call); LO and HI must be simple tokens (numeric, bare
+    // identifier, `|s|`, `s.Length`). Multi-link chains and complex bounds are
+    // left alone — those will still fail to compile and can be picked up by
+    // --comment-uncompilable.
+    static string RewriteChainedForallBounds(string lit)
+    {
+        var pat = @"(\b\d+\b|\b\w+\b|\|\w+\||\b\w+\.Length\b)\s*<=\s*(\b\w+\b)\s*<=\s*(\b\w+\b)\s*<=\s*(\b\d+\b|\b\w+\b|\|\w+\||\b\w+\.Length\b)";
+        return System.Text.RegularExpressions.Regex.Replace(lit, pat, m =>
+        {
+            var lo = m.Groups[1].Value;
+            var v1 = m.Groups[2].Value;
+            var v2 = m.Groups[3].Value;
+            var hi = m.Groups[4].Value;
+            // Skip when v1 and v2 are the same identifier (degenerate, no chain).
+            if (v1 == v2) return m.Value;
+            return $"{lo} <= {v1} <= {hi} && {lo} <= {v2} <= {hi} && {v1} <= {v2}";
+        });
     }
 
     static string StripOldWrappers(string expr)
@@ -1656,7 +1706,10 @@ static class TestEmitter
                 }
                 else
                 {
-                    sb.AppendLine($"    expect {preStr}; // PRE-CHECK");
+                    // Same chained-bound rewrite as the post path: `LO <= V1 <= V2 <= HI`
+                    // → independent bounds + filter, so Dafny's runtime compiler
+                    // accepts the expect.
+                    sb.AppendLine($"    expect {RewriteChainedForallBounds(preStr)}; // PRE-CHECK");
                 }
             }
 
@@ -2279,7 +2332,7 @@ static class TestEmitter
                     else if (isSimpleEq && rhsInline.TryGetValue(lhsName, out var inlineRhs))
                         sb.AppendLine($"{prefix}{lhsName} == {inlineRhs}{suffix}");
                     else
-                        sb.AppendLine($"{prefix}{RewriteUnboundedForalls(lit)}{suffix}");
+                        sb.AppendLine($"{prefix}{RewriteUnboundedForalls(RewriteChainedForallBounds(lit))}{suffix}");
                 }
             }
 
