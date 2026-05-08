@@ -74,14 +74,17 @@ class Program
         noRelevanceOpt.AddAlias("-nr");
         var vacuityOpt = new Option<bool>("--vacuity", "Enable per-literal vacuity check (Phase 1v). For each safe candidate Q_k, try isolated mode first (find ins where Q_k is vacuous AND every other Q_j is non-vacuous → /Vik label) and fall back to non-isolated (Q_k vacuous but other Q_j may also be → /Vk label) when isolated is infeasible. Note: independently of this flag, every emitted test gets per-Q vacuity annotations (// VACUOUSLY TRUE) via a post-phase scan. Default: OFF.");
         vacuityOpt.AddAlias("-v1v");
+        // Deprecated. The first/last/middle witness coverage previously gated
+        // by --exists-decomposition is now provided by Phase 2 BVA's existential
+        // boundary tiers (`/Eb<n>=lo`, `/Eb<n>=hi`, `/Eb<n>=mid`) — same coverage,
+        // no DNF inflation, always on. Flag and its --no- alias are accepted
+        // (hidden no-ops) so existing scripts don't break.
         var existsDecompOpt = new Option<bool>("--exists-decomposition",
-            "Enable decomposition of single-variable existential quantifiers (and negated foralls) into three mutually-exclusive DNF clauses: (A) first element satisfies; (B) last satisfies, first doesn't; (C) some strictly-middle k satisfies, neither end does. Forces witness diversity Z3 wouldn't otherwise produce — Z3 defaults to the simplest model (first or last index), so without (C), mutants that only fail at non-trivial witness positions escape. Default: OFF.");
+            "Deprecated no-op. Existential first/last/middle coverage is now provided by Phase 2 BVA's `/Eb<n>=lo` / `/Eb<n>=hi` / `/Eb<n>=mid` tiers (always on, no DNF inflation).");
         existsDecompOpt.AddAlias("-ed");
-        // Legacy alias kept so existing scripts using --no-exists-decomposition / -ned
-        // don't break. It is now a no-op (decomposition is OFF by default), included
-        // only to avoid CLI parse errors.
+        existsDecompOpt.IsHidden = true;
         var noExistsDecompOpt = new Option<bool>("--no-exists-decomposition",
-            "Deprecated. Decomposition is now OFF by default; this flag is a no-op. Use --exists-decomposition / -ed to enable the 3-way split (first / last / middle).");
+            "Deprecated no-op. See --exists-decomposition.");
         noExistsDecompOpt.AddAlias("-ned");
         noExistsDecompOpt.IsHidden = true;
         var reverseBvaOrderOpt = new Option<bool>("--reverse-bva-order",
@@ -159,9 +162,10 @@ class Program
             VacuityCheckEnabled = ctx.ParseResult.GetValueForOption(vacuityOpt);
             if (VacuityCheckEnabled)
                 Console.WriteLine($"[DafnyCBT] Vacuity check (Phase 1v): ON (isolated with non-isolated fallback)");
-            DnfEngine.DecomposeQuantifiers = ctx.ParseResult.GetValueForOption(existsDecompOpt);
-            if (DnfEngine.DecomposeQuantifiers)
-                Console.WriteLine("[DafnyCBT] Existential quantifier decomposition: ON (3-way mutually-exclusive split: first / last / middle)");
+            // --exists-decomposition / --no-exists-decomposition: deprecated no-ops.
+            // First/last/middle existential coverage is now via Phase 2 BVA tiers.
+            _ = ctx.ParseResult.GetValueForOption(existsDecompOpt);
+            _ = ctx.ParseResult.GetValueForOption(noExistsDecompOpt);
             ReverseBvaOrder = ctx.ParseResult.GetValueForOption(reverseBvaOrderOpt);
             if (ReverseBvaOrder)
                 Console.WriteLine("[DafnyCBT] BVA order: Phase 2b → Phase 2 (reversed)");
@@ -2206,9 +2210,16 @@ class Program
                         foreach (var lit in clause)
                         {
                             var inner = Unwrap(lit);
-                            if (inner is not ExistsExpr existsExpr) continue;
+                            // Accept ExistsExpr directly OR a negated ForallExpr
+                            // (`!(forall k :: range ==> P(k))` is equivalent to
+                            // `exists k :: range && !P(k)` — the helper performs
+                            // the conversion internally).
+                            bool isCandidate = inner is ExistsExpr
+                                || (inner is UnaryOpExpr u && u.Op == UnaryOpExpr.Opcode.Not
+                                    && Unwrap(u.E) is ForallExpr);
+                            if (!isCandidate) continue;
                             existsIdx++;
-                            var narrowings = DnfEngine.GetExistsBoundaryNarrowings(existsExpr);
+                            var narrowings = DnfEngine.GetExistsBoundaryNarrowings(inner);
                             if (narrowings == null) continue;
                             foreach (var (suffix, narrowing, _) in narrowings)
                             {

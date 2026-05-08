@@ -13,11 +13,6 @@ static class DnfEngine
     /// <summary>
     /// Sets the mode: DNF (default) or FDNF. 
     internal static bool UseFdnf { get; set; } = false;
-    /// <summary>When false, single-variable existential quantifiers (and the negation
-    /// of forall quantifiers) are kept as a single literal instead of being split
-    /// into left-boundary / middle-range / right-boundary cases. Used for ablation
-    /// experiments measuring the contribution of quantifier decomposition.</summary>
-    internal static bool DecomposeQuantifiers { get; set; } = false;
 
     /// <summary>
     /// Set by Program.cs after parsing. Required by the Dafny Substituter base
@@ -373,20 +368,10 @@ static class DnfEngine
             return (pos, neg);
         }
 
-        // Exists quantifier: decompose into boundary cases (gated for ablation).
-        if (DecomposeQuantifiers && expr is ExistsExpr existsFdnf)
-        {
-            var decomposed = TryDecomposeExists(existsFdnf);
-            if (decomposed != null)
-                return (decomposed, new List<List<Expression>> { new() { Negate(expr) } });
-        }
-        // Forall: neg decomposes as exists-not (gated for ablation).
-        if (DecomposeQuantifiers && expr is ForallExpr forallFdnf)
-        {
-            var decomposed = TryDecomposeNegatedForall(forallFdnf);
-            if (decomposed != null)
-                return (new List<List<Expression>> { new() { expr } }, decomposed);
-        }
+        // (Existential first/last/middle witness coverage is now provided by Phase 2 BVA's
+        // existential boundary tiers — see DnfEngine.GetExistsBoundaryNarrowings — instead
+        // of via DNF clause splitting. Removes the cross-product blowup the legacy
+        // --exists-decomposition flag used to incur.)
 
         // LeafExpression with string-level ITE
         if (expr is LeafExpression leafIteF)
@@ -595,32 +580,58 @@ static class DnfEngine
 
     /// <summary>
     /// Returns up to three boundary narrowings of a single-variable existential
-    /// `exists k :: lo <= k < hi && P(k)`, suitable for use as Phase 2 BVA tier
-    /// extras (each narrowing is a strictly stronger constraint that, when ANDed
-    /// with the original existential, pins the witness to a specific position
-    /// class):
+    /// (or negated single-variable forall, which is equivalent to an existential
+    /// over the negated body). Suitable for use as Phase 2 BVA tier extras —
+    /// each narrowing is a strictly stronger constraint that, when ANDed with
+    /// the original quantifier, pins the witness to a specific position class:
     ///   ("=lo",  P[k := effectiveLo])                          first-position witness
-    ///   ("=hi",  P[k := effectiveHi])                          last-position witness
-    ///   ("=mid", exists k :: effectiveLo+1 <= k <= effectiveHi-1 && P(k))
-    ///                                                          strictly-middle witness
-    /// Returns null if the existential doesn't match the expected
-    /// `lo op k op hi && property(k)` shape (no extractable range, or pure
-    /// range with no property). Each narrowing is independent — emitted as a
+    ///   ("=hi",  P[k := effectiveHi] ∧ !P[k := effectiveLo])    last-position witness
+    ///                                                          (mutex with =lo)
+    ///   ("=mid", exists k :: effectiveLo+1 <= k <= effectiveHi-1 && P(k)
+    ///            ∧ !P[k := effectiveLo] ∧ !P[k := effectiveHi]) strictly-middle witness
+    ///                                                          (mutex with =lo, =hi)
+    /// The mutex chain forces structural diversity across the three tiers —
+    /// without it, when the predicate happens to hold at both endpoints Z3 can
+    /// return the same input for `=lo` and `=hi`, with subsumption then pruning
+    /// one (losing the second test). The chain mirrors the negation-cascade
+    /// from the legacy `--exists-decomposition` 3-way DNF split.
+    /// Returns null if the quantifier doesn't match the expected shape
+    /// (`lo op k op hi && property(k)` for `exists`, `lo op k op hi ==> property(k)`
+    /// for negated `forall`). Each narrowing is independent — emitted as a
     /// SEPARATE Phase 2 tier on top of the original clause (which still
-    /// contains the unmodified existential), unlike the 3-way DNF
-    /// decomposition under `--exists-decomposition` which splits the clause
-    /// itself. This is cheaper (no DNF inflation) and benefits from
-    /// subsumption pruning when Phase 1's plain witness already happens
-    /// to land in one of the boundary regions.
+    /// contains the unmodified quantifier), so no DNF inflation.
     /// </summary>
     internal static List<(string Suffix, Expression Narrowing, BoundVar BoundVar)>?
-        GetExistsBoundaryNarrowings(ExistsExpr existsExpr)
+        GetExistsBoundaryNarrowings(Expression quantExpr)
     {
-        if (existsExpr.BoundVars.Count != 1) return null;
-        var boundVar = existsExpr.BoundVars[0];
-        var body = existsExpr.Term;
+        BoundVar boundVar;
+        Expression body;
+        if (quantExpr is ExistsExpr existsExpr)
+        {
+            if (existsExpr.BoundVars.Count != 1) return null;
+            boundVar = existsExpr.BoundVars[0];
+            body = existsExpr.Term;
+        }
+        else if (quantExpr is UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not } notExpr
+                 && Unwrap(notExpr.E) is ForallExpr forallExpr
+                 && forallExpr.BoundVars.Count == 1)
+        {
+            // !(forall k :: range ==> P(k))   ≡   exists k :: range && !P(k)
+            boundVar = forallExpr.BoundVars[0];
+            var fbody = forallExpr.Term;
+            if (fbody is BinaryExpr { Op: BinaryExpr.Opcode.Imp } imp)
+                body = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.And, imp.E0, Negate(imp.E1));
+            else
+                body = Negate(fbody);
+        }
+        else
+        {
+            return null;
+        }
 
-        // Reuse the same range-extraction pattern as TryDecomposeQuantifierBody.
+        // Range-extraction pattern: walk top-level conjuncts of the body and
+        // identify `lo op k` and `k op hi` (or the chained 3-operand form),
+        // marking strictness on each side.
         var conjuncts = FlattenConjuncts(body);
         Expression? lo = null, hi = null;
         int loIdx = -1, hiIdx = -1;
@@ -683,66 +694,26 @@ static class DnfEngine
 
         var leftProp = SubstituteVar(property, boundVar, effectiveLo);
         var rightProp = SubstituteVar(property, boundVar, effectiveHi);
+        var notLeftProp = Negate(leftProp);
+        var notRightProp = Negate(rightProp);
+
+        // Mutex chain (mirrors the legacy 3-way decomposition's mutual exclusion):
+        //   =lo  pure pin
+        //   =hi  pin ∧ !lo
+        //   =mid pin ∧ !lo ∧ !hi
+        var rightWithMutex = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.And, rightProp, notLeftProp);
+
         var midExistsStr = $"exists {boundVar.Name} :: {ExprToString(afterLo)} <= {boundVar.Name} <= {ExprToString(beforeHi)} && {ExprToString(property)}";
         var midExistsExpr = ParseToLeafExpression(midExistsStr);
+        var midWithMutex1 = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.And, midExistsExpr, notLeftProp);
+        var midWithMutex = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.And, midWithMutex1, notRightProp);
 
         return new List<(string, Expression, BoundVar)>
         {
-            ("=lo",  leftProp,  boundVar),
-            ("=hi",  rightProp, boundVar),
-            ("=mid", midExistsExpr, boundVar),
+            ("=lo",  leftProp,        boundVar),
+            ("=hi",  rightWithMutex,  boundVar),
+            ("=mid", midWithMutex,    boundVar),
         };
-    }
-
-    /// <summary>
-    /// Try to decompose an exists quantifier into mutually-exclusive cases at AST level.
-    /// Pattern: exists k :: lo <=|< k <|<= hi && body(k)
-    /// Produces 3 mutually-exclusive DNF clauses (first / last / middle):
-    ///   A: body[k/effLo]                                                            (first satisfies)
-    ///   B: !body[k/effLo] ∧ body[k/effHi]                                            (last satisfies, first doesn't)
-    ///   C: !body[k/effLo] ∧ !body[k/effHi] ∧ exists k :: effLo+1 <= k <= effHi-1 ∧ body
-    ///                                                                                (some strictly-middle k satisfies)
-    /// The middle clause forces witnesses Z3 wouldn't otherwise pick — Z3 defaults to
-    /// the simplest model (typically the first or last index), so without C, mutants
-    /// that only fail when the witness is at a non-trivial position (e.g. linear-search
-    /// returning `-(n+1)` instead of `n+1` — kills only when `n >= 1` AND the search
-    /// hits the element at a non-last reverse-mapped position) escape.
-    /// </summary>
-    static List<List<Expression>>? TryDecomposeExists(ExistsExpr existsExpr)
-    {
-        if (existsExpr.BoundVars.Count != 1)
-            return null;
-        var boundVar = existsExpr.BoundVars[0];
-
-        // The Term is the body after "::"
-        var body = existsExpr.Term;
-        return TryDecomposeQuantifierBody(boundVar, body);
-    }
-
-    /// <summary>
-    /// Decompose negated forall: !(forall k :: range ==> P(k)) = exists k :: range && !P(k)
-    /// </summary>
-    static List<List<Expression>>? TryDecomposeNegatedForall(ForallExpr forallExpr)
-    {
-        if (forallExpr.BoundVars.Count != 1)
-            return null;
-        var boundVar = forallExpr.BoundVars[0];
-
-        // ForallExpr with implication: Term is typically "range ==> P(k)"
-        var body = forallExpr.Term;
-
-        // Check if the body is an implication
-        if (body is BinaryExpr { Op: BinaryExpr.Opcode.Imp } imp)
-        {
-            // range ==> P(k) — we want: range && !P(k)
-            var negProp = Negate(imp.E1);
-            var negBody = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.And, imp.E0, negProp);
-            return TryDecomposeQuantifierBody(boundVar, negBody);
-        }
-
-        // If the body is not an implication, negate it directly: exists k :: !body
-        // But we can't easily decompose this into boundary cases
-        return null;
     }
 
     /// <summary>
@@ -753,8 +724,6 @@ static class DnfEngine
     /// range" constraint — Phase 1r should not pick witnesses where some forall
     /// in the clause is vacuously true via empty range.
     ///
-    /// Implementation reuses the same matching patterns as TryDecomposeQuantifierBody
-    /// (kept inline to avoid disturbing the working decomposition code).
     /// </summary>
     internal static (Expression? lo, Expression? hi, bool isStrictLo, bool isStrictHi)
         TryExtractForallRange(ForallExpr forall)
@@ -796,175 +765,6 @@ static class DnfEngine
         return (lo, hi, isStrictLo, isStrictHi);
     }
 
-    /// <summary>
-    /// Core AST-based decomposition. Given a bound variable and a body expression,
-    /// tries to match patterns like: lo <=|< k [&&|&& k] <|<= hi && property(k)
-    /// and produces 4 boundary clauses with effective boundary values
-    /// (adjusted for strict vs non-strict inequalities).
-    /// </summary>
-    static List<List<Expression>>? TryDecomposeQuantifierBody(
-        BoundVar boundVar, Expression body)
-    {
-        // Flatten top-level conjuncts
-        var conjuncts = FlattenConjuncts(body);
-
-        // Try to find range bounds: lo <=|< k <|<= hi
-        Expression? lo = null, hi = null;
-        int loIdx = -1, hiIdx = -1;
-        bool isStrictLo = false; // true for lo < k, false for lo <= k
-        bool isStrictHi = true;  // true for k < hi, false for k <= hi
-
-        for (int i = 0; i < conjuncts.Count; i++)
-        {
-            var c = Unwrap(conjuncts[i]);
-
-            // Pattern: ChainingExpression  lo <=|< k <|<= hi  (3 operands, 2 operators)
-            if (c is ChainingExpression chain
-                && chain.Operands.Count == 3
-                && chain.Operators.Count == 2
-                && ReferencesVar(chain.Operands[1], boundVar.Name)
-                && !ReferencesVar(chain.Operands[0], boundVar.Name)
-                && !ReferencesVar(chain.Operands[2], boundVar.Name))
-            {
-                // Extract lo from first comparison: Operands[0] op0 k
-                if (chain.Operators[0] == BinaryExpr.Opcode.Le
-                    || chain.Operators[0] == BinaryExpr.Opcode.Lt)
-                {
-                    lo = chain.Operands[0];
-                    loIdx = i;
-                    isStrictLo = chain.Operators[0] == BinaryExpr.Opcode.Lt;
-                }
-                // Extract hi from second comparison: k op1 Operands[2]
-                if (chain.Operators[1] == BinaryExpr.Opcode.Lt
-                    || chain.Operators[1] == BinaryExpr.Opcode.Le)
-                {
-                    hi = chain.Operands[2];
-                    hiIdx = i; // same index — both bounds come from same conjunct
-                    isStrictHi = chain.Operators[1] == BinaryExpr.Opcode.Lt;
-                }
-            }
-
-            // Pattern: lo <= k  (or equivalently k >= lo) — non-strict lower bound
-            if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Le } leq
-                && ReferencesVar(leq.E1, boundVar.Name) && !ReferencesVar(leq.E0, boundVar.Name))
-            {
-                lo = leq.E0;
-                loIdx = i;
-                isStrictLo = false;
-            }
-            else if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Ge } geq
-                && ReferencesVar(geq.E0, boundVar.Name) && !ReferencesVar(geq.E1, boundVar.Name))
-            {
-                lo = geq.E1;
-                loIdx = i;
-                isStrictLo = false;
-            }
-
-            // Pattern: lo < k  (or equivalently k > lo) — strict lower bound
-            if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Lt } ltLo
-                && ReferencesVar(ltLo.E1, boundVar.Name) && !ReferencesVar(ltLo.E0, boundVar.Name))
-            {
-                lo = ltLo.E0;
-                loIdx = i;
-                isStrictLo = true;
-            }
-            else if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Gt } gtLo
-                && ReferencesVar(gtLo.E0, boundVar.Name) && !ReferencesVar(gtLo.E1, boundVar.Name))
-            {
-                lo = gtLo.E1;
-                loIdx = i;
-                isStrictLo = true;
-            }
-
-            // Pattern: k < hi  (or equivalently hi > k) — strict upper bound
-            if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Lt } lt
-                && ReferencesVar(lt.E0, boundVar.Name) && !ReferencesVar(lt.E1, boundVar.Name))
-            {
-                hi = lt.E1;
-                hiIdx = i;
-                isStrictHi = true;
-            }
-            else if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Gt } gt
-                && ReferencesVar(gt.E1, boundVar.Name) && !ReferencesVar(gt.E0, boundVar.Name))
-            {
-                hi = gt.E0;
-                hiIdx = i;
-                isStrictHi = true;
-            }
-
-            // Pattern: k <= hi  (or equivalently hi >= k) — non-strict upper bound
-            if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Le } leHi
-                && ReferencesVar(leHi.E0, boundVar.Name) && !ReferencesVar(leHi.E1, boundVar.Name))
-            {
-                hi = leHi.E1;
-                hiIdx = i;
-                isStrictHi = false;
-            }
-            else if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Ge } geHi
-                && !ReferencesVar(geHi.E0, boundVar.Name) && ReferencesVar(geHi.E1, boundVar.Name))
-            {
-                hi = geHi.E0;
-                hiIdx = i;
-                isStrictHi = false;
-            }
-        }
-
-        if (lo == null || hi == null)
-            return null;
-
-        // The "property" is the remaining conjuncts after removing the range bounds
-        var propertyConjuncts = new List<Expression>();
-        for (int i = 0; i < conjuncts.Count; i++)
-            if (i != loIdx && i != hiIdx)
-                propertyConjuncts.Add(conjuncts[i]);
-
-        if (propertyConjuncts.Count == 0)
-            return null; // No property to decompose — just a range, nothing useful
-
-        var property = BuildConjunction(propertyConjuncts);
-
-        // Compute effective boundary values accounting for strict vs non-strict bounds.
-        // For lo < k (strict): first valid k is lo+1.  For lo <= k: first valid k is lo.
-        // For k < hi (strict): last valid k is hi-1.   For k <= hi: last valid k is hi.
-        var effectiveLo = isStrictLo ? MakeAdd(lo, 1) : lo;
-        var effectiveHi = isStrictHi ? MakeSub(hi, 1) : hi;
-
-        // Range guards built as typed BinaryExprs so the SMT path handles them via
-        // the typed BinaryExpr branch (no LeafExpression fallback).
-        //   aGuard:  effectiveLo <= effectiveHi                       (≥1 element — first exists)
-        //   bGuard:  effectiveLo + 1 <= effectiveHi                   (≥2 distinct elements — last differs from first)
-        //   cGuard:  effectiveLo + 2 <= effectiveHi                   (≥3 elements — strict middle exists)
-        var aGuard = (Expression)new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Le, effectiveLo, effectiveHi);
-        var afterLo = MakeAdd(effectiveLo, 1);
-        var beforeHi = MakeSub(effectiveHi, 1);
-        var bGuard = (Expression)new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Le, afterLo, effectiveHi);
-        var cGuard = (Expression)new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Le, MakeAdd(afterLo, 1), effectiveHi);
-
-        // Clause A (first satisfies): property[k := effectiveLo]
-        var leftProp = SubstituteVar(property, boundVar, effectiveLo);
-        var notLeftProp = Negate(leftProp);
-
-        // Clause B (last satisfies, first doesn't): property[k := effectiveHi] ∧ !property[lo]
-        var rightProp = SubstituteVar(property, boundVar, effectiveHi);
-        var notRightProp = Negate(rightProp);
-
-        // Clause C (strict middle satisfies, neither end does):
-        //   !property[lo] ∧ !property[hi] ∧ exists k :: lo+1 <= k <= hi-1 ∧ property
-        // The existential is emitted as a LeafExpression — constructing a fully-typed
-        // ExistsExpr here would require re-resolution of a synthetic bound var; the
-        // SMT translator's string-form fallback handles it.
-        var cExistsStr = $"exists {boundVar.Name} :: {ExprToString(afterLo)} <= {boundVar.Name} <= {ExprToString(beforeHi)} && {ExprToString(property)}";
-        var cExistsExpr = ParseToLeafExpression(cExistsStr);
-
-        var clauses = new List<List<Expression>>
-        {
-            new List<Expression> { aGuard, leftProp },                             // first
-            new List<Expression> { bGuard, notLeftProp, rightProp },               // last (not first)
-            new List<Expression> { cGuard, notLeftProp, notRightProp, cExistsExpr }, // middle (neither end)
-        };
-
-        return clauses;
-    }
 
     // ──────────────── AST manipulation helpers ────────────────
 
