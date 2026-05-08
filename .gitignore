@@ -26,6 +26,7 @@ test/*_log.txt
 test/experimental_results/*
 !test/experimental_results/run_dafny_generate_tests.py
 test/buggy_progs/out_*/
+!test/buggy_progs/out_of_scope/
 
 # Special test cases (local corpora not committed)
 test/new_buggy/
