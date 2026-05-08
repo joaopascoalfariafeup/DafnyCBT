@@ -596,12 +596,16 @@ static class DnfEngine
     /// <summary>
     /// Try to decompose an exists quantifier into mutually-exclusive cases at AST level.
     /// Pattern: exists k :: lo <=|< k <|<= hi && body(k)
-    /// Produces 2 mutually-exclusive DNF clauses, mirroring the standard `A || B` rule
-    /// (`A`, `!A ∧ B`):
-    ///   A: body[k/effLo]                                                  (first satisfies)
-    ///   B: !body[k/effLo] ∧ exists k :: effLo+1 <= k <= effHi && body     (first doesn't, some k > effLo does)
-    /// The right-boundary case from the older 3-way split is absorbed into B's range —
-    /// in practice it rarely produced a different witness from the left-boundary case.
+    /// Produces 3 mutually-exclusive DNF clauses (first / last / middle):
+    ///   A: body[k/effLo]                                                            (first satisfies)
+    ///   B: !body[k/effLo] ∧ body[k/effHi]                                            (last satisfies, first doesn't)
+    ///   C: !body[k/effLo] ∧ !body[k/effHi] ∧ exists k :: effLo+1 <= k <= effHi-1 ∧ body
+    ///                                                                                (some strictly-middle k satisfies)
+    /// The middle clause forces witnesses Z3 wouldn't otherwise pick — Z3 defaults to
+    /// the simplest model (typically the first or last index), so without C, mutants
+    /// that only fail when the witness is at a non-trivial position (e.g. linear-search
+    /// returning `-(n+1)` instead of `n+1` — kills only when `n >= 1` AND the search
+    /// hits the element at a non-last reverse-mapped position) escape.
     /// </summary>
     static List<List<Expression>>? TryDecomposeExists(ExistsExpr existsExpr)
     {
@@ -826,29 +830,36 @@ static class DnfEngine
 
         // Range guards built as typed BinaryExprs so the SMT path handles them via
         // the typed BinaryExpr branch (no LeafExpression fallback).
-        //   aGuard:  effectiveLo <= effectiveHi                  (range non-empty — at least one element)
-        //   bGuard:  effectiveLo + 1 <= effectiveHi              (at least two elements — needed so some k > lo exists)
+        //   aGuard:  effectiveLo <= effectiveHi                       (≥1 element — first exists)
+        //   bGuard:  effectiveLo + 1 <= effectiveHi                   (≥2 distinct elements — last differs from first)
+        //   cGuard:  effectiveLo + 2 <= effectiveHi                   (≥3 elements — strict middle exists)
         var aGuard = (Expression)new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Le, effectiveLo, effectiveHi);
         var afterLo = MakeAdd(effectiveLo, 1);
+        var beforeHi = MakeSub(effectiveHi, 1);
         var bGuard = (Expression)new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Le, afterLo, effectiveHi);
+        var cGuard = (Expression)new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Le, MakeAdd(afterLo, 1), effectiveHi);
 
         // Clause A (first satisfies): property[k := effectiveLo]
         var leftProp = SubstituteVar(property, boundVar, effectiveLo);
+        var notLeftProp = Negate(leftProp);
 
-        // Clause B (first doesn't, some k > lo does):
-        //   !property[k := effectiveLo]   (mutual-exclusion with A)
-        //   ∧ exists k :: effectiveLo+1 <= k <= effectiveHi && property
+        // Clause B (last satisfies, first doesn't): property[k := effectiveHi] ∧ !property[lo]
+        var rightProp = SubstituteVar(property, boundVar, effectiveHi);
+        var notRightProp = Negate(rightProp);
+
+        // Clause C (strict middle satisfies, neither end does):
+        //   !property[lo] ∧ !property[hi] ∧ exists k :: lo+1 <= k <= hi-1 ∧ property
         // The existential is emitted as a LeafExpression — constructing a fully-typed
         // ExistsExpr here would require re-resolution of a synthetic bound var; the
         // SMT translator's string-form fallback handles it.
-        var notLeftProp = Negate(leftProp);
-        var bExistsStr = $"exists {boundVar.Name} :: {ExprToString(afterLo)} <= {boundVar.Name} <= {ExprToString(effectiveHi)} && {ExprToString(property)}";
-        var bExistsExpr = ParseToLeafExpression(bExistsStr);
+        var cExistsStr = $"exists {boundVar.Name} :: {ExprToString(afterLo)} <= {boundVar.Name} <= {ExprToString(beforeHi)} && {ExprToString(property)}";
+        var cExistsExpr = ParseToLeafExpression(cExistsStr);
 
         var clauses = new List<List<Expression>>
         {
-            new List<Expression> { aGuard, leftProp },
-            new List<Expression> { bGuard, notLeftProp, bExistsExpr },
+            new List<Expression> { aGuard, leftProp },                             // first
+            new List<Expression> { bGuard, notLeftProp, rightProp },               // last (not first)
+            new List<Expression> { cGuard, notLeftProp, notRightProp, cExistsExpr }, // middle (neither end)
         };
 
         return clauses;
