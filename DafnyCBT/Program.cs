@@ -3443,6 +3443,23 @@ class Program
                     // Per-base mutable state.
                     var perBaseExclusions = bases.ToDictionary(b => b.label, b => new List<string>(
                         baseConditionExclusions.TryGetValue(b.baseKey, out var prior) ? prior : Enumerable.Empty<string>()));
+                    // Seed open-tier (`/O|<var>|>=K`) bases with a length exclusion
+                    // derived from their own Phase 2 witness, so the first Phase 3
+                    // round is forced to pick a length strictly greater than the
+                    // base's. Without this seeding, Z3 happily returns another
+                    // length-K result on round 1 (a different element pattern is
+                    // enough to pass the input-fingerprint dedup), the test budget
+                    // is hit, and the post-emit length-progression at line 3559
+                    // never gets a chance to ratchet up. The base's witness is
+                    // already in `testCases` (added during Phase 2), so look it
+                    // up by label and feed `repValues` into BuildOpenTierLengthExclusion.
+                    foreach (var b in bases)
+                    {
+                        var baseTest = testCases.FirstOrDefault(tc => tc.label == b.label);
+                        if (baseTest.values == null) continue;
+                        var seedLenExcl = BuildOpenTierLengthExclusion(b.label, baseTest.values, inputs, mutableNames);
+                        if (seedLenExcl != null) perBaseExclusions[b.label].Add(seedLenExcl);
+                    }
                     var perBaseRoundIdx = bases.ToDictionary(b => b.label, b => 0);
                     var perBaseRelExhausted = bases.ToDictionary(b => b.label, b => false);
                     // Consecutive-duplicate counter: how many rounds in a row the base has
