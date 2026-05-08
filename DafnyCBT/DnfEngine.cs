@@ -594,6 +594,107 @@ static class DnfEngine
     // ───────── quantifier decomposition (AST-based) ─────────
 
     /// <summary>
+    /// Returns up to three boundary narrowings of a single-variable existential
+    /// `exists k :: lo <= k < hi && P(k)`, suitable for use as Phase 2 BVA tier
+    /// extras (each narrowing is a strictly stronger constraint that, when ANDed
+    /// with the original existential, pins the witness to a specific position
+    /// class):
+    ///   ("=lo",  P[k := effectiveLo])                          first-position witness
+    ///   ("=hi",  P[k := effectiveHi])                          last-position witness
+    ///   ("=mid", exists k :: effectiveLo+1 <= k <= effectiveHi-1 && P(k))
+    ///                                                          strictly-middle witness
+    /// Returns null if the existential doesn't match the expected
+    /// `lo op k op hi && property(k)` shape (no extractable range, or pure
+    /// range with no property). Each narrowing is independent — emitted as a
+    /// SEPARATE Phase 2 tier on top of the original clause (which still
+    /// contains the unmodified existential), unlike the 3-way DNF
+    /// decomposition under `--exists-decomposition` which splits the clause
+    /// itself. This is cheaper (no DNF inflation) and benefits from
+    /// subsumption pruning when Phase 1's plain witness already happens
+    /// to land in one of the boundary regions.
+    /// </summary>
+    internal static List<(string Suffix, Expression Narrowing, BoundVar BoundVar)>?
+        GetExistsBoundaryNarrowings(ExistsExpr existsExpr)
+    {
+        if (existsExpr.BoundVars.Count != 1) return null;
+        var boundVar = existsExpr.BoundVars[0];
+        var body = existsExpr.Term;
+
+        // Reuse the same range-extraction pattern as TryDecomposeQuantifierBody.
+        var conjuncts = FlattenConjuncts(body);
+        Expression? lo = null, hi = null;
+        int loIdx = -1, hiIdx = -1;
+        bool isStrictLo = false;
+        bool isStrictHi = true;
+
+        for (int i = 0; i < conjuncts.Count; i++)
+        {
+            var c = Unwrap(conjuncts[i]);
+            if (c is ChainingExpression chain
+                && chain.Operands.Count == 3 && chain.Operators.Count == 2
+                && ReferencesVar(chain.Operands[1], boundVar.Name)
+                && !ReferencesVar(chain.Operands[0], boundVar.Name)
+                && !ReferencesVar(chain.Operands[2], boundVar.Name))
+            {
+                if (chain.Operators[0] == BinaryExpr.Opcode.Le || chain.Operators[0] == BinaryExpr.Opcode.Lt)
+                { lo = chain.Operands[0]; loIdx = i; isStrictLo = chain.Operators[0] == BinaryExpr.Opcode.Lt; }
+                if (chain.Operators[1] == BinaryExpr.Opcode.Lt || chain.Operators[1] == BinaryExpr.Opcode.Le)
+                { hi = chain.Operands[2]; hiIdx = i; isStrictHi = chain.Operators[1] == BinaryExpr.Opcode.Lt; }
+            }
+            if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Le } leq
+                && ReferencesVar(leq.E1, boundVar.Name) && !ReferencesVar(leq.E0, boundVar.Name))
+            { lo = leq.E0; loIdx = i; isStrictLo = false; }
+            else if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Ge } geq
+                && ReferencesVar(geq.E0, boundVar.Name) && !ReferencesVar(geq.E1, boundVar.Name))
+            { lo = geq.E1; loIdx = i; isStrictLo = false; }
+            if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Lt } ltLo
+                && ReferencesVar(ltLo.E1, boundVar.Name) && !ReferencesVar(ltLo.E0, boundVar.Name))
+            { lo = ltLo.E0; loIdx = i; isStrictLo = true; }
+            else if (lo == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Gt } gtLo
+                && ReferencesVar(gtLo.E0, boundVar.Name) && !ReferencesVar(gtLo.E1, boundVar.Name))
+            { lo = gtLo.E1; loIdx = i; isStrictLo = true; }
+            if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Lt } lt
+                && ReferencesVar(lt.E0, boundVar.Name) && !ReferencesVar(lt.E1, boundVar.Name))
+            { hi = lt.E1; hiIdx = i; isStrictHi = true; }
+            else if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Gt } gt
+                && ReferencesVar(gt.E1, boundVar.Name) && !ReferencesVar(gt.E0, boundVar.Name))
+            { hi = gt.E0; hiIdx = i; isStrictHi = true; }
+            if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Le } leHi
+                && ReferencesVar(leHi.E0, boundVar.Name) && !ReferencesVar(leHi.E1, boundVar.Name))
+            { hi = leHi.E1; hiIdx = i; isStrictHi = false; }
+            else if (hi == null && c is BinaryExpr { Op: BinaryExpr.Opcode.Ge } geHi
+                && !ReferencesVar(geHi.E0, boundVar.Name) && ReferencesVar(geHi.E1, boundVar.Name))
+            { hi = geHi.E0; hiIdx = i; isStrictHi = false; }
+        }
+
+        if (lo == null || hi == null) return null;
+
+        var propertyConjuncts = new List<Expression>();
+        for (int i = 0; i < conjuncts.Count; i++)
+            if (i != loIdx && i != hiIdx)
+                propertyConjuncts.Add(conjuncts[i]);
+        if (propertyConjuncts.Count == 0) return null;
+        var property = BuildConjunction(propertyConjuncts);
+
+        var effectiveLo = isStrictLo ? MakeAdd(lo, 1) : lo;
+        var effectiveHi = isStrictHi ? MakeSub(hi, 1) : hi;
+        var afterLo = MakeAdd(effectiveLo, 1);
+        var beforeHi = MakeSub(effectiveHi, 1);
+
+        var leftProp = SubstituteVar(property, boundVar, effectiveLo);
+        var rightProp = SubstituteVar(property, boundVar, effectiveHi);
+        var midExistsStr = $"exists {boundVar.Name} :: {ExprToString(afterLo)} <= {boundVar.Name} <= {ExprToString(beforeHi)} && {ExprToString(property)}";
+        var midExistsExpr = ParseToLeafExpression(midExistsStr);
+
+        return new List<(string, Expression, BoundVar)>
+        {
+            ("=lo",  leftProp,  boundVar),
+            ("=hi",  rightProp, boundVar),
+            ("=mid", midExistsExpr, boundVar),
+        };
+    }
+
+    /// <summary>
     /// Try to decompose an exists quantifier into mutually-exclusive cases at AST level.
     /// Pattern: exists k :: lo <=|< k <|<= hi && body(k)
     /// Produces 3 mutually-exclusive DNF clauses (first / last / middle):

@@ -2159,21 +2159,66 @@ class Program
                                     clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (> {expSmt} {loSmt}) (< {expSmt} {hiSmt}))" }, simpleMask, pi));
                                 emitted.Add($"{pi}|{ci}|{midLabel}");
                                 // Boundary EXP=LO (only when L1 is non-strict; for `LO <
-                                // EXP`, EXP=LO is UNSAT given the precondition).
+                                // EXP`, EXP=LO is UNSAT given the precondition). Strengthen
+                                // with `EXP < HI` (or `EXP <= HI` if L2 is non-strict)
+                                // so the boundary tier is structurally distinct from the
+                                // EXP=HI tier even when LO == HI is satisfiable — without
+                                // this strengthening Z3 may pick the degenerate single-point
+                                // model (LO == EXP == HI) that satisfies both =lo and =hi
+                                // tiers identically, defeating boundary diversity.
+                                var hiCmpOp = strictHi ? "<" : "<=";
+                                var loCmpOp = strictLo ? "<" : "<=";
                                 if (!strictLo)
                                 {
                                     var lLabel = $"{rangeLabel}/=lo";
                                     schedule.Add(($"{clauseLabel}/B{lLabel}",
-                                        clause, fullPreLits, new List<Expression>(), new List<string> { $"(= {expSmt} {loSmt})" }, simpleMask, pi));
+                                        clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (= {expSmt} {loSmt}) ({hiCmpOp} {expSmt} {hiSmt}))" }, simpleMask, pi));
                                     emitted.Add($"{pi}|{ci}|{lLabel}");
                                 }
                                 if (!strictHi)
                                 {
                                     var hLabel = $"{rangeLabel}/=hi";
                                     schedule.Add(($"{clauseLabel}/B{hLabel}",
-                                        clause, fullPreLits, new List<Expression>(), new List<string> { $"(= {expSmt} {hiSmt})" }, simpleMask, pi));
+                                        clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (= {expSmt} {hiSmt}) ({loCmpOp} {loSmt} {expSmt}))" }, simpleMask, pi));
                                     emitted.Add($"{pi}|{ci}|{hLabel}");
                                 }
+                            }
+                        }
+
+                        // Existential boundary tiers (no DNF inflation). For each
+                        // post-clause literal of the form `exists k :: lo <= k < hi
+                        // && P(k)`, emit up to three Phase 2 entries that pin the
+                        // witness to a specific position class:
+                        //   /Eb<n>=lo  — extra: P[k := effectiveLo]                  (first witness)
+                        //   /Eb<n>=hi  — extra: P[k := effectiveHi]                  (last witness)
+                        //   /Eb<n>=mid — extra: exists k :: lo+1 <= k <= hi-1 && P(k) (middle)
+                        // The original existential STAYS in the clause; the extra
+                        // narrows the witness without splitting the DNF (cf. the
+                        // 3-way split under --exists-decomposition which inflates
+                        // the clause set). Subsumption pruning at solve time skips
+                        // any tier already covered by a prior test's witness.
+                        // Targets mutants that escape default tests because Z3's
+                        // default existential witness lands at first/last where
+                        // the divergence is invisible (e.g. LinearSearch3 returning
+                        // -(n+1): `n=0` makes the result -1, coinciding with the
+                        // "not found" sentinel and masking the bug).
+                        int existsIdx = 0;
+                        foreach (var lit in clause)
+                        {
+                            var inner = Unwrap(lit);
+                            if (inner is not ExistsExpr existsExpr) continue;
+                            existsIdx++;
+                            var narrowings = DnfEngine.GetExistsBoundaryNarrowings(existsExpr);
+                            if (narrowings == null) continue;
+                            foreach (var (suffix, narrowing, _) in narrowings)
+                            {
+                                SmtTranslator.ResetExprToSmtBudget();
+                                var smtExtra = SmtTranslator.ExprToSmt(narrowing, allInputs, mutableNames, isPostContext: true);
+                                if (smtExtra == null) continue;
+                                var ebLabel = $"Eb{existsIdx}{suffix}";
+                                schedule.Add(($"{clauseLabel}/B{ebLabel}",
+                                    clause, fullPreLits, new List<Expression>(), new List<string> { smtExtra }, simpleMask, pi));
+                                emitted.Add($"{pi}|{ci}|{ebLabel}");
                             }
                         }
                     }
