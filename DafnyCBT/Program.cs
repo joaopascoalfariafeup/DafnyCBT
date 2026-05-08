@@ -17,7 +17,7 @@ class Program
     static string RelevanceMode = "ladder";
     public static bool VacuityCheckEnabled = false;
     public static bool ReverseBvaOrder = false;
-    public static bool LiteralBvaEnabled = false;
+    public static bool LiteralBvaEnabled = true;
     // Unroll depth for recursive functions during spec inlining. Default 1
     // (one level of substitution; residual recursive calls fall back to a
     // type-correct uninterpreted stub). Higher values fully unroll linear
@@ -87,9 +87,16 @@ class Program
         var reverseBvaOrderOpt = new Option<bool>("--reverse-bva-order",
             "Run Phase 2b (categorical type/size coverage) before Phase 2 (refined-range BVA) instead of after. Default order is 2 → 2b. When reversed, Phase 2's per-clause dedup against Phase 2b keys is dropped; subsumption at solve-time still skips redundant entries. Useful for kill-curve ablation experiments.");
         reverseBvaOrderOpt.AddAlias("-rbva");
+        var noLiteralBvaOpt = new Option<bool>("--no-literal-bva",
+            "Phase 2 BVA: disable the literal-centric tier emission and fall back to the legacy variable-centric extractor (boundary tiers per int/nat variable from extracted bounds). Default: literal-centric is ON — for each relational post-clause literal `E1 op E2` (with op ∈ {<, ≤, >, ≥}) emit boundary (`E1 = E2`) and strict-companion (`E1 > E2` / `E1 < E2`) tiers, plus chained-range mid synthesis (`LO ≤ EXP ≤ HI` ↦ `EXP=LO` / `EXP=HI` / `LO<EXP<HI`). Catches ROR-mutated bound bugs on compound expressions (`|carPark| > normalSpaces - badParkingBuffer`) the variable-centric path can't reach.");
+        noLiteralBvaOpt.AddAlias("-nlbva");
+        // Legacy alias for the prior opt-in form. Now a hidden no-op since
+        // literal-centric is the default — kept so existing scripts using
+        // --literal-bva / -lbva don't error out.
         var literalBvaOpt = new Option<bool>("--literal-bva",
-            "Phase 2 BVA: scan every relational post-clause literal `E1 op E2` (with op ∈ {<, ≤, >, ≥}) and emit boundary (`E1 = E2`) and strict-companion (`E1 > E2` / `E1 < E2`) tiers, regardless of whether E1 or E2 is a bare variable. Targets ROR-mutated `≥` → `==` bugs whose witness lies strictly above/below a relational bound (e.g. `|carPark| > normalSpaces - badParkingBuffer`). Default OFF — uses the legacy variable-centric extractor.");
+            "Deprecated. Literal-centric Phase 2 BVA is now the default; this flag is a no-op. Use --no-literal-bva / -nlbva to opt out.");
         literalBvaOpt.AddAlias("-lbva");
+        literalBvaOpt.IsHidden = true;
         var seedOpt = new Option<int?>("--seed",
             "Force a fixed Z3 random seed for every SMT query, overriding the per-method name hash and bypassing the --no-bias / skipBias gating. Useful for reproducibility experiments and seed-sensitivity studies. When omitted, the usual per-method deterministic seed is used (but only when bias is on).");
         var relevanceModeOpt = new Option<string>("--relevance-mode", () => "ladder",
@@ -105,7 +112,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, vacuityOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, vacuityOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -152,9 +159,9 @@ class Program
             ReverseBvaOrder = ctx.ParseResult.GetValueForOption(reverseBvaOrderOpt);
             if (ReverseBvaOrder)
                 Console.WriteLine("[DafnyCBT] BVA order: Phase 2b → Phase 2 (reversed)");
-            LiteralBvaEnabled = ctx.ParseResult.GetValueForOption(literalBvaOpt);
-            if (LiteralBvaEnabled)
-                Console.WriteLine("[DafnyCBT] Phase 2 BVA: literal-centric (E1 op E2 boundary + strict-companion tiers)");
+            LiteralBvaEnabled = !ctx.ParseResult.GetValueForOption(noLiteralBvaOpt);
+            if (!LiteralBvaEnabled)
+                Console.WriteLine("[DafnyCBT] Phase 2 BVA: variable-centric (legacy — literal-centric disabled)");
             SmtTranslator.ForcedSeed = ctx.ParseResult.GetValueForOption(seedOpt);
             RecursiveUnrollDepth = Math.Max(1, ctx.ParseResult.GetValueForOption(unrollDepthOpt));
             if (RecursiveUnrollDepth > 1)
