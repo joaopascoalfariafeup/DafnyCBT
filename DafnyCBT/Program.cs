@@ -107,12 +107,15 @@ class Program
             "In --check mode, treat tests that crash with an unhandled exception from the method under test (non-zero exit, no FAIL marker) as SKIPPED instead of FAILED. Preconditions that passed PRE-CHECK but led to a crash (e.g. out-of-bounds access, overflow in the impl) are reported separately as `skipped (exception)`. Default: OFF — crashes count as failures.");
         var unrollDepthOpt = new Option<int>("--unroll-depth", () => 1,
             "Unroll depth for recursive functions in spec inlining. Default 1 (one level of body substitution; the residual recursive call falls back to a type-correct uninterpreted stub). Bump to e.g. 4 to fully unroll linear recursions like ProdF(s) = s[0]*ProdF(s[1..]) for sequences of length ≤ N. Higher values can blow up SMT size for branching recursion (Fibonacci-style); start small and raise only if needed.");
+        var smokeTestsOpt = new Option<bool>("--smoke-tests",
+            "Also generate tests for methods that have a precondition but no postcondition (`requires` only). Each such method gets a single test that satisfies the precondition and calls the method, with no `expect` checks — passes if the method returns. Useful for catching infinite-loop / crash mutants in unspecified helpers. Excludes `Main` and methods named *Test* / *test*. Default: OFF.");
+        smokeTestsOpt.AddAlias("-st");
         var dropPostWfOpt = new Option<bool>("--drop-post-wf-guards", () => true,
             "Drop well-formedness guards (e.g., 0<=i<a.Length) generated while translating postconditions. Default: ON. An implication-guarded access like '0<=i<a.Length ==> a[i] == x' already bounds i inside the `==>`; re-asserting the bound as a hard top-level fact would incorrectly strengthen the spec and break uniqueness/relevance reasoning. Pass `--drop-post-wf-guards false` to restore legacy behavior.");
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, vacuityOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, vacuityOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -142,6 +145,9 @@ class Program
             TestValidator.CommentUncompilable = ctx.ParseResult.GetValueForOption(commentUncompilableOpt);
             UniquenessRounds = ctx.ParseResult.GetValueForOption(uniquenessRoundsOpt);
             var skipBodyless = ctx.ParseResult.GetValueForOption(skipBodylessOpt);
+            var smokeTests = ctx.ParseResult.GetValueForOption(smokeTestsOpt);
+            if (smokeTests)
+                Console.WriteLine("[DafnyCBT] Smoke tests: ON (also testing methods with `requires` only)");
             var antiTrivialBias = !ctx.ParseResult.GetValueForOption(noBiasOpt);
             SmtTranslator.AntiTrivialBiasEnabled = antiTrivialBias;
             if (!antiTrivialBias)
@@ -221,7 +227,7 @@ class Program
                 if (files.Count > 1)
                     Console.WriteLine($"{'='} Processing: {file.Name} {'=',40}");
 
-                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat, minTests, z3Path, maxTests, timeout, skipBodyless, grouping);
+                await Run(file, method, outputFile, verbose, allComb, boundary, simple, tiers, check, repeat, minTests, z3Path, maxTests, timeout, skipBodyless, grouping, smokeTests);
 
                 if (files.Count > 1)
                     Console.WriteLine();
@@ -264,7 +270,7 @@ class Program
         return new List<FileInfo>();
     }
 
-    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1, int minTests = 4, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool skipBodyless = false, string grouping = "by-method")
+    static async Task Run(FileInfo file, string? methodName, FileInfo? outputFile, bool verbose, bool allCombinations, bool boundary, bool simple, int tiers, bool check = false, int repeat = 1, int minTests = 4, string? z3Path = null, int maxTests = 0, int timeoutSecs = 0, bool skipBodyless = false, string grouping = "by-method", bool smokeTests = false)
     {
         if (!file.Exists)
         {
@@ -526,7 +532,7 @@ class Program
         else
         {
             // Auto-discover: all non-ghost methods that don't have "test" in the name
-            methods = DafnyParser.FindTestableMethodsAuto(program, enumDatatypes, classNames);
+            methods = DafnyParser.FindTestableMethodsAuto(program, enumDatatypes, classNames, smokeTests);
             if (!methods.Any())
             {
                 Console.Error.WriteLine("No testable methods found (methods with ensures and without 'test' in name).");
@@ -1230,6 +1236,12 @@ class Program
         // Get DNF clauses as AST Expressions — kept as Expressions throughout the pipeline.
         // Strings are only used for display, dedup keys, and at the TestEmitter boundary.
         var ensuresClauses = method.Ens.Select(e => e.E).ToList();
+        // Smoke-tests path: when a method has `requires` but no `ensures`, force
+        // preOnlyMode so Z3 only solves for inputs satisfying the precondition.
+        // No postconditions to encode means the DNF is trivially a single empty
+        // clause; the test that emerges calls the method with valid inputs and
+        // emits no expects — passing if the method returns.
+        if (ensuresClauses.Count == 0) preOnlyMode = true;
         // preOnlyMode: postconditions are NOT solved by Z3 (too expensive), but still emitted
         // as runtime-evaluated expects so buggy implementations fail with diagnostics.
         // Force the "full-postcondition as expect" path used for uninterpreted functions.
@@ -1374,9 +1386,19 @@ class Program
         // Force the full-postcondition / no-alt-enum path in that case.
         // Use CrossProductPruned to keep clause structure aligned with dnfExprs — otherwise
         // the position-based inlined→original mapping below misaligns and literals get lost.
-        var originalDnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
-        for (int i = 1; i < ensuresClauses.Count; i++)
-            originalDnfExprs = DnfEngine.CrossProductPruned(originalDnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
+        // Smoke-test path with no ensures: single trivial clause (Z3 solves for
+        // pre-only). Avoids IndexOutOfRange on `ensuresClauses[0]`.
+        List<List<Expression>> originalDnfExprs;
+        if (ensuresClauses.Count == 0)
+        {
+            originalDnfExprs = new List<List<Expression>> { new List<Expression>() };
+        }
+        else
+        {
+            originalDnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
+            for (int i = 1; i < ensuresClauses.Count; i++)
+                originalDnfExprs = DnfEngine.CrossProductPruned(originalDnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
+        }
 
         // Compute DNF/FDNF on inlined ensures for SMT translation.
         // FDNF (Full DNF) used only in all-combinations mode (explicit -a flag).

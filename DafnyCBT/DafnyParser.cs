@@ -101,7 +101,8 @@ static class DafnyParser
 
     internal static List<Method> FindTestableMethodsAuto(Microsoft.Dafny.Program program,
         Dictionary<string, List<string>>? enumDatatypes = null,
-        HashSet<string>? classNames = null)
+        HashSet<string>? classNames = null,
+        bool smokeTests = false)
     {
         var result = new List<Method>();
         foreach (var topDecl in AllTopLevelDecls(program))
@@ -110,7 +111,13 @@ static class DafnyParser
             {
                 foreach (var member in cls.Members)
                 {
-                    if (member is Method m && !m.IsGhost && m.Ens.Count > 0
+                    // Standard mode: at least one ensures (postcondition to test).
+                    // Smoke-tests mode: also accept methods with `requires` only —
+                    // generates a single test that satisfies the precondition and
+                    // calls the method (no expects). Catches infinite-loop / crash
+                    // mutants in unspecified helpers without requiring a contract.
+                    if (member is Method m && !m.IsGhost
+                        && (m.Ens.Count > 0 || (smokeTests && m.Req.Count > 0))
                         && !m.Name.Contains("test", StringComparison.OrdinalIgnoreCase)
                         && !m.Name.Contains("Test", StringComparison.OrdinalIgnoreCase)
                         && m.Name != "Main"
