@@ -110,6 +110,81 @@ static class TestEmitter
     // we only rewrite when the body has NO `==>` at any depth — false negatives
     // are tolerable (those expects will still fail to compile, but
     // --comment-uncompilable picks them up).
+    // Split `forall <vars>: <unbounded-type> :: A <==> B` into
+    //    (forall <vars>: <unbounded-type> :: A ==> B) && (forall <vars>: <unbounded-type> :: B ==> A)
+    // Dafny's runtime compiler cannot enumerate `<==>` over an unbounded domain,
+    // but each implication is compilable when its antecedent is a bounded
+    // membership predicate (e.g., `i in nums ==> P(i)` enumerates over `nums`).
+    // The split is semantics-preserving. Bounded foralls (with `|` range or
+    // bounded type) are left alone — the original `<==>` form already compiles.
+    static string RewriteForallBiconditionals(string lit)
+    {
+        int idx = 0;
+        var sb = new System.Text.StringBuilder();
+        while (idx < lit.Length)
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(lit.Substring(idx),
+                @"\bforall\b");
+            if (!m.Success) { sb.Append(lit.Substring(idx)); break; }
+            int forallStart = idx + m.Index;
+            sb.Append(lit.Substring(idx, forallStart - idx));
+            int dcolon = lit.IndexOf("::", forallStart);
+            if (dcolon < 0) { sb.Append(lit.Substring(forallStart)); break; }
+            int bodyStart = dcolon + 2;
+            int depth = 0;
+            int bodyEnd = lit.Length;
+            for (int j = bodyStart; j < lit.Length; j++)
+            {
+                char c = lit[j];
+                if (c == '(' || c == '[' || c == '{') depth++;
+                else if (c == ')' || c == ']' || c == '}')
+                {
+                    if (depth == 0) { bodyEnd = j; break; }
+                    depth--;
+                }
+                else if (c == ';' && depth == 0) { bodyEnd = j; break; }
+            }
+            var quantPart = lit.Substring(forallStart, bodyStart - forallStart);
+            var body = lit.Substring(bodyStart, bodyEnd - bodyStart);
+            bool unboundedType = System.Text.RegularExpressions.Regex.IsMatch(
+                quantPart, @":\s*(int|nat|real)\b");
+            bool hasRangeBar = false;
+            int qDepth = 0;
+            for (int j = forallStart + 6; j < dcolon; j++)
+            {
+                char c = lit[j];
+                if (c == '(' || c == '[' || c == '{') qDepth++;
+                else if (c == ')' || c == ']' || c == '}') qDepth--;
+                else if (qDepth == 0 && c == '|'
+                         && (j + 1 >= lit.Length || lit[j + 1] != '|')
+                         && (j == 0 || lit[j - 1] != '|'))
+                { hasRangeBar = true; break; }
+            }
+            int biconAt = -1;
+            int d3 = 0;
+            for (int j = 0; j + 3 < body.Length; j++)
+            {
+                char c = body[j];
+                if (c == '(' || c == '[' || c == '{') d3++;
+                else if (c == ')' || c == ']' || c == '}') d3--;
+                else if (d3 == 0 && body[j] == '<' && body[j + 1] == '=' && body[j + 2] == '=' && body[j + 3] == '>')
+                { biconAt = j; break; }
+            }
+            if (unboundedType && !hasRangeBar && biconAt >= 0)
+            {
+                var lhs = body.Substring(0, biconAt).TrimEnd();
+                var rhs = body.Substring(biconAt + 4).TrimStart();
+                sb.Append($"(({quantPart}{lhs} ==> {rhs}) && ({quantPart}{rhs} ==> {lhs}))");
+            }
+            else
+            {
+                sb.Append(lit.Substring(forallStart, bodyEnd - forallStart));
+            }
+            idx = bodyEnd;
+        }
+        return sb.ToString();
+    }
+
     static string RewriteUnboundedForalls(string lit)
     {
         // Match `forall <name>[: <type>] [{:trigger ...}] :: <body>` and
@@ -172,6 +247,8 @@ static class TestEmitter
             }
             if (hasRangeBar) unboundedType = false;
             // Detect top-level `==>`: any `==>` outside parens makes the body bounded.
+            // Note: `<==>` also matches this pattern; the bicon-split pre-pass
+            // (RewriteForallBiconditionals) already handled that case.
             bool hasTopLevelImp = false;
             int d2 = 0;
             for (int j = 0; j < body.Length - 2; j++)
@@ -1767,7 +1844,7 @@ static class TestEmitter
                     // Same chained-bound rewrite as the post path: `LO <= V1 <= V2 <= HI`
                     // → independent bounds + filter, so Dafny's runtime compiler
                     // accepts the expect.
-                    sb.AppendLine($"    expect {RewriteChainedForallBounds(preStr)}; // PRE-CHECK");
+                    sb.AppendLine($"    expect {RewriteForallBiconditionals(RewriteChainedForallBounds(preStr))}; // PRE-CHECK");
                 }
             }
 
@@ -2390,7 +2467,7 @@ static class TestEmitter
                     else if (isSimpleEq && rhsInline.TryGetValue(lhsName, out var inlineRhs))
                         sb.AppendLine($"{prefix}{lhsName} == {inlineRhs}{suffix}");
                     else
-                        sb.AppendLine($"{prefix}{RewriteUnboundedForalls(RewriteChainedForallBounds(lit))}{suffix}");
+                        sb.AppendLine($"{prefix}{RewriteUnboundedForalls(RewriteForallBiconditionals(RewriteChainedForallBounds(lit)))}{suffix}");
                 }
             }
 

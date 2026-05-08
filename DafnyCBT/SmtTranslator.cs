@@ -129,6 +129,16 @@ static class SmtTranslator
     internal static Dictionary<string, List<string>> _enumDatatypes = new();
     internal static Dictionary<string, (string dtName, int ordinal)> _enumConstructors = new();
 
+    // Subset / type-synonym aliases: alias name → base type string. Used by the
+    // decl loop so a parameter typed `interval` (where `type interval = iv:
+    // (int, int) | iv.0 <= iv.1`) gets the same flat tuple encoding as a bare
+    // `(int, int)`. Without this, the decl falls back to `(declare-const x Int)`
+    // while the spec translation references `x_0`/`x_1` (tuple field accesses) —
+    // Z3 then errors on the unknown constants and silently returns a degenerate
+    // model, which in turn makes every literal-centric BVA tier appear
+    // subsumed by the base case.
+    internal static Dictionary<string, string> _subsetTypeBase = new();
+
     // Non-enum algebraic datatypes admitted in v1 (slice 1: non-recursive only).
     // _adtDatatypes:   dtName → list of (ctorName, list of (formalName, formalType))
     // _adtConstructors: ctorName → (dtName, ordinal)
@@ -451,8 +461,16 @@ static class SmtTranslator
         // post-state (output) values. This prevents postconditions like IsSorted(a[..])
         // from constraining inputs.
         var allVars = inputs.Concat(outputs).ToList();
-        foreach (var (name, type) in allVars)
+        foreach (var (name, typeRaw) in allVars)
         {
+            // Resolve subset-type / synonym aliases to their base type so the
+            // dispatch below picks the correct branch (e.g. `interval` =>
+            // `(int, int)` => the tuple branch flat-encodes as name_0/name_1,
+            // matching the tuple field accesses produced by ExprToSmt for
+            // `interval.0`/`interval.1`). Without this resolution the alias
+            // falls through to the generic `(declare-const name Int)` branch
+            // and Z3 errors on every `name_0`/`name_1` reference.
+            var type = _subsetTypeBase.TryGetValue(typeRaw, out var baseT) ? baseT : typeRaw;
             // Skip names already emitted as `(define-fun {name} () ... <literal>)` via
             // the const-inline pass above. Class const fields with literal initializers
             // (e.g. `const totalSpaces: nat := 10`) get added to `inputs` by the
@@ -2042,6 +2060,34 @@ static class SmtTranslator
             var tupleIdxStr = memSel.MemberName.StartsWith("_") ? memSel.MemberName.Substring(1) : memSel.MemberName;
             if (int.TryParse(tupleIdxStr, out var tupleIdx))
             {
+                // Constant-fold tuple destructor on a tuple literal: `(e0, e1).0` -> `e0`,
+                // `(e0, e1).1` -> `e1`. Arises after function inlining substitutes a tuple
+                // argument like `valid_interval(s, (x, y))` whose body destructures with
+                // `iv.0`, `iv.1`. Without this fold, `(x, y).0` falls through to the
+                // generic path (`ExprToSmt(DatatypeValue) -> null`), which makes the whole
+                // surrounding forall translation fail with "Could not translate".
+                {
+                    var unwrappedObj = memSel.Obj;
+                    while (unwrappedObj is ParensExpression pe) unwrappedObj = pe.E;
+                    while (unwrappedObj is ConcreteSyntaxExpression cse && cse.ResolvedExpression != null)
+                        unwrappedObj = cse.ResolvedExpression;
+                    if (unwrappedObj is DatatypeValue tupVal && tupleIdx < tupVal.Arguments.Count)
+                    {
+                        // Recognise tuples by either Type.AsDatatype or DatatypeName/Ctor.
+                        // After inlining, the substituted DatatypeValue may not have its
+                        // Type re-resolved — fall back to ctor-name pattern matching.
+                        bool isTuple = tupVal.Type?.AsDatatype?.Name?.StartsWith("_System.Tuple") == true
+                            || tupVal.DatatypeName?.StartsWith("_tuple") == true
+                            || tupVal.DatatypeName == ""
+                            || (tupVal.Ctor?.EnclosingDatatype?.Name?.StartsWith("_System.Tuple") == true);
+                        if (isTuple)
+                        {
+                            var inner = ExprToSmt(tupVal.Arguments[tupleIdx], inputs, mutableNames, isPostContext, insideOld);
+                            if (inner != null) return inner;
+                            goto fallback;
+                        }
+                    }
+                }
                 // Special case: a[i].0 where a is array<(T,U)> or seq<(T,U)>
                 // Produces (seq.nth a_seq_0 i) instead of invalid (seq.nth a_seq i)_0
                 if (memSel.Obj is SeqSelectExpr innerSeqSel && innerSeqSel.SelectOne && innerSeqSel.E0 != null)

@@ -334,6 +334,40 @@ class Program
         if (enumDatatypes.Count > 0)
             Console.WriteLine($"[DafnyCBT] Enum datatypes: {string.Join(", ", enumDatatypes.Select(e => $"{e.Key}({string.Join("|", e.Value)})"))}");
 
+        // Subset-type / type-synonym aliases (e.g. `type interval = iv: (int,
+        // int) | iv.0 <= iv.1`): record alias name → base-type string so the
+        // SMT decl loop can flat-encode `interval`-typed parameters as
+        // `name_0`/`name_1` (same as a bare `(int, int)`). Without this, the
+        // alias falls through to a generic Int decl and Z3 errors on every
+        // tuple-component reference produced by the spec translation. Use
+        // reflection to find a `Rhs`-style Type-valued property without
+        // hard-coding Dafny's exact class hierarchy across versions.
+        var subsetTypeBase = new Dictionary<string, string>();
+        foreach (var topDecl in DafnyParser.AllTopLevelDecls(program))
+        {
+            var typeName = topDecl.GetType().Name;
+            if (typeName != "SubsetTypeDecl" && typeName != "TypeSynonymDecl") continue;
+            var t = topDecl.GetType();
+            foreach (var prop in t.GetProperties())
+            {
+                try
+                {
+                    if (typeof(Microsoft.Dafny.Type).IsAssignableFrom(prop.PropertyType)
+                        && (prop.Name == "Rhs" || prop.Name == "RhsWithArgument"))
+                    {
+                        if (prop.GetValue(topDecl) is Microsoft.Dafny.Type rhs)
+                        {
+                            subsetTypeBase[topDecl.Name] = rhs.ToString();
+                            break;
+                        }
+                    }
+                } catch { }
+            }
+        }
+        if (subsetTypeBase.Count > 0)
+            Console.WriteLine($"[DafnyCBT] Subset/synonym types: {string.Join(", ", subsetTypeBase.Select(kv => $"{kv.Key} = {kv.Value}"))}");
+        SmtTranslator._subsetTypeBase = subsetTypeBase;
+
         // Slice 1 admission: non-enum ADT, no type params, not codata, no formal
         // referencing any non-enum datatype name (excludes recursion + mutual rec).
         var nonEnumDatatypeNames = new HashSet<string>(nonEnumDatatypes.Select(d => d.Name));
