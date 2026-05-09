@@ -3076,23 +3076,100 @@ class Program
                                 lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
                             }
                         }
-                        // combined/ladder: UNSAT with multiple safe indices → at least one is
-                        // redundant. Fall back to single-literal (last safe index) to still
-                        // exercise the defining literal when possible.
+                        // combined/ladder: UNSAT with multiple safe indices → at least one
+                        // is mutually subsumed by another (e.g. a forall whose body
+                        // implies a positive literal). Sweep each safe index individually:
+                        // each SAT probe yields a test that exercises that specific
+                        // literal. Multiple Q's may be SAT (e.g. Q9 and Q11 in the
+                        // FirstEvenOddIndices spec — both restrict to first-occurrence
+                        // independently on multi-element inputs); we emit one /RelQ<k+1>
+                        // test per SAT index.
+                        bool perLiteralSweepSatAny = false;
                         if (mode != "group" && lines.Any(l => l == "unsat") && safeIndices.Count > 1)
                         {
-                            var fallbackIndices = new List<int> { safeIndices[safeIndices.Count - 1] };
-                            var fbSmt = SmtTranslator.BuildRelevanceQuery(
-                                inputs, outputs, fullPreLits, clause, method, mutableNames, fallbackIndices);
-                            if (fbSmt != null)
+                            foreach (var k in safeIndices)
                             {
-                                if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: multi-literal UNSAT — retry with Q{fallbackIndices[0] + 1} only");
-                                z3Result = await Z3Runner.RunZ3(z3Path, fbSmt);
-                                lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
-                                lastQueriedIndex = fallbackIndices[0];
+                                if (TimedOut()) break;
+                                if (maxTests > 0 && testCases.Count >= maxTests) break;
+                                var perLitIndices = new List<int> { k };
+                                // Try with strip-strengthening first, fall back to plain on UNSAT.
+                                string? perStripSmt = SmtTranslator.BuildRelevanceQuery(
+                                    inputs, outputs, fullPreLits, clause, method, mutableNames, perLitIndices, null, assertExistsStripped: true);
+                                if (perStripSmt == null) continue;
+                                if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel}/Q{k + 1} (single-literal+strip)...");
+                                var perResult = await Z3Runner.RunZ3(z3Path, perStripSmt);
+                                var perLines = perResult.Split('\n').Select(l => l.Trim()).ToList();
+                                if (perLines.Any(l => l == "unsat"))
+                                {
+                                    var perPlainSmt = SmtTranslator.BuildRelevanceQuery(
+                                        inputs, outputs, fullPreLits, clause, method, mutableNames, perLitIndices);
+                                    if (perPlainSmt != null)
+                                    {
+                                        if (verbose) Console.WriteLine($"  Relevance {clauseLabel}/Q{k + 1}: strip UNSAT — retry plain");
+                                        perResult = await Z3Runner.RunZ3(z3Path, perPlainSmt);
+                                        perLines = perResult.Split('\n').Select(l => l.Trim()).ToList();
+                                    }
+                                }
+                                if (!perLines.Any(l => l == "sat")) continue;
+                                var perValues = TypeUtils.ParseZ3Model(perResult, allVars);
+                                if (perValues.Count == 0) continue;
+                                // Emit a per-literal /RelQ<k+1> test. Same uniqueness +
+                                // exclusion bookkeeping as the combined SAT path below.
+                                // Don't apply IsAlreadyCovered (clause-level) here — every
+                                // per-literal witness covers the full clause by construction;
+                                // the value is in the *distinct input* it produces. Skip only
+                                // if the input matches a prior test (fingerprint dedup).
+                                var perLabel = $"{fullPreLabel}{{{ci + 1}}}/RelQ{k + 1}";
+                                var perInputFp = BuildInputExclusion(perValues);
+                                bool perDup = false;
+                                if (perInputFp != null)
+                                {
+                                    foreach (var prior in testCases)
+                                    {
+                                        var priorFp = BuildInputExclusion(prior.values);
+                                        if (priorFp != null && priorFp == perInputFp) { perDup = true; break; }
+                                    }
+                                }
+                                if (perDup)
+                                {
+                                    if (verbose) Console.WriteLine($"  Relevance {perLabel}: skipped (input matches prior test)");
+                                    continue;
+                                }
+                                var perSpecSmt = SmtTranslator.BuildSmt2Query(
+                                    inputs, outputs, preClauses, dnfEnsures, method, false,
+                                    null, null, fullPreLits, mutableNames, skipBias: true);
+                                var perUQuery = !hasNonInlinableFuncs
+                                    ? SmtTranslator.BuildUniquenessQuery(
+                                        perSpecSmt, inputs, outputs, perValues, mutableNames)
+                                    : null;
+                                if (!string.IsNullOrEmpty(perUQuery) && !TimedOut())
+                                {
+                                    var perUResult = await Z3Runner.RunZ3(z3Path, perUQuery);
+                                    var perULines = perUResult.Split('\n').Select(l => l.Trim()).ToList();
+                                    var perUnique = perULines.Any(l => l == "unsat");
+                                    var perUnknown = !perUnique && perULines.Any(l => l == "unknown");
+                                    perValues["__unique__"] = (perUnique || (perUnknown && TrustUnknownUniqueness)) ? "true" : "false";
+                                }
+                                testCases.Add((perLabel, perValues, clause));
+                                coveredByRelevance.Add((pi, ci));
+                                relAdded++;
+                                perLiteralSweepSatAny = true;
+                                if (verbose) Console.WriteLine($"  Relevance {perLabel}: SAT — added test case");
+                                var perBaseKey = ScheduleKey(clause, new List<Expression>(), fullPreLits);
+                                if (!baseConditionExclusions.ContainsKey(perBaseKey))
+                                    baseConditionExclusions[perBaseKey] = new List<string>();
+                                var perExcl = BuildInputExclusion(perValues);
+                                if (perExcl != null) baseConditionExclusions[perBaseKey].Add(perExcl);
+                                relevanceContextByBaseKey[perBaseKey] = (perLitIndices, clause, fullPreLits, mode, perLabel);
+                            }
+                            // If at least one per-literal probe was SAT, the clause is covered;
+                            // skip the group fallback. Otherwise let the group attempt run.
+                            if (perLiteralSweepSatAny)
+                            {
+                                lines = new List<string> { "sat-handled-via-sweep" };
                             }
                         }
-                        // ladder: both combined attempts UNSAT → fall back to group.
+                        // ladder: combined and per-literal sweep both UNSAT → fall back to group.
                         if (mode == "ladder" && lines.Any(l => l == "unsat"))
                         {
                             var gSmt = SmtTranslator.BuildGroupRelevanceQuery(
