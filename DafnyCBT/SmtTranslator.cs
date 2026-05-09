@@ -4195,9 +4195,19 @@ static class SmtTranslator
             if (rangeAsserts.Count > 0)
             {
                 sb.AppendLine();
-                sb.AppendLine("; ─── Phase 1r: forall non-vacuity — every clause forall has a non-empty range ───");
+                sb.AppendLine("; ─── Phase 1r: forall non-vacuity — prefer non-empty range for every clause forall (soft) ───");
+                // Soft: when multiple postcondition foralls have related ranges
+                // (e.g. `forall i < evenIndex` and `forall i < oddIndex` in the
+                // same clause), requiring ALL non-empty can be unsatisfiable
+                // because position 0 must satisfy exactly one — a hard assert
+                // would make the entire relevance query UNSAT and force a
+                // fallback to a non-relevance witness. Soft asserts let Z3
+                // pick the model that maximises the count of non-vacuous
+                // foralls without rejecting models where some must remain
+                // vacuous (equivalent to the legacy hard form when no such
+                // conflict exists).
                 foreach (var a in rangeAsserts)
-                    sb.AppendLine($"(assert {a})");
+                    sb.AppendLine($"(assert-soft {a} :weight 100)");
             }
         }
     }
