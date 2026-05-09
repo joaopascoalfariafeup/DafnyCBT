@@ -1191,6 +1191,26 @@ static class SmtTranslator
                 foreach (var a in nearWitnessAsserts)
                     sb.AppendLine($"(assert-soft {a} :weight 1)");
             }
+
+            // Conditional-forall branch coverage in the plain query (low weight).
+            // Mirrors the !exists near-witness emission above. See
+            // BuildForallIteBranchCoverage for the rationale and example
+            // (dafny-synthesis_task_id_477 / ToLowercase).
+            var iteCoverageAsserts = new List<string>();
+            foreach (var lit in postLiterals)
+            {
+                var unwrapped = UnwrapExpr(lit);
+                if (unwrapped is not ForallExpr forallIte) continue;
+                iteCoverageAsserts.AddRange(BuildForallIteBranchCoverage(
+                    forallIte, nwInputsAndOutputs, mutableNames));
+            }
+            if (iteCoverageAsserts.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("; forall-ITE branch coverage: soft-prefer a witness for each branch (low weight in plain query)");
+                foreach (var a in iteCoverageAsserts)
+                    sb.AppendLine($"(assert-soft {a} :weight 1)");
+            }
         }
 
         sb.AppendLine();
@@ -4356,7 +4376,99 @@ static class SmtTranslator
                 foreach (var a in nearWitnessAsserts)
                     sb.AppendLine($"(assert-soft {a} :weight 200)");
             }
+
+            // (4) Conditional-forall branch coverage: for `forall var :: range ==>
+            // if C then A else B`, soft-assert both `exists var :: range ∧ C ∧ A`
+            // (then-branch witness) and `exists var :: range ∧ ¬C ∧ B`
+            // (else-branch witness). Forces Z3 to pick inputs that exercise
+            // both branches of the ITE — full case coverage.
+            //
+            // Example: dafny-synthesis_task_id_477 has
+            //   forall i :: 0 ≤ i < |s| ==> if IsUpperCase(s[i])
+            //                                 then IsUpperLowerPair(s[i], v[i])
+            //                                 else v[i] == s[i]
+            // The mutation deletes the upper-case branch. Without ITE coverage,
+            // Z3 happily picks `s` with no upper-case chars (else-branch only,
+            // mutation invisible). With both branches forced, Z3 must include
+            // at least one upper-case and at least one non-upper-case char,
+            // exposing the deletion.
+            var iteCoverageAsserts = new List<string>();
+            foreach (var lit in postLiterals)
+            {
+                var unwrapped = UnwrapExpr(lit);
+                if (unwrapped is not ForallExpr forallIte) continue;
+                iteCoverageAsserts.AddRange(BuildForallIteBranchCoverage(
+                    forallIte, inputsAndOutputs, mutableNames));
+            }
+            if (iteCoverageAsserts.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("; ─── Phase 1r: forall-ITE branch coverage — prefer a witness for each branch (soft) ───");
+                foreach (var a in iteCoverageAsserts)
+                    sb.AppendLine($"(assert-soft {a} :weight 200)");
+            }
         }
+    }
+
+    /// <summary>
+    /// For a forall of the form `forall var :: range ==> if C then A else B`
+    /// (or directly `forall var :: if C then A else B` without the range
+    /// implication), build two stripped-existential SMT strings:
+    ///   `(exists vars :: range ∧ C ∧ A)`  -- then-branch witness
+    ///   `(exists vars :: range ∧ ¬C ∧ B)` -- else-branch witness
+    /// Returns an empty list if the body doesn't match this shape.
+    /// Soft-asserting both forces Z3 to pick an input that exercises both
+    /// branches of the ITE — exposing mutations that affect just one branch.
+    /// </summary>
+    internal static List<string> BuildForallIteBranchCoverage(
+        ForallExpr forallExpr,
+        List<(string Name, string Type)> inputsAndOutputs,
+        HashSet<string> mutableNames)
+    {
+        var result = new List<string>();
+        if (forallExpr.BoundVars.Count != 1) return result;
+
+        // Body shape: `range ==> ITE(C, A, B)` or directly `ITE(C, A, B)`.
+        var body = UnwrapExpr(forallExpr.Term);
+        Expression? rangeExpr = null;
+        Expression iteExpr;
+        if (body is BinaryExpr { Op: BinaryExpr.Opcode.Imp } imp)
+        {
+            rangeExpr = imp.E0;
+            iteExpr = UnwrapExpr(imp.E1);
+        }
+        else
+        {
+            iteExpr = body;
+        }
+        if (iteExpr is not ITEExpr ite) return result;
+
+        var bvNames = forallExpr.BoundVars.Select(bv => bv.Name).ToList();
+        foreach (var n in bvNames) _boundVars.Add(n);
+        ResetExprToSmtBudget();
+        var rangeSmt = rangeExpr != null ? ExprToSmt(rangeExpr, inputsAndOutputs, mutableNames, isPostContext: true) : null;
+        ResetExprToSmtBudget();
+        var condSmt = ExprToSmt(ite.Test, inputsAndOutputs, mutableNames, isPostContext: true);
+        ResetExprToSmtBudget();
+        var thnSmt = ExprToSmt(ite.Thn, inputsAndOutputs, mutableNames, isPostContext: true);
+        ResetExprToSmtBudget();
+        var elsSmt = ExprToSmt(ite.Els, inputsAndOutputs, mutableNames, isPostContext: true);
+        foreach (var n in bvNames) _boundVars.Remove(n);
+
+        if (condSmt == null || thnSmt == null || elsSmt == null) return result;
+
+        var bvBindings = string.Join(" ", forallExpr.BoundVars.Select(bv =>
+            $"({bv.Name} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
+
+        string Wrap(string body) => $"(exists ({bvBindings}) {body})";
+        string AndAll(params string?[] parts) {
+            var nonNull = parts.Where(p => p != null).ToList();
+            return nonNull.Count == 1 ? nonNull[0]! : "(and " + string.Join(" ", nonNull) + ")";
+        }
+
+        result.Add(Wrap(AndAll(rangeSmt, condSmt, thnSmt)));
+        result.Add(Wrap(AndAll(rangeSmt, $"(not {condSmt})", elsSmt)));
+        return result;
     }
 
 
