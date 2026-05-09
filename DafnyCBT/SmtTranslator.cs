@@ -1154,6 +1154,36 @@ static class SmtTranslator
             EmitAntiTrivialBias(sb, inputs, mutableNames);
         }
 
+        // !exists near-witness preferences: for every `!exists vars :: c1 ∧ … ∧ cn`
+        // postcondition literal, soft-assert one stripped existential per body
+        // conjunct dropped. Drives Z3 toward inputs where each body conjunct
+        // individually has a witness — exposing structurally-rich inputs that
+        // approach but don't quite hit the full witness (which the spec forbids).
+        // Emitted in the plain query (Phase 1/2/2b) too, since `!exists` literals
+        // referencing inputs only are filtered out of the relevance safe set and
+        // would otherwise miss this benefit.
+        if (biasOn)
+        {
+            var nwInputsAndOutputs = inputs.Concat(outputs).ToList();
+            var nearWitnessAsserts = new List<string>();
+            foreach (var lit in postLiterals)
+            {
+                var unwrapped = UnwrapExpr(lit);
+                if (unwrapped is not UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not } notOp) continue;
+                if (UnwrapExpr(notOp.E) is not ExistsExpr existsInNot) continue;
+                nearWitnessAsserts.AddRange(BuildStrippedExistsVariants(
+                    existsInNot, nwInputsAndOutputs, mutableNames,
+                    isPostContext: false, requireQuantifierLast: false));
+            }
+            if (nearWitnessAsserts.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("; !exists near-witness: soft-prefer near-witnesses for each dropped body conjunct");
+                foreach (var a in nearWitnessAsserts)
+                    sb.AppendLine($"(assert-soft {a} :weight 200)");
+            }
+        }
+
         sb.AppendLine();
         sb.AppendLine("(check-sat)");
         sb.AppendLine("(get-model)");
@@ -4254,6 +4284,45 @@ static class SmtTranslator
                 foreach (var a in rangeAsserts)
                     sb.AppendLine($"(assert-soft {a} :weight 100)");
             }
+
+            // (3) !exists near-witness: for `!exists vars :: c1 ∧ … ∧ cn`,
+            // also soft-assert the stripped existential `exists vars :: c1 ∧ …
+            // ∧ c(n-1)` (drop just the last body conjunct). The full !exists
+            // remains as a hard assertion (it's the spec). The stripped
+            // exists, when satisfied, forces a structural near-witness to
+            // exist — exposing inputs where the last conjunct is the only
+            // thing keeping the !exists true. Without this, Z3 typically
+            // picks the simplest input where !exists holds vacuously
+            // (e.g. empty seq, no '.' anywhere).
+            //
+            // Example: dafny-synthesis_task_id_759 has
+            //   !exists i :: 0 ≤ i < |s| ∧ s[i] == '.' ∧ |s|-i-1 == 2
+            // The mutation removes `s[i] == '.'` from the loop guard, only
+            // observable when there's a position with `|s|-i-1 == 2` whose
+            // char is NOT '.'. Without the near-witness soft, Z3 picks
+            // `s = []`; with it, Z3 prefers `s` with '.' present (and the
+            // spec forbids '.' at position |s|-3, so '.' lands elsewhere).
+            var nearWitnessAsserts = new List<string>();
+            foreach (var lit in postLiterals)
+            {
+                var unwrapped = UnwrapExpr(lit);
+                if (unwrapped is not UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not } notOp) continue;
+                if (UnwrapExpr(notOp.E) is not ExistsExpr existsInNot) continue;
+                // Emit one soft per body-conjunct dropped: each variant captures
+                // a different near-witness structural pattern. Z3 prefers the
+                // model satisfying ALL variants (every conjunct individually
+                // witnessable), driving inputs toward structural diversity.
+                nearWitnessAsserts.AddRange(BuildStrippedExistsVariants(
+                    existsInNot, inputsAndOutputs, mutableNames,
+                    isPostContext: false, requireQuantifierLast: false));
+            }
+            if (nearWitnessAsserts.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("; ─── Phase 1r: !exists near-witness — prefer a witness for the stripped existential (soft) ───");
+                foreach (var a in nearWitnessAsserts)
+                    sb.AppendLine($"(assert-soft {a} :weight 200)");
+            }
         }
     }
 
@@ -4290,25 +4359,57 @@ static class SmtTranslator
         ExistsExpr existsExpr,
         List<(string Name, string Type)> inputsAndOutputs,
         HashSet<string> mutableNames,
-        bool isPostContext)
+        bool isPostContext,
+        bool requireQuantifierLast = true)
     {
-        var conjuncts = DnfEngine.FlattenConjuncts(existsExpr.Term);
-        if (conjuncts.Count < 2) return null;
-        var last = conjuncts[conjuncts.Count - 1];
-        if (last is not ForallExpr && last is not ExistsExpr) return null;
+        var smts = BuildStrippedExistsVariants(existsExpr, inputsAndOutputs, mutableNames, isPostContext, requireQuantifierLast);
+        return smts.Count == 0 ? null : smts[smts.Count - 1];  // legacy: drop-last variant
+    }
 
-        // Translate each kept conjunct (and the optional Range) under the
-        // existential's bound-var scope.
+    /// <summary>
+    /// Build SMT for every "drop one body conjunct" variant of an existential.
+    /// For `exists vars :: c1 ∧ c2 ∧ … ∧ cn`, returns a list of n SMT strings
+    /// `(exists … (and c2 ∧ … ∧ cn))`, `(exists … (and c1 ∧ c3 ∧ … ∧ cn))`, …,
+    /// `(exists … (and c1 ∧ … ∧ c(n-1)))`.
+    ///
+    /// Each variant captures a different "near-witness" structural pattern.
+    /// Soft-asserting all of them lets Z3 pick the model that satisfies as
+    /// many as possible — typically the input where every body conjunct
+    /// individually has a witness (the richest near-witness).
+    ///
+    /// `requireQuantifierLast` (positive-`exists` strengthening case) skips
+    /// when the last conjunct isn't a quantifier and only emits the drop-last
+    /// variant. For `!exists` near-witness, callers pass false to get all
+    /// drop-one variants.
+    /// </summary>
+    internal static List<string> BuildStrippedExistsVariants(
+        ExistsExpr existsExpr,
+        List<(string Name, string Type)> inputsAndOutputs,
+        HashSet<string> mutableNames,
+        bool isPostContext,
+        bool requireQuantifierLast = true)
+    {
+        var result = new List<string>();
+        var conjuncts = DnfEngine.FlattenConjuncts(existsExpr.Term);
+        if (conjuncts.Count < 2) return result;
+        if (requireQuantifierLast)
+        {
+            var last = conjuncts[conjuncts.Count - 1];
+            if (last is not ForallExpr && last is not ExistsExpr) return result;
+        }
+
         var bvNames = existsExpr.BoundVars.Select(bv => bv.Name).ToList();
         foreach (var n in bvNames) _boundVars.Add(n);
-        var conjSmts = new List<string>();
+
+        // Translate every conjunct and the range once.
+        var conjSmts = new List<string?>();
         bool ok = true;
-        for (int k = 0; k < conjuncts.Count - 1; k++)
+        foreach (var c in conjuncts)
         {
             ResetExprToSmtBudget();
-            var s = ExprToSmt(conjuncts[k], inputsAndOutputs, mutableNames, isPostContext);
-            if (s == null) { ok = false; break; }
+            var s = ExprToSmt(c, inputsAndOutputs, mutableNames, isPostContext);
             conjSmts.Add(s);
+            if (s == null) { ok = false; break; }
         }
         string? rangeSmt = null;
         if (ok && existsExpr.Range != null)
@@ -4318,14 +4419,28 @@ static class SmtTranslator
             if (rangeSmt == null) ok = false;
         }
         foreach (var n in bvNames) _boundVars.Remove(n);
-        if (!ok) return null;
+        if (!ok) return result;
 
         var bvBindings = string.Join(" ", existsExpr.BoundVars.Select(bv =>
             $"({bv.Name} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
-        var bodyParts = new List<string>(conjSmts);
-        if (rangeSmt != null) bodyParts.Insert(0, rangeSmt);
-        var bodySmt = bodyParts.Count == 1 ? bodyParts[0] : "(and " + string.Join(" ", bodyParts) + ")";
-        return $"(exists ({bvBindings}) {bodySmt})";
+
+        // For `requireQuantifierLast`, callers expect just the drop-last variant.
+        int from = requireQuantifierLast ? conjuncts.Count - 1 : 0;
+        int to = conjuncts.Count;  // drop index k means keep all conjuncts except k
+        for (int k = from; k < to; k++)
+        {
+            var bodyParts = new List<string>();
+            if (rangeSmt != null) bodyParts.Add(rangeSmt);
+            for (int j = 0; j < conjuncts.Count; j++)
+            {
+                if (j == k) continue;
+                bodyParts.Add(conjSmts[j]!);
+            }
+            if (bodyParts.Count == 0) continue;
+            var bodySmt = bodyParts.Count == 1 ? bodyParts[0] : "(and " + string.Join(" ", bodyParts) + ")";
+            result.Add($"(exists ({bvBindings}) {bodySmt})");
+        }
+        return result;
     }
 
     internal static string? BuildRelevanceQuery(
