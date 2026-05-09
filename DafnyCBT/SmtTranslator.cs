@@ -1455,6 +1455,37 @@ static class SmtTranslator
         _exprToSmtCalls = 0;
     }
 
+    /// <summary>
+    /// Convert a Dafny real literal (BigDec = mantissa * 10^exponent) to an
+    /// SMT-LIB Real decimal. BigDec.ToString() emits scientific form like "0e0"
+    /// or "15e-1" which Z3 parses as `<symbol>e<...>` — i.e. an undefined
+    /// constant — silently producing "unknown constant" errors that propagate
+    /// as spurious UNSAT for any clause referencing real literals (e.g. `0.0`
+    /// inside `if x &lt; 0.0 then -x else x`). We expand to plain decimal form.
+    /// </summary>
+    static string BigDecToSmtReal(Microsoft.BaseTypes.BigDec d)
+    {
+        var m = d.Mantissa;
+        var e = d.Exponent;
+        if (m.IsZero) return "0.0";
+        var absM = m.Sign < 0 ? -m : m;
+        var mStr = absM.ToString();
+        string body;
+        if (e >= 0)
+        {
+            body = mStr + new string('0', e) + ".0";
+        }
+        else
+        {
+            int absE = -e;
+            if (absE < mStr.Length)
+                body = mStr.Substring(0, mStr.Length - absE) + "." + mStr.Substring(mStr.Length - absE);
+            else
+                body = "0." + new string('0', absE - mStr.Length) + mStr;
+        }
+        return m.Sign < 0 ? $"(- {body})" : body;
+    }
+
     private static string? ExprToSmtImpl(Expression expr,
         List<(string Name, string Type)> inputs,
         HashSet<string> mutableNames,
@@ -1798,6 +1829,8 @@ static class SmtTranslator
                 var units = strVal.Select(c => $"(seq.unit {(int)c})").ToList();
                 return units.Count == 1 ? units[0] : $"(seq.++ {string.Join(" ", units)})";
             }
+            if (litExpr.Value is Microsoft.BaseTypes.BigDec bigDec)
+                return BigDecToSmtReal(bigDec);
             return litExpr.Value?.ToString() ?? "0";
         }
 
