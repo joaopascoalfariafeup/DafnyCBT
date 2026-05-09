@@ -732,6 +732,27 @@ static class DnfEngine
         var boundVar = forall.BoundVars[0];
         var body = Unwrap(forall.Term);
         Expression rangeExpr = body is BinaryExpr { Op: BinaryExpr.Opcode.Imp } imp ? imp.E0 : body;
+        return ExtractRangeFromConjuncts(rangeExpr, boundVar);
+    }
+
+    /// <summary>
+    /// Extract `lo`/`hi` bounds from the body of an `exists` (range ∧ body form),
+    /// analogous to TryExtractForallRange. Used for `!exists` non-vacuity in the
+    /// relevance query (the negated existential is structurally equivalent to a
+    /// forall, so the same range-non-empty preference applies).
+    /// </summary>
+    internal static (Expression? lo, Expression? hi, bool isStrictLo, bool isStrictHi)
+        TryExtractExistsRange(ExistsExpr exists)
+    {
+        if (exists.BoundVars.Count != 1) return (null, null, false, true);
+        var boundVar = exists.BoundVars[0];
+        var body = Unwrap(exists.Term);
+        return ExtractRangeFromConjuncts(body, boundVar);
+    }
+
+    static (Expression? lo, Expression? hi, bool isStrictLo, bool isStrictHi)
+        ExtractRangeFromConjuncts(Expression rangeExpr, BoundVar boundVar)
+    {
         var conjuncts = FlattenConjuncts(rangeExpr);
         Expression? lo = null, hi = null;
         bool isStrictLo = false, isStrictHi = true;

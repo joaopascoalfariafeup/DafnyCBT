@@ -4210,8 +4210,20 @@ static class SmtTranslator
             foreach (var lit in postLiterals)
             {
                 var unwrapped = UnwrapExpr(lit);
-                if (unwrapped is not ForallExpr forall) continue;
-                var (lo, hi, isStrictLo, isStrictHi) = DnfEngine.TryExtractForallRange(forall);
+                Expression? lo = null, hi = null;
+                bool isStrictLo = false, isStrictHi = true;
+                if (unwrapped is ForallExpr forall)
+                {
+                    (lo, hi, isStrictLo, isStrictHi) = DnfEngine.TryExtractForallRange(forall);
+                }
+                else if (unwrapped is UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not } notOp
+                         && UnwrapExpr(notOp.E) is ExistsExpr existsInNot)
+                {
+                    // `!exists i :: range ∧ body` is logically equivalent to
+                    // `forall i :: range ⇒ ¬body`, so the same non-empty-range
+                    // preference applies — empty range makes both vacuously true.
+                    (lo, hi, isStrictLo, isStrictHi) = DnfEngine.TryExtractExistsRange(existsInNot);
+                }
                 if (lo == null || hi == null) continue;
                 ResetExprToSmtBudget();
                 var loSmt = ExprToSmt(lo, inputsAndOutputs, mutableNames, isPostContext: false);
