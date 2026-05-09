@@ -1856,6 +1856,30 @@ static class SmtTranslator
             var ch = charLit.Value?.ToString();
             return ch != null && ch.Length > 0 ? ((int)ch[0]).ToString() : "0";
         }
+        // ConversionExpr: `e as T`. Our SMT encoding represents chars as ints in [32,126]
+        // (printable ASCII range, set up by EmitSequenceConstraints) and nats as ints with
+        // soft non-negativity. So `c as int`, `i as nat`, `n as int` and similar between
+        // int-encoded primitive types are semantic identities — emit the inner expression
+        // directly. Without this, predicates like `IsUpperCase(c) { 65 <= c as int <= 90 }`
+        // fail to inline (translation returns null on the unhandled ConversionExpr), the
+        // forall body it lives in falls back to string-based translation and partially
+        // truncates, and the whole spec's relevance/Phase 1 query becomes UNSAT — see
+        // dafny-synthesis_task_id_477 (ToLowercase) where the post forall was being
+        // translated to just `(forall ((i Int)) (<= 0 i))` instead of the full body.
+        if (expr is ConversionExpr conv)
+        {
+            var toTypeStr = (conv.ToType?.ToString() ?? "").Trim();
+            var fromTypeStr = (conv.E?.Type?.ToString() ?? "").Trim();
+            // int / nat / char / bool are all SMT Int (or Bool). Identity conversion.
+            if (toTypeStr == "int" || toTypeStr == "nat" || toTypeStr == "char"
+                || fromTypeStr == "int" || fromTypeStr == "nat" || fromTypeStr == "char")
+            {
+                return ExprToSmt(conv.E, inputs, mutableNames, isPostContext, insideOld);
+            }
+            // Other conversions (e.g. real ↔ int) are not supported here; fall back.
+            goto fallback;
+        }
+
         if (expr is LiteralExpr litExpr && litExpr is not LeafExpression)
         {
             if (litExpr.Value is bool b) return b ? "true" : "false";
