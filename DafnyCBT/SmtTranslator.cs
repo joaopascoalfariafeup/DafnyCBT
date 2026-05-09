@@ -1792,6 +1792,12 @@ static class SmtTranslator
             if (litExpr.Value is System.Numerics.BigInteger bigInt)
                 return bigInt < 0 ? $"(- {-bigInt})" : bigInt.ToString();
             if (litExpr.Value is int n) return n < 0 ? $"(- {-n})" : n.ToString();
+            if (litExpr.Value is string strVal)
+            {
+                if (strVal.Length == 0) return "(as seq.empty (Seq Int))";
+                var units = strVal.Select(c => $"(seq.unit {(int)c})").ToList();
+                return units.Count == 1 ? units[0] : $"(seq.++ {string.Join(" ", units)})";
+            }
             return litExpr.Value?.ToString() ?? "0";
         }
 
@@ -4210,6 +4216,63 @@ static class SmtTranslator
     /// that all its free variables are covered by earlier literals.
     /// Returns null when the query cannot be safely constructed (e.g., class outputs).
     /// </summary>
+    /// <summary>
+    /// For a literal of the form `exists vars :: c1 ∧ c2 ∧ ... ∧ cn` whose last
+    /// conjunct cn is itself a quantifier (Forall/Exists), build SMT for the
+    /// "stripped" existential `exists vars :: c1 ∧ ... ∧ c(n-1)` (last conjunct
+    /// dropped). Returns null when the literal does not match this shape, or when
+    /// any inner conjunct fails to translate.
+    ///
+    /// Used as a relevance-query refinement: alongside the standard `(not Y_k)`
+    /// shadow assertion, the caller asserts the stripped form so that Z3 must
+    /// find inputs where the *first parts* of the existential are satisfiable
+    /// (a witness for c1∧…∧c(n-1) exists) but the full Y_k is not. This pinpoints
+    /// the last conjunct (typically a constraining inner forall) as the actively
+    /// biting clause and produces inputs that exercise it specifically — exposing
+    /// mutations that only manifest when the inner quantifier has substance.
+    /// </summary>
+    internal static string? BuildStrippedExistsSmt(
+        ExistsExpr existsExpr,
+        List<(string Name, string Type)> inputsAndOutputs,
+        HashSet<string> mutableNames,
+        bool isPostContext)
+    {
+        var conjuncts = DnfEngine.FlattenConjuncts(existsExpr.Term);
+        if (conjuncts.Count < 2) return null;
+        var last = conjuncts[conjuncts.Count - 1];
+        if (last is not ForallExpr && last is not ExistsExpr) return null;
+
+        // Translate each kept conjunct (and the optional Range) under the
+        // existential's bound-var scope.
+        var bvNames = existsExpr.BoundVars.Select(bv => bv.Name).ToList();
+        foreach (var n in bvNames) _boundVars.Add(n);
+        var conjSmts = new List<string>();
+        bool ok = true;
+        for (int k = 0; k < conjuncts.Count - 1; k++)
+        {
+            ResetExprToSmtBudget();
+            var s = ExprToSmt(conjuncts[k], inputsAndOutputs, mutableNames, isPostContext);
+            if (s == null) { ok = false; break; }
+            conjSmts.Add(s);
+        }
+        string? rangeSmt = null;
+        if (ok && existsExpr.Range != null)
+        {
+            ResetExprToSmtBudget();
+            rangeSmt = ExprToSmt(existsExpr.Range, inputsAndOutputs, mutableNames, isPostContext);
+            if (rangeSmt == null) ok = false;
+        }
+        foreach (var n in bvNames) _boundVars.Remove(n);
+        if (!ok) return null;
+
+        var bvBindings = string.Join(" ", existsExpr.BoundVars.Select(bv =>
+            $"({bv.Name} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
+        var bodyParts = new List<string>(conjSmts);
+        if (rangeSmt != null) bodyParts.Insert(0, rangeSmt);
+        var bodySmt = bodyParts.Count == 1 ? bodyParts[0] : "(and " + string.Join(" ", bodyParts) + ")";
+        return $"(exists ({bvBindings}) {bodySmt})";
+    }
+
     internal static string? BuildRelevanceQuery(
         List<(string Name, string Type)> inputs,
         List<(string Name, string Type)> outputs,
@@ -4218,7 +4281,8 @@ static class SmtTranslator
         Method method,
         HashSet<string>? mutableNames = null,
         List<int>? safeIndices = null,
-        List<string>? extraConstraints = null)
+        List<string>? extraConstraints = null,
+        bool assertExistsStripped = false)
     {
         mutableNames ??= new HashSet<string>();
         if (postLiterals.Count == 0) return null;
@@ -4306,6 +4370,24 @@ static class SmtTranslator
                 sb.AppendLine($"(assert {smtExpr})");
             }
 
+            // Strengthen: when the negated literal is `exists vars :: c1 ∧ … ∧ cn`
+            // with cn itself a quantifier, additionally assert the stripped form
+            // `exists vars :: c1 ∧ … ∧ c(n-1)`. This forces Z3 to find inputs where
+            // the first parts of the existential are satisfiable but the full
+            // clause fails, pinpointing the last conjunct as the biting one.
+            // Caller falls back to the unstrengthened query on UNSAT.
+            if (assertExistsStripped && idx < postLiterals.Count
+                && postLiterals[idx] is ExistsExpr existsLit)
+            {
+                var stripped = BuildStrippedExistsSmt(existsLit, inputsAndOutputs, mutableNames, isPostContext: true);
+                if (stripped != null)
+                {
+                    stripped = ApplyOutputAltRenames(stripped, renameMap);
+                    sb.AppendLine($"; ─── Relevance: stripped existential for Q{idx + 1} (last conjunct dropped) ───");
+                    sb.AppendLine($"(assert {stripped})");
+                }
+            }
+
             sb.AppendLine();
             sb.AppendLine($"; ─── Relevance: outs ≠ outs_{suffix} ───");
             var ineq = BuildOutputInequalityClause(inputs, outputs, mutableNames, suffix);
@@ -4346,7 +4428,8 @@ static class SmtTranslator
         Method method,
         HashSet<string>? mutableNames = null,
         List<int>? safeIndices = null,
-        List<string>? extraConstraints = null)
+        List<string>? extraConstraints = null,
+        bool assertExistsStripped = false)
     {
         mutableNames ??= new HashSet<string>();
         if (postLiterals.Count == 0) return null;
@@ -4430,6 +4513,23 @@ static class SmtTranslator
             ? safeSmtParts[0]
             : $"(and {string.Join(" ", safeSmtParts)})";
         sb.AppendLine($"(assert (not {conj}))");
+
+        // Strengthen: for any safe-index literal that is `exists vars :: c1 ∧ … ∧ cn`
+        // with cn a quantifier, also assert the stripped existential. Same intent as
+        // the per-literal builder. Caller falls back on UNSAT.
+        if (assertExistsStripped)
+        {
+            foreach (var idx in indices)
+            {
+                if (idx >= postLiterals.Count) continue;
+                if (postLiterals[idx] is not ExistsExpr existsLit) continue;
+                var stripped = BuildStrippedExistsSmt(existsLit, inputsAndOutputs, mutableNames, isPostContext: true);
+                if (stripped == null) continue;
+                stripped = ApplyOutputAltRenames(stripped, renameMap);
+                sb.AppendLine($"; ─── Grouped Relevance: stripped existential for Q{idx + 1} ───");
+                sb.AppendLine($"(assert {stripped})");
+            }
+        }
 
         sb.AppendLine();
         sb.AppendLine($"; ─── Grouped Relevance: outs ≠ outs_{suffix} ───");

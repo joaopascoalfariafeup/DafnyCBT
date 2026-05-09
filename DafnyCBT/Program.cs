@@ -2246,6 +2246,10 @@ class Program
         {
             int added = 0;
             int pruned = 0;
+            // Per-clause buckets, interleaved round-robin at the end of each pi iteration so
+            // each DNF clause gets its first tier emitted before any clause gets its second.
+            // Without this, clause-major emission can starve later clauses at small budgets
+            // (e.g., minTests=4 spent all on clause-1 tiers, none on clause-3 tiers).
             for (int pi = 0; pi < preCombinations.Count; pi++)
             {
                 var (preLabel, preLits, preExclusions) = preCombinations[pi];
@@ -2254,8 +2258,11 @@ class Program
                 var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
                 var preLitStrings = preLits.Select(EKey).ToList();
 
+                var perClauseEntries = new List<List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)>>();
                 for (int ci = 0; ci < dnfExprs.Count; ci++)
                 {
+                    var thisClauseEntries = new List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)>();
+                    perClauseEntries.Add(thisClauseEntries);
                     var clause = dnfExprs[ci];
                     var clauseLitStrings = clause.Select(EKey).ToList();
                     var classLits = preLitStrings.Concat(clauseLitStrings).ToList();
@@ -2305,7 +2312,7 @@ class Program
                                 var neg = DnfEngine.NegateOperatorInLiteral(dkey);
                                 if (neg != null && classLits.Contains(neg)) { pruned++; continue; }
                             }
-                            schedule.Add(($"{clauseLabel}/O{tlabel}",
+                            thisClauseEntries.Add(($"{clauseLabel}/O{tlabel}",
                                 clause, fullPreLits, new List<Expression>(), tconstraints, simpleMask, pi));
                             added++;
                         }
@@ -2329,7 +2336,7 @@ class Program
                         var muts = BoundaryAnalysis.ComputeMutationTiers(vname, vtype, postLitStrings, mutableNames);
                         foreach (var (tlabel, tconstraints, _) in muts)
                         {
-                            schedule.Add(($"{clauseLabel}/O{tlabel}",
+                            thisClauseEntries.Add(($"{clauseLabel}/O{tlabel}",
                                 clause, fullPreLits, new List<Expression>(), tconstraints, simpleMask, pi));
                             added++;
                         }
@@ -2344,6 +2351,18 @@ class Program
                     {
                         foreach (var (fname, ftype) in mutableFieldsList)
                             EmitMutation(fname, ftype);
+                    }
+                }
+
+                // Round-robin interleave per pi: emit the i-th tier of every clause
+                // before any clause's (i+1)-th. Preserves emission order within each clause.
+                int maxPerClause = perClauseEntries.Count == 0 ? 0 : perClauseEntries.Max(l => l.Count);
+                for (int pos = 0; pos < maxPerClause; pos++)
+                {
+                    foreach (var clauseEntries in perClauseEntries)
+                    {
+                        if (pos < clauseEntries.Count)
+                            schedule.Add(clauseEntries[pos]);
                     }
                 }
             }
@@ -3028,16 +3047,35 @@ class Program
                         //                richer than group alone since combined's SAT witness
                         //                makes every safe Q_k individually cuttable).
                         var mode = RelevanceMode;
+                        // Strengthened first: when a safe-index literal is `exists vars :: c1∧…∧cn`
+                        // with cn a quantifier, also assert the stripped existential. SAT here
+                        // pinpoints inputs where the inner quantifier is the biting clause.
+                        // UNSAT → fall back to the unstrengthened query (existing ladder).
                         string? smt = mode == "group"
                             ? SmtTranslator.BuildGroupRelevanceQuery(
-                                inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices)
+                                inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices, null, assertExistsStripped: true)
                             : SmtTranslator.BuildRelevanceQuery(
-                                inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices);
+                                inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices, null, assertExistsStripped: true);
                         if (smt == null) { relSkipped++; continue; }
-                        if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel} (mode={mode}, safe: [{string.Join(",", safeIndices.Select(i => i + 1))}])...");
+                        if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel} (mode={mode}+strip, safe: [{string.Join(",", safeIndices.Select(i => i + 1))}])...");
                         var z3Result = await Z3Runner.RunZ3(z3Path, smt);
                         var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
                         int lastQueriedIndex = safeIndices.Count == 1 ? safeIndices[0] : -1;
+                        // Fallback 0: stripped-existential strengthening was UNSAT — retry without it.
+                        if (lines.Any(l => l == "unsat"))
+                        {
+                            string? plainSmt = mode == "group"
+                                ? SmtTranslator.BuildGroupRelevanceQuery(
+                                    inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices)
+                                : SmtTranslator.BuildRelevanceQuery(
+                                    inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices);
+                            if (plainSmt != null)
+                            {
+                                if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: stripped-strengthen UNSAT — retry plain");
+                                z3Result = await Z3Runner.RunZ3(z3Path, plainSmt);
+                                lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
+                            }
+                        }
                         // combined/ladder: UNSAT with multiple safe indices → at least one is
                         // redundant. Fall back to single-literal (last safe index) to still
                         // exercise the defining literal when possible.
