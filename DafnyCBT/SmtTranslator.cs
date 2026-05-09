@@ -1178,9 +1178,18 @@ static class SmtTranslator
             if (nearWitnessAsserts.Count > 0)
             {
                 sb.AppendLine();
-                sb.AppendLine("; !exists near-witness: soft-prefer near-witnesses for each dropped body conjunct");
+                sb.AppendLine("; !exists near-witness: soft-prefer near-witnesses for each dropped body conjunct (low weight in plain query)");
+                // Weight 25 (vs 200 in the relevance shadow): a gentle nudge
+                // toward structural near-witness inputs that doesn't dominate
+                // Z3's model choice. Higher weight here (200) was found to
+                // bias Z3 away from killers in cases where the mutation
+                // depends on a particular *value* (e.g. threshold=0) rather
+                // than near-witness structure — see llm-verified-eval
+                // 1069_COR_Iff where the mutation `<==>` only manifests at
+                // threshold ≤ 0, but a strong near-witness preference would
+                // force threshold > 0 to satisfy `exists i,j :: abs<threshold`.
                 foreach (var a in nearWitnessAsserts)
-                    sb.AppendLine($"(assert-soft {a} :weight 200)");
+                    sb.AppendLine($"(assert-soft {a} :weight 1)");
             }
         }
 
