@@ -4511,19 +4511,59 @@ static class SmtTranslator
     }
 
     /// <summary>
+    /// Returns true iff `e` is a range/guard conjunct for one of the bound
+    /// variables in `boundVarNames`. A range/guard is a relational comparison
+    /// (`&lt;`, `≤`, `&gt;`, `≥`, or chain thereof) where at least one bare
+    /// operand is a bound variable. Equality/inequality (`==`, `!=`) are NOT
+    /// range ops — they're body constraints. Free input parameters appearing
+    /// in a comparison (like `threshold`) don't qualify the conjunct as a
+    /// range guard for the quantifier.
+    /// </summary>
+    static bool IsRangeOrGuardConjunct(Expression e, HashSet<string> boundVarNames)
+    {
+        var u = UnwrapExpr(e);
+        bool IsRelOp(BinaryExpr.Opcode op) =>
+            op == BinaryExpr.Opcode.Lt || op == BinaryExpr.Opcode.Le ||
+            op == BinaryExpr.Opcode.Gt || op == BinaryExpr.Opcode.Ge;
+        bool IsBoundVarRef(Expression x)
+        {
+            var ux = UnwrapExpr(x);
+            return (ux is IdentifierExpr id && boundVarNames.Contains(id.Name))
+                || (ux is NameSegment ns && boundVarNames.Contains(ns.Name));
+        }
+        if (u is ChainingExpression chain)
+        {
+            foreach (var op in chain.Operators)
+                if (!IsRelOp(op)) return false;
+            foreach (var operand in chain.Operands)
+                if (IsBoundVarRef(operand)) return true;
+            return false;
+        }
+        if (u is BinaryExpr bin && IsRelOp(bin.Op))
+            return IsBoundVarRef(bin.E0) || IsBoundVarRef(bin.E1);
+        return false;
+    }
+
+    /// <summary>
     /// Decompose a body expression into a list of cases, each represented as
     /// a list of expressions to be conjoined. Caller assembles the AND in SMT
     /// (preserving flat textual form, which matters for Z3 seed-sensitivity).
     /// Decomposition rules (same as before):
-    ///   AND(c1, ..., cn)  → for each i, [cj for j ≠ i]           (drop-each)
+    ///   AND(c1, ..., cn)  → for each *body* i, [cj for j ≠ i]    (drop-each over body conjuncts only)
     ///   OR(d1, ..., dn)   → for each i, [di, ¬dj for j ≠ i]      (MC/DC pick-one)
     ///   ITE(C, A, B)      → [[C, A], [¬C, B]]                    (branch coverage)
     ///   atomic            → [[body]]                             (single case)
-    /// If `flipDropped` is true, each AND-decomposition case additionally
-    /// includes ¬ci (the dropped conjunct) — for positive `exists` to force
-    /// a distinct near-witness rather than be trivially implied by the spec.
+    /// For AND drop-each, range/guard conjuncts (those binding the quantifier's
+    /// own variables, e.g. `0 ≤ i &lt; |s|`) are SKIPPED — they're part of the
+    /// quantifier scope, not body, and dropping them produces a degenerate soft
+    /// (Z3 fabricates values for unbounded vars). The other body conjuncts
+    /// (`s[i] = '.'`, `i != j`, `abs &lt; threshold`, etc.) are dropped one
+    /// at a time. If `flipDropped` is true, each case additionally includes
+    /// ¬ci (the dropped body conjunct) — for positive `exists` to force a
+    /// distinct near-witness.
     /// </summary>
-    internal static List<List<Expression>> DecomposeBodyCases(Expression body, bool flipDropped)
+    internal static List<List<Expression>> DecomposeBodyCases(
+        Expression body, HashSet<string> boundVarNames, bool flipDropped)
     {
         var u = UnwrapExpr(body);
         var result = new List<List<Expression>>();
@@ -4550,11 +4590,28 @@ static class SmtTranslator
             return result;
         }
 
-        // AND (BinaryExpr.And, possibly nested)
+        // AND (BinaryExpr.And, possibly nested) — drop-each over BODY conjuncts only.
+        // Range/guard conjuncts (`0 ≤ bv`, `bv < hi`, `lo ≤ bv < hi` chain, etc.)
+        // are SKIPPED: dropping them would leave the bound variable unbounded
+        // and Z3 would fabricate values for indexed accesses, producing
+        // degenerate softs that contribute no useful structural pressure.
         var conjuncts = DnfEngine.FlattenConjuncts(u);
         if (conjuncts.Count >= 2)
         {
+            // Identify range/guard conjuncts (over the quantifier's own bound
+            // vars) and skip them. The remaining body conjuncts are eligible
+            // for drop-each.
+            var dropIndices = new List<int>();
             for (int i = 0; i < conjuncts.Count; i++)
+            {
+                if (!IsRangeOrGuardConjunct(conjuncts[i], boundVarNames))
+                    dropIndices.Add(i);
+            }
+            // Edge case: every conjunct is a range/guard (no body) → no drops.
+            // This is rare but possible (e.g. `!exists i :: 0 ≤ i < |s|` —
+            // body is "non-empty range" only, no further body conjuncts).
+            if (dropIndices.Count == 0) return result;
+            foreach (int i in dropIndices)
             {
                 var keepers = new List<Expression>();
                 for (int j = 0; j < conjuncts.Count; j++)
@@ -4629,10 +4686,11 @@ static class SmtTranslator
         // dropped-conjunct case to force a *distinct* near-witness.
         bool flipDropped = polarity == LiteralPolarity.Exists;
 
-        var cases = DecomposeBodyCases(body, flipDropped);
-        if (cases.Count <= 1) return result;  // atomic body — nothing to decompose
-
         var bvNames = vars.Select(bv => bv.Name).ToList();
+        var boundVarSet = new HashSet<string>(bvNames);
+        var cases = DecomposeBodyCases(body, boundVarSet, flipDropped);
+        if (cases.Count == 0) return result;  // body had no droppable conjuncts
+
         foreach (var n in bvNames) _boundVars.Add(n);
 
         string? rangeSmt = null;
