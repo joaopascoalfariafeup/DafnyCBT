@@ -1154,62 +1154,33 @@ static class SmtTranslator
             EmitAntiTrivialBias(sb, inputs, mutableNames);
         }
 
-        // !exists near-witness preferences: for every `!exists vars :: c1 ∧ … ∧ cn`
-        // postcondition literal, soft-assert one stripped existential per body
-        // conjunct dropped. Drives Z3 toward inputs where each body conjunct
-        // individually has a witness — exposing structurally-rich inputs that
-        // approach but don't quite hit the full witness (which the spec forbids).
-        // Emitted in the plain query (Phase 1/2/2b) too, since `!exists` literals
-        // referencing inputs only are filtered out of the relevance safe set and
-        // would otherwise miss this benefit.
+        // Spec-coverage soft preferences (plain query / Phase 1/2/2b). One
+        // unified mechanism for every quantifier-literal shape:
+        //   forall vars :: range ⇒ body         — pick-one for OR/ITE bodies
+        //   !exists vars :: range ∧ body        — drop-each for AND bodies
+        //   exists vars :: range ∧ body         — drop-each-with-flip (multi-witness diversity)
+        // See BuildSpecCoverageSofts and DecomposeBodyCases for the
+        // decomposition rules and the polarity-aware flipping. Weight is
+        // intentionally low (1) here — the plain query's anti-trivial bias
+        // and Phase 2/2b tier constraints dominate Z3's model choice; the
+        // soft is a gentle nudge toward inputs that exercise the spec's
+        // structural cases when nothing else pins them. Spec-coverage softs
+        // get weight 200 in the relevance shadow (see
+        // EmitBehaviouralRelevanceConstraints) where they're the primary
+        // pressure on the witness.
         if (biasOn)
         {
             var nwInputsAndOutputs = inputs.Concat(outputs).ToList();
-            var nearWitnessAsserts = new List<string>();
+            var coverageSofts = new List<(string smt, LiteralPolarity polarity)>();
             foreach (var lit in postLiterals)
-            {
-                var unwrapped = UnwrapExpr(lit);
-                if (unwrapped is not UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not } notOp) continue;
-                if (UnwrapExpr(notOp.E) is not ExistsExpr existsInNot) continue;
-                nearWitnessAsserts.AddRange(BuildStrippedExistsVariants(
-                    existsInNot, nwInputsAndOutputs, mutableNames,
-                    isPostContext: false, requireQuantifierLast: false));
-            }
-            if (nearWitnessAsserts.Count > 0)
+                coverageSofts.AddRange(BuildSpecCoverageSofts(
+                    lit, nwInputsAndOutputs, mutableNames, isPostContext: false));
+            if (coverageSofts.Count > 0)
             {
                 sb.AppendLine();
-                sb.AppendLine("; !exists near-witness: soft-prefer near-witnesses for each dropped body conjunct (low weight in plain query)");
-                // Weight 25 (vs 200 in the relevance shadow): a gentle nudge
-                // toward structural near-witness inputs that doesn't dominate
-                // Z3's model choice. Higher weight here (200) was found to
-                // bias Z3 away from killers in cases where the mutation
-                // depends on a particular *value* (e.g. threshold=0) rather
-                // than near-witness structure — see llm-verified-eval
-                // 1069_COR_Iff where the mutation `<==>` only manifests at
-                // threshold ≤ 0, but a strong near-witness preference would
-                // force threshold > 0 to satisfy `exists i,j :: abs<threshold`.
-                foreach (var a in nearWitnessAsserts)
-                    sb.AppendLine($"(assert-soft {a} :weight 1)");
-            }
-
-            // Conditional-forall branch coverage in the plain query (low weight).
-            // Mirrors the !exists near-witness emission above. See
-            // BuildForallIteBranchCoverage for the rationale and example
-            // (dafny-synthesis_task_id_477 / ToLowercase).
-            var iteCoverageAsserts = new List<string>();
-            foreach (var lit in postLiterals)
-            {
-                var unwrapped = UnwrapExpr(lit);
-                if (unwrapped is not ForallExpr forallIte) continue;
-                iteCoverageAsserts.AddRange(BuildForallIteBranchCoverage(
-                    forallIte, nwInputsAndOutputs, mutableNames));
-            }
-            if (iteCoverageAsserts.Count > 0)
-            {
-                sb.AppendLine();
-                sb.AppendLine("; forall-ITE branch coverage: soft-prefer a witness for each branch (low weight in plain query)");
-                foreach (var a in iteCoverageAsserts)
-                    sb.AppendLine($"(assert-soft {a} :weight 1)");
+                sb.AppendLine("; Spec-coverage softs (plain query, low weight): per-case witnesses for forall/!exists/exists literals");
+                foreach (var (a, pol) in coverageSofts)
+                    sb.AppendLine($"(assert-soft {a} :weight {CoverageWeight(pol, inRelevanceShadow: false)})");
             }
         }
 
@@ -4355,57 +4326,31 @@ static class SmtTranslator
             // char is NOT '.'. Without the near-witness soft, Z3 picks
             // `s = []`; with it, Z3 prefers `s` with '.' present (and the
             // spec forbids '.' at position |s|-3, so '.' lands elsewhere).
-            var nearWitnessAsserts = new List<string>();
+            // Spec-coverage softs (relevance shadow). One unified mechanism
+            // for every quantifier-literal shape — see BuildSpecCoverageSofts
+            // and DecomposeBodyCases. Decomposition rules:
+            //   AND(c1..cn)         drop-each (drop ci, keep others)
+            //   OR(d1..dn)          MC/DC pick-one (di alone fires)
+            //   ITE(C, A, B)        branch coverage (C∧A, ¬C∧B)
+            // Polarity flag from the outer quantifier:
+            //   forall ⇒ body       spec coverage (high weight)
+            //   !exists ∧ body      spec coverage (high weight)
+            //   exists ∧ body       collection diversity — drop-each-with-flip,
+            //                       lower priority but still useful for exposing
+            //                       defects that depend on multi-witness inputs
+            //                       (FindFirstRepeatedChar-style).
+            // Weight 200 here (vs 1 in BuildSmt2Query plain query) — in the
+            // relevance shadow these softs are the primary structural pressure.
+            var coverageSofts = new List<(string smt, LiteralPolarity polarity)>();
             foreach (var lit in postLiterals)
-            {
-                var unwrapped = UnwrapExpr(lit);
-                if (unwrapped is not UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not } notOp) continue;
-                if (UnwrapExpr(notOp.E) is not ExistsExpr existsInNot) continue;
-                // Emit one soft per body-conjunct dropped: each variant captures
-                // a different near-witness structural pattern. Z3 prefers the
-                // model satisfying ALL variants (every conjunct individually
-                // witnessable), driving inputs toward structural diversity.
-                nearWitnessAsserts.AddRange(BuildStrippedExistsVariants(
-                    existsInNot, inputsAndOutputs, mutableNames,
-                    isPostContext: false, requireQuantifierLast: false));
-            }
-            if (nearWitnessAsserts.Count > 0)
+                coverageSofts.AddRange(BuildSpecCoverageSofts(
+                    lit, inputsAndOutputs, mutableNames, isPostContext: false));
+            if (coverageSofts.Count > 0)
             {
                 sb.AppendLine();
-                sb.AppendLine("; ─── Phase 1r: !exists near-witness — prefer a witness for the stripped existential (soft) ───");
-                foreach (var a in nearWitnessAsserts)
-                    sb.AppendLine($"(assert-soft {a} :weight 200)");
-            }
-
-            // (4) Conditional-forall branch coverage: for `forall var :: range ==>
-            // if C then A else B`, soft-assert both `exists var :: range ∧ C ∧ A`
-            // (then-branch witness) and `exists var :: range ∧ ¬C ∧ B`
-            // (else-branch witness). Forces Z3 to pick inputs that exercise
-            // both branches of the ITE — full case coverage.
-            //
-            // Example: dafny-synthesis_task_id_477 has
-            //   forall i :: 0 ≤ i < |s| ==> if IsUpperCase(s[i])
-            //                                 then IsUpperLowerPair(s[i], v[i])
-            //                                 else v[i] == s[i]
-            // The mutation deletes the upper-case branch. Without ITE coverage,
-            // Z3 happily picks `s` with no upper-case chars (else-branch only,
-            // mutation invisible). With both branches forced, Z3 must include
-            // at least one upper-case and at least one non-upper-case char,
-            // exposing the deletion.
-            var iteCoverageAsserts = new List<string>();
-            foreach (var lit in postLiterals)
-            {
-                var unwrapped = UnwrapExpr(lit);
-                if (unwrapped is not ForallExpr forallIte) continue;
-                iteCoverageAsserts.AddRange(BuildForallIteBranchCoverage(
-                    forallIte, inputsAndOutputs, mutableNames));
-            }
-            if (iteCoverageAsserts.Count > 0)
-            {
-                sb.AppendLine();
-                sb.AppendLine("; ─── Phase 1r: forall-ITE branch coverage — prefer a witness for each branch (soft) ───");
-                foreach (var a in iteCoverageAsserts)
-                    sb.AppendLine($"(assert-soft {a} :weight 200)");
+                sb.AppendLine("; ─── Phase 1r: spec-coverage softs — per-case witness for each quantifier literal ───");
+                foreach (var (a, pol) in coverageSofts)
+                    sb.AppendLine($"(assert-soft {a} :weight {CoverageWeight(pol, inRelevanceShadow: true)})");
             }
         }
     }
@@ -4500,6 +4445,247 @@ static class SmtTranslator
     /// biting clause and produces inputs that exercise it specifically — exposing
     /// mutations that only manifest when the inner quantifier has substance.
     /// </summary>
+    /// <summary>
+    /// Polarity of a quantifier literal in the contract.
+    /// </summary>
+    internal enum LiteralPolarity
+    {
+        /// <summary>`forall vars :: range ⇒ body` — spec-coverage strengthening (high weight).</summary>
+        Forall,
+        /// <summary>`!exists vars :: range ∧ body` — spec-coverage strengthening (high weight).</summary>
+        NotExists,
+        /// <summary>`exists vars :: range ∧ body` — collection-diversity strengthening (low weight).</summary>
+        Exists,
+    }
+
+    /// <summary>
+    /// Try to recognise a quantifier literal in one of three canonical shapes:
+    ///   `forall vars :: range ⇒ body`     → (Forall, vars, range, body)
+    ///   `!exists vars :: range ∧ body`    → (NotExists, vars, range, body)  -- range/body split: leading conjuncts that bound `vars` form `range`, the rest is `body`
+    ///   `exists vars :: range ∧ body`     → (Exists, vars, range, body)
+    /// Returns null if the literal doesn't match any of these.
+    /// `range` may be null when no leading bound is detected.
+    /// </summary>
+    internal static (LiteralPolarity polarity,
+                     List<BoundVar> vars,
+                     Expression? range,
+                     Expression body)? TryParseQuantifierLiteral(Expression lit)
+    {
+        var u = UnwrapExpr(lit);
+        if (u is ForallExpr f)
+        {
+            var fb = UnwrapExpr(f.Term);
+            if (fb is BinaryExpr { Op: BinaryExpr.Opcode.Imp } imp)
+                return (LiteralPolarity.Forall, f.BoundVars.ToList(), imp.E0, UnwrapExpr(imp.E1));
+            return (LiteralPolarity.Forall, f.BoundVars.ToList(), null, fb);
+        }
+        if (u is UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not } notOp
+            && UnwrapExpr(notOp.E) is ExistsExpr neg)
+        {
+            var (rng, bd) = SplitRangeAndBody(neg);
+            return (LiteralPolarity.NotExists, neg.BoundVars.ToList(), rng, bd);
+        }
+        if (u is ExistsExpr pos)
+        {
+            var (rng, bd) = SplitRangeAndBody(pos);
+            return (LiteralPolarity.Exists, pos.BoundVars.ToList(), rng, bd);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// For an `exists vars :: c1 ∧ c2 ∧ … ∧ cn` body, split off the leading
+    /// "range" conjuncts (those of the form `lo ≤ v`, `v &lt; hi`, or chained
+    /// `lo ≤ v &lt; hi` for some bound var `v`) from the "body" conjuncts (the
+    /// rest). Returns (rangeExpr, bodyExpr) where rangeExpr is an AND of the
+    /// range conjuncts (or null if none) and bodyExpr is the AND of the rest.
+    /// Currently used only to keep range conjuncts intact under decomposition;
+    /// the actual range extraction reuses the existing TryExtractExistsRange.
+    /// </summary>
+    static (Expression? range, Expression body) SplitRangeAndBody(ExistsExpr e)
+    {
+        // Conservative: treat the whole term as body and let the SMT builder
+        // assemble the range from TryExtractExistsRange when needed. Range/body
+        // split here matters for *AST decomposition*, not SMT emission.
+        return (null, UnwrapExpr(e.Term));
+    }
+
+    /// <summary>
+    /// Decompose a body expression into a list of cases, each represented as
+    /// a list of expressions to be conjoined. Caller assembles the AND in SMT
+    /// (preserving flat textual form, which matters for Z3 seed-sensitivity).
+    /// Decomposition rules (same as before):
+    ///   AND(c1, ..., cn)  → for each i, [cj for j ≠ i]           (drop-each)
+    ///   OR(d1, ..., dn)   → for each i, [di, ¬dj for j ≠ i]      (MC/DC pick-one)
+    ///   ITE(C, A, B)      → [[C, A], [¬C, B]]                    (branch coverage)
+    ///   atomic            → [[body]]                             (single case)
+    /// If `flipDropped` is true, each AND-decomposition case additionally
+    /// includes ¬ci (the dropped conjunct) — for positive `exists` to force
+    /// a distinct near-witness rather than be trivially implied by the spec.
+    /// </summary>
+    internal static List<List<Expression>> DecomposeBodyCases(Expression body, bool flipDropped)
+    {
+        var u = UnwrapExpr(body);
+        var result = new List<List<Expression>>();
+
+        // ITE
+        if (u is ITEExpr ite)
+        {
+            result.Add(new List<Expression> { ite.Test, ite.Thn });
+            result.Add(new List<Expression> { MkNot(ite.Test), ite.Els });
+            return result;
+        }
+
+        // OR (BinaryExpr.Or, possibly nested)
+        var disjuncts = FlattenDisjuncts(u);
+        if (disjuncts.Count >= 2)
+        {
+            for (int i = 0; i < disjuncts.Count; i++)
+            {
+                var case_ = new List<Expression> { disjuncts[i] };
+                for (int j = 0; j < disjuncts.Count; j++)
+                    if (j != i) case_.Add(MkNot(disjuncts[j]));
+                result.Add(case_);
+            }
+            return result;
+        }
+
+        // AND (BinaryExpr.And, possibly nested)
+        var conjuncts = DnfEngine.FlattenConjuncts(u);
+        if (conjuncts.Count >= 2)
+        {
+            for (int i = 0; i < conjuncts.Count; i++)
+            {
+                var keepers = new List<Expression>();
+                for (int j = 0; j < conjuncts.Count; j++)
+                    if (j != i) keepers.Add(conjuncts[j]);
+                if (flipDropped) keepers.Add(MkNot(conjuncts[i]));
+                result.Add(keepers);
+            }
+            return result;
+        }
+
+        // Atomic — single case.
+        result.Add(new List<Expression> { u });
+        return result;
+    }
+
+    static List<Expression> FlattenDisjuncts(Expression expr)
+    {
+        var r = new List<Expression>();
+        FlattenDisjunctsInner(UnwrapExpr(expr), r);
+        return r;
+    }
+    static void FlattenDisjunctsInner(Expression e, List<Expression> r)
+    {
+        if (e is BinaryExpr { Op: BinaryExpr.Opcode.Or } or)
+        {
+            FlattenDisjunctsInner(UnwrapExpr(or.E0), r);
+            FlattenDisjunctsInner(UnwrapExpr(or.E1), r);
+        }
+        else r.Add(e);
+    }
+    static Expression MkAnd(Expression a, Expression b) =>
+        new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.And, a, b);
+    static Expression MkNot(Expression a) =>
+        a is UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not } un ? un.E :
+        new UnaryOpExpr(Token.NoToken, UnaryOpExpr.Opcode.Not, a);
+    static Expression MkAndAll(List<Expression> xs)
+    {
+        if (xs.Count == 0) throw new System.ArgumentException("MkAndAll: empty list");
+        var r = xs[0];
+        for (int i = 1; i < xs.Count; i++) r = MkAnd(r, xs[i]);
+        return r;
+    }
+
+    /// <summary>
+    /// Build SMT soft-assertion strings for spec coverage of a quantifier
+    /// literal. Returns a list of `(smtCase, polarity)` tuples, one per case
+    /// from DecomposeBodyCases (with polarity-aware flipping). Caller emits
+    /// each as `(assert-soft smtCase :weight W)` with W chosen by polarity:
+    ///   Forall / NotExists  →  high weight (spec coverage)
+    ///   Exists              →  low weight (collection-diversity richness)
+    /// </summary>
+    internal static List<(string smt, LiteralPolarity polarity)> BuildSpecCoverageSofts(
+        Expression literal,
+        List<(string Name, string Type)> inputsAndOutputs,
+        HashSet<string> mutableNames,
+        bool isPostContext)
+    {
+        var result = new List<(string, LiteralPolarity)>();
+        var parsed = TryParseQuantifierLiteral(literal);
+        if (parsed == null) return result;
+        var (polarity, vars, rangeExpr, body) = parsed.Value;
+        if (vars.Count == 0) return result;
+
+        // For now, skip positive `exists` in the unified emitter — its
+        // multi-witness strengthening interacts with the legacy shadow-side
+        // hard `assertExistsStripped` mechanism (which is the path that
+        // actually drives killers like FindFirstRepeatedChar). Will re-enable
+        // once the shadow-side mechanism is also unified.
+        if (polarity == LiteralPolarity.Exists) return result;
+
+        // Polarity-conditional: positive `exists` needs ¬ci appended to the
+        // dropped-conjunct case to force a *distinct* near-witness.
+        bool flipDropped = polarity == LiteralPolarity.Exists;
+
+        var cases = DecomposeBodyCases(body, flipDropped);
+        if (cases.Count <= 1) return result;  // atomic body — nothing to decompose
+
+        var bvNames = vars.Select(bv => bv.Name).ToList();
+        foreach (var n in bvNames) _boundVars.Add(n);
+
+        string? rangeSmt = null;
+        if (rangeExpr != null)
+        {
+            ResetExprToSmtBudget();
+            rangeSmt = ExprToSmt(rangeExpr, inputsAndOutputs, mutableNames, isPostContext);
+        }
+
+        var bvBindings = string.Join(" ", vars.Select(bv =>
+            $"({bv.Name} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
+
+        foreach (var caseConjuncts in cases)
+        {
+            // Translate each conjunct individually; build a flat `(and a b c …)`
+            // textual form to preserve Z3's seed-sensitive heuristics across
+            // refactors. Nested ANDs (from AST chains) and flat ANDs are
+            // semantically identical but produce different model orderings.
+            var parts = new List<string>();
+            if (rangeSmt != null) parts.Add(rangeSmt);
+            bool ok = true;
+            foreach (var c in caseConjuncts)
+            {
+                ResetExprToSmtBudget();
+                var s = ExprToSmt(c, inputsAndOutputs, mutableNames, isPostContext);
+                if (s == null) { ok = false; break; }
+                parts.Add(s);
+            }
+            if (!ok || parts.Count == 0) continue;
+            var bodySmt = parts.Count == 1 ? parts[0] : "(and " + string.Join(" ", parts) + ")";
+            result.Add(($"(exists ({bvBindings}) {bodySmt})", polarity));
+        }
+
+        foreach (var n in bvNames) _boundVars.Remove(n);
+        return result;
+    }
+
+    /// <summary>
+    /// Per-polarity weight for spec-coverage soft assertions. Spec-coverage
+    /// strengthening (forall/!exists) is high priority — it ensures every
+    /// disjunct/branch/conjunct of the spec is exercised. Collection-diversity
+    /// strengthening (positive exists) is lower priority — the spec is already
+    /// satisfied by a single witness; multi-witness richness is a "nice-to-have".
+    /// </summary>
+    internal static int CoverageWeight(LiteralPolarity polarity, bool inRelevanceShadow) =>
+        polarity switch
+        {
+            LiteralPolarity.Forall => inRelevanceShadow ? 200 : 1,
+            LiteralPolarity.NotExists => inRelevanceShadow ? 200 : 1,
+            LiteralPolarity.Exists => 1,  // collection diversity: low everywhere
+            _ => 1,
+        };
+
     internal static string? BuildStrippedExistsSmt(
         ExistsExpr existsExpr,
         List<(string Name, string Type)> inputsAndOutputs,
