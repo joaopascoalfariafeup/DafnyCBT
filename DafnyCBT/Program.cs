@@ -2232,6 +2232,40 @@ class Program
                                 emitted.Add($"{pi}|{ci}|{ebLabel}");
                             }
                         }
+
+                        // Spec-coverage row tiers for `!exists ∧ AND` literals.
+                        // For a literal of shape `!exists vars :: range && c1 && ... && cn`,
+                        // emit n+1 separate Phase 2 entries:
+                        //   /SC<i>=drop<j>  for j in 1..n   — relax body conjunct j
+                        //   /SC<i>=allflip                  — flip every body conjunct
+                        // The drop tiers exercise truth-table rows where exactly one body
+                        // conjunct is false; the all-flipped tier covers the all-false row
+                        // (incompatible as a soft with the drop tiers, hence emitted as a
+                        // separate test). Targets COR-style mutants whose killer requires
+                        // the all-false row (e.g. 1069_COR_Iff: i=j with both clauses false).
+                        int scLitIdx = 0;
+                        foreach (var lit in clause)
+                        {
+                            scLitIdx++;
+                            var inner = Unwrap(lit);
+                            // Only `!exists ∧ AND` qualifies (NotExists polarity).
+                            if (!(inner is UnaryOpExpr u2 && u2.Op == UnaryOpExpr.Opcode.Not
+                                  && Unwrap(u2.E) is ExistsExpr)) continue;
+                            var rows = SmtTranslator.BuildSpecCoverageSofts(
+                                lit, allInputs, mutableNames,
+                                isPostContext: true, includeAllFlipped: true);
+                            if (rows == null || rows.Count < 2) continue;
+                            int rowIdx = 0;
+                            foreach (var (rowSmt, _) in rows)
+                            {
+                                rowIdx++;
+                                if (string.IsNullOrEmpty(rowSmt)) continue;
+                                var scLabel = $"SC{scLitIdx}r{rowIdx}";
+                                schedule.Add(($"{clauseLabel}/{scLabel}",
+                                    clause, fullPreLits, new List<Expression>(), new List<string> { rowSmt }, simpleMask, pi));
+                                emitted.Add($"{pi}|{ci}|{scLabel}");
+                            }
+                        }
                     }
                 }
             }

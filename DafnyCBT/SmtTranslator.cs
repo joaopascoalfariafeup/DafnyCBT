@@ -4667,7 +4667,8 @@ static class SmtTranslator
         Expression literal,
         List<(string Name, string Type)> inputsAndOutputs,
         HashSet<string> mutableNames,
-        bool isPostContext)
+        bool isPostContext,
+        bool includeAllFlipped = false)
     {
         var result = new List<(string, LiteralPolarity)>();
         var parsed = TryParseQuantifierLiteral(literal);
@@ -4689,6 +4690,34 @@ static class SmtTranslator
         var bvNames = vars.Select(bv => bv.Name).ToList();
         var boundVarSet = new HashSet<string>(bvNames);
         var cases = DecomposeBodyCases(body, boundVarSet, flipDropped);
+
+        // n+1 row coverage for !exists ∧ AND when includeAllFlipped is set.
+        // Adds the "all body conjuncts flipped" row — `∃ pair :: range ∧ ¬c1
+        // ∧ ¬c2 ∧ … ∧ ¬cn` — which captures multi-conjunct interaction
+        // defects whose discriminator is the *whole conjunction* (e.g.
+        // 1069_COR_Iff: i=j ∧ abs ≥ thr ⇒ thr ≤ 0). Only emitted when there
+        // are ≥ 2 droppable body conjuncts (else the all-flipped is just
+        // the single drop-each case).
+        if (includeAllFlipped && polarity == LiteralPolarity.NotExists)
+        {
+            var conjuncts = DnfEngine.FlattenConjuncts(UnwrapExpr(body));
+            if (conjuncts.Count >= 2)
+            {
+                var bodyIndices = new List<int>();
+                for (int i = 0; i < conjuncts.Count; i++)
+                    if (!IsRangeOrGuardConjunct(conjuncts[i], boundVarSet))
+                        bodyIndices.Add(i);
+                if (bodyIndices.Count >= 2)
+                {
+                    var allFlipped = new List<Expression>();
+                    var bodySet = new HashSet<int>(bodyIndices);
+                    for (int j = 0; j < conjuncts.Count; j++)
+                        allFlipped.Add(bodySet.Contains(j) ? MkNot(conjuncts[j]) : conjuncts[j]);
+                    cases.Add(allFlipped);
+                }
+            }
+        }
+
         if (cases.Count == 0) return result;  // body had no droppable conjuncts
 
         foreach (var n in bvNames) _boundVars.Add(n);
