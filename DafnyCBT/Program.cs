@@ -2233,38 +2233,34 @@ class Program
                             }
                         }
 
-                        // Spec-coverage row tiers for `!exists ∧ AND` literals.
-                        // For a literal of shape `!exists vars :: range && c1 && ... && cn`,
-                        // emit n+1 separate Phase 2 entries:
-                        //   /SC<i>=drop<j>  for j in 1..n   — relax body conjunct j
-                        //   /SC<i>=allflip                  — flip every body conjunct
-                        // The drop tiers exercise truth-table rows where exactly one body
-                        // conjunct is false; the all-flipped tier covers the all-false row
-                        // (incompatible as a soft with the drop tiers, hence emitted as a
-                        // separate test). Targets COR-style mutants whose killer requires
-                        // the all-false row (e.g. 1069_COR_Iff: i=j with both clauses false).
+                        // Spec-coverage all-flipped tier for `!exists ∧ AND` literals.
+                        // For `!exists vars :: range ∧ c1 ∧ … ∧ cn` (n ≥ 2 body conjuncts),
+                        // emit ONE Phase 2 entry with extra-constraint
+                        //   (exists vars :: range ∧ ¬c1 ∧ ¬c2 ∧ … ∧ ¬cn)
+                        // This is the truth-table row no Phase 1r near-witness soft can
+                        // reach (the drop-each softs already cover the n single-false-conjunct
+                        // rows in both the plain query and relevance shadow). Targets
+                        // COR-style defects whose discriminator is the whole conjunction —
+                        // e.g. 1069_COR_Iff: i=j with both body clauses false.
                         int scLitIdx = 0;
                         foreach (var lit in clause)
                         {
                             scLitIdx++;
                             var inner = Unwrap(lit);
-                            // Only `!exists ∧ AND` qualifies (NotExists polarity).
                             if (!(inner is UnaryOpExpr u2 && u2.Op == UnaryOpExpr.Opcode.Not
                                   && Unwrap(u2.E) is ExistsExpr)) continue;
                             var rows = SmtTranslator.BuildSpecCoverageSofts(
                                 lit, allInputs, mutableNames,
                                 isPostContext: true, includeAllFlipped: true);
                             if (rows == null || rows.Count < 2) continue;
-                            int rowIdx = 0;
-                            foreach (var (rowSmt, _) in rows)
-                            {
-                                rowIdx++;
-                                if (string.IsNullOrEmpty(rowSmt)) continue;
-                                var scLabel = $"SC{scLitIdx}r{rowIdx}";
-                                schedule.Add(($"{clauseLabel}/{scLabel}",
-                                    clause, fullPreLits, new List<Expression>(), new List<string> { rowSmt }, simpleMask, pi));
-                                emitted.Add($"{pi}|{ci}|{scLabel}");
-                            }
+                            // BuildSpecCoverageSofts appends the all-flipped row last
+                            // when includeAllFlipped is set; take just that row.
+                            var (allFlipSmt, _) = rows[rows.Count - 1];
+                            if (string.IsNullOrEmpty(allFlipSmt)) continue;
+                            var scLabel = $"SC{scLitIdx}";
+                            schedule.Add(($"{clauseLabel}/{scLabel}",
+                                clause, fullPreLits, new List<Expression>(), new List<string> { allFlipSmt }, simpleMask, pi));
+                            emitted.Add($"{pi}|{ci}|{scLabel}");
                         }
                     }
                 }
