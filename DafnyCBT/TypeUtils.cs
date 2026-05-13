@@ -667,6 +667,8 @@ static class TypeUtils
         if (Regex.IsMatch(trimmed, @"\bfresh\s*\(")) return true;
         // "this in Repr" standalone is spec-only (but don't match Repr inside larger expressions like Valid() body)
         if (Regex.IsMatch(trimmed, @"^(this|data|\w+)\s+in\s+Repr$")) return true;
+        // "null !in Repr" / "x !in Repr": class-invariant clause from autocontracts; not runtime-checkable
+        if (Regex.IsMatch(trimmed, @"^(null|this|\w+)\s*!in\s+Repr$")) return true;
         return false;
     }
 

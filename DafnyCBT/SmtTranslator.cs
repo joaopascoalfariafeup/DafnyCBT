@@ -5215,7 +5215,33 @@ static class SmtTranslator
         }
         if (TypeUtils.IsSetType(type))
         {
-            sb.AppendLine($"(declare-const {altName} (Array Int Bool))");
+            // Mirror the main set encoding so alt is sort-compatible with the
+            // original side of the inequality clause:
+            //   - SMT sort matches DafnyTypeToSmt (set<int> → (Array Int Bool),
+            //                                      set<string> → (Array (Seq Int) Bool))
+            //   - closed-world universe constraint so Z3 doesn't pick membership
+            //     outside the bounded universe (mirrors lines 805-846)
+            //   - {altName}_card define-fun so postconditions that reference the
+            //     post-state cardinality rename consistently
+            var altSmtSort = TypeUtils.DafnyTypeToSmt(type);
+            sb.AppendLine($"(declare-const {altName} {altSmtSort})");
+            if (TypeUtils.IsStringElementSet(type))
+            {
+                var smtUniverse = TypeUtils.GetElementUniverseSmt("string");
+                var universeDisjuncts = string.Join(" ", smtUniverse.Select(v => $"(= x {v})"));
+                sb.AppendLine($"(assert (forall ((x (Seq Int))) (=> (select {altName} x) (or {universeDisjuncts}))))");
+                var cardTerms = string.Join(" ", smtUniverse.Select(v => $"(ite (select {altName} {v}) 1 0)"));
+                sb.AppendLine($"(define-fun {altName}_card () Int (+ {cardTerms}))");
+            }
+            else
+            {
+                var elemType = TypeUtils.GetSetElementType(type);
+                var universe = TypeUtils.GetElementUniverse(elemType);
+                var universeDisjuncts = string.Join(" ", universe.Select(v => $"(= x {v})"));
+                sb.AppendLine($"(assert (forall ((x Int)) (=> (select {altName} x) (or {universeDisjuncts}))))");
+                var cardTerms = string.Join(" ", universe.Select(v => $"(ite (select {altName} {v}) 1 0)"));
+                sb.AppendLine($"(define-fun {altName}_card () Int (+ {cardTerms}))");
+            }
             return true;
         }
         if (TypeUtils.IsMultisetType(type))
@@ -5321,11 +5347,13 @@ static class SmtTranslator
         if (TypeUtils.IsSetType(type))
         {
             map[baseName] = $"{baseName}_{suffix}";
+            map[$"{baseName}_card"] = $"{baseName}_{suffix}_card";
             return;
         }
         if (TypeUtils.IsMultisetType(type))
         {
             map[baseName] = $"{baseName}_{suffix}";
+            map[$"{baseName}_card"] = $"{baseName}_{suffix}_card";
             var elemType = TypeUtils.GetMultisetElementType(type);
             var universe = TypeUtils.GetElementUniverse(elemType);
             for (int i = 0; i < universe.Length; i++) map[$"{baseName}_e{i}"] = $"{baseName}_{suffix}_e{i}";

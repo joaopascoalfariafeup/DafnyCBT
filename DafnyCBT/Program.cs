@@ -1992,11 +1992,31 @@ class Program
                 .Concat(ins.Where(i => mutables.Contains(i.Name)).Select(i => i.Name))
                 .Distinct().ToList();
             var litStrs = clause.Select(DnfEngine.ExprToString).ToList();
+            // Frame condition: `X == old(X)` says "field X is preserved across the call".
+            // Trivially flippable on alt (alt-X can differ), but the resulting input is
+            // generic — adds no relevance signal beyond what Phase 1 already covers.
+            var frameEq = new Regex(@"^\s*(\w+)\s*==\s*old\s*\(\s*\1\s*\)\s*$");
+            // Strip `old(...)` wrappers, then check for output references in the residue.
+            // A literal that mentions an output ONLY inside `old(...)` is pre-state-only:
+            // alt-outputs and outs share the same `old(...)` values, so the alt can never
+            // flip the literal → per-literal relevance query is UNSAT by construction.
+            var oldStrip = new Regex(@"\bold\s*\([^()]*\)");
+            string StripOld(string s)
+            {
+                while (true)
+                {
+                    var next = oldStrip.Replace(s, "_OLD_");
+                    if (next == s) return s;
+                    s = next;
+                }
+            }
             for (int i = 0; i < clause.Count; i++)
             {
                 var s = litStrs[i];
                 if (IsGuardLiteral(s)) continue;
-                bool refsOut = outNames.Any(n => Regex.IsMatch(s, @"\b" + Regex.Escape(n) + @"\b"));
+                if (frameEq.IsMatch(s)) continue;
+                var stripped = StripOld(s);
+                bool refsOut = outNames.Any(n => Regex.IsMatch(stripped, @"\b" + Regex.Escape(n) + @"\b"));
                 if (!refsOut) continue;
                 result.Add(i);
             }
