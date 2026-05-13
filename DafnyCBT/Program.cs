@@ -1392,6 +1392,33 @@ class Program
         // the position-based inlined→original mapping below misaligns and literals get lost.
         // Smoke-test path with no ensures: single trivial clause (Z3 solves for
         // pre-only). Avoids IndexOutOfRange on `ensuresClauses[0]`.
+        // Input-only ensures optimization: for non-mutating methods (no `modifies`
+        // clause), any ensures literal that doesn't reference a return parameter is
+        // a preservation/frame property and contributes no behavioural alternative
+        // to the DNF. Keep it atomic (single-clause DNF) rather than decomposing,
+        // to avoid spurious sub-cases — e.g. an `ensures Valid()` in a non-mutating
+        // class method whose Valid() body has internal `|s|!=0 ==> forall...`
+        // implications that would otherwise multiply the clause count.
+        bool isNonMutating = method.Mod == null || method.Mod.Expressions.Count == 0;
+        var outputNamesForEnsuresCheck = method.Outs.Select(o => o.Name).ToList();
+        bool ReferencesOutput(Expression e)
+        {
+            if (outputNamesForEnsuresCheck.Count == 0) return false;
+            var s = DnfEngine.ExprToString(e);
+            foreach (var n in outputNamesForEnsuresCheck)
+                if (Regex.IsMatch(s, $@"\b{Regex.Escape(n)}\b"))
+                    return true;
+            return false;
+        }
+        var ensuresInputOnly = new bool[ensuresClauses.Count];
+        if (isNonMutating)
+        {
+            for (int i = 0; i < ensuresClauses.Count; i++)
+                ensuresInputOnly[i] = !ReferencesOutput(ensuresClauses[i]);
+        }
+        List<List<Expression>> AtomicDnf(Expression e) =>
+            new List<List<Expression>> { new List<Expression> { e } };
+
         List<List<Expression>> originalDnfExprs;
         if (ensuresClauses.Count == 0)
         {
@@ -1399,9 +1426,16 @@ class Program
         }
         else
         {
-            originalDnfExprs = DnfEngine.ExprToDnf(ensuresClauses[0]);
+            originalDnfExprs = ensuresInputOnly[0]
+                ? AtomicDnf(ensuresClauses[0])
+                : DnfEngine.ExprToDnf(ensuresClauses[0]);
             for (int i = 1; i < ensuresClauses.Count; i++)
-                originalDnfExprs = DnfEngine.CrossProductPruned(originalDnfExprs, DnfEngine.ExprToDnf(ensuresClauses[i]));
+            {
+                var clauseDnf = ensuresInputOnly[i]
+                    ? AtomicDnf(ensuresClauses[i])
+                    : DnfEngine.ExprToDnf(ensuresClauses[i]);
+                originalDnfExprs = DnfEngine.CrossProductPruned(originalDnfExprs, clauseDnf);
+            }
         }
 
         // Compute DNF/FDNF on inlined ensures for SMT translation.
@@ -1416,16 +1450,30 @@ class Program
         }
         else if (allCombinations)
         {
-            dnfExprs = DnfEngine.ExprToFdnf(dnfEnsures[0]);
+            dnfExprs = ensuresInputOnly[0]
+                ? AtomicDnf(dnfEnsures[0])
+                : DnfEngine.ExprToFdnf(dnfEnsures[0]);
             for (int i = 1; i < dnfEnsures.Count; i++)
-                dnfExprs = DnfEngine.CrossProductPruned(dnfExprs, DnfEngine.ExprToFdnf(dnfEnsures[i]));
+            {
+                var clauseDnf = ensuresInputOnly[i]
+                    ? AtomicDnf(dnfEnsures[i])
+                    : DnfEngine.ExprToFdnf(dnfEnsures[i]);
+                dnfExprs = DnfEngine.CrossProductPruned(dnfExprs, clauseDnf);
+            }
             usedFdnf = true;
         }
         else
         {
-            dnfExprs = DnfEngine.ExprToDnf(dnfEnsures[0]);
+            dnfExprs = ensuresInputOnly[0]
+                ? AtomicDnf(dnfEnsures[0])
+                : DnfEngine.ExprToDnf(dnfEnsures[0]);
             for (int i = 1; i < dnfEnsures.Count; i++)
-                dnfExprs = DnfEngine.CrossProductPruned(dnfExprs, DnfEngine.ExprToDnf(dnfEnsures[i]));
+            {
+                var clauseDnf = ensuresInputOnly[i]
+                    ? AtomicDnf(dnfEnsures[i])
+                    : DnfEngine.ExprToDnf(dnfEnsures[i]);
+                dnfExprs = DnfEngine.CrossProductPruned(dnfExprs, clauseDnf);
+            }
         }
 
         // Detect whether inlining (typically recursive at depth ≥ 2) altered
