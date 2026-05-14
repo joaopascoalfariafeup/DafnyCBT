@@ -1807,6 +1807,99 @@ class Program
         if (mutableNames.Count > 0 && verbose)
             Console.WriteLine($"  Mutable (pre/post split): {string.Join(", ", mutableNames)}");
 
+        // Clause-merge by input-fingerprint: DNF cross-product of `(A1 ∨ A2) ⟹ B`-style
+        // ensures with other clauses sometimes produces multiple clauses that share the
+        // same input-only literals and differ only in output-shape literals. For binary
+        // search, the not-found case splits into `pos < 0 ∧ val !in a` and
+        // `pos ≥ a.Length ∧ val !in a` — same input region (`val !in a`), different
+        // output representations of "not found". These are operationally equivalent:
+        // the impl's choice of output representation is what's being checked, but for
+        // *input generation* there's no extra signal from testing both shapes.
+        //
+        // Merge: group clauses by their input-only-literal canonical key; for each
+        // group of size ≥ 2, replace with a single clause that keeps the shared input
+        // literals and OR's the per-clause output sub-conjunctions into one compound
+        // output literal. The runtime expect still uses the full original post (via
+        // `hasNonInlinableFuncs`-driven full-post emission, or directly), so semantics
+        // are preserved; we just reduce test-slot waste.
+        //
+        // A literal is "output-touching" if it references any return parameter or
+        // mutable-post variable (the same `outNames` set used by the relevance safety
+        // filter at line ~1973). Everything else is input-only.
+        {
+            var outNamesForMerge = outputs.Select(o => o.Name)
+                .Concat(inputs.Where(i => mutableNames.Contains(i.Name)).Select(i => i.Name))
+                .Distinct().ToList();
+            bool TouchesOutput(string litStr)
+            {
+                foreach (var n in outNamesForMerge)
+                    if (Regex.IsMatch(litStr, @"\b" + Regex.Escape(n) + @"\b"))
+                        return true;
+                return false;
+            }
+            List<List<Expression>> MergeByInputKey(List<List<Expression>> clauses)
+            {
+                if (clauses.Count < 2 || outNamesForMerge.Count == 0) return clauses;
+                var groups = new Dictionary<string, List<(List<Expression> inLits, List<Expression> outLits, int origIdx)>>();
+                var origOrder = new List<string>();
+                for (int ci = 0; ci < clauses.Count; ci++)
+                {
+                    var clause = clauses[ci];
+                    var inLits = new List<Expression>();
+                    var outLits = new List<Expression>();
+                    foreach (var lit in clause)
+                    {
+                        if (TouchesOutput(DnfEngine.ExprToString(lit))) outLits.Add(lit);
+                        else inLits.Add(lit);
+                    }
+                    // Key = sorted canonical strings of input-only literals.
+                    var key = string.Join(" && ",
+                        inLits.Select(l => DnfEngine.CanonicalLiteralKey(DnfEngine.ExprToString(l)))
+                              .OrderBy(s => s, StringComparer.Ordinal));
+                    if (!groups.ContainsKey(key)) { groups[key] = new(); origOrder.Add(key); }
+                    groups[key].Add((inLits, outLits, ci));
+                }
+                bool anyMerged = false;
+                var merged = new List<List<Expression>>();
+                foreach (var key in origOrder)
+                {
+                    var grp = groups[key];
+                    if (grp.Count == 1)
+                    {
+                        merged.Add(clauses[grp[0].origIdx]);
+                        continue;
+                    }
+                    // Multiple clauses with same input-key. Skip merge if any clause has
+                    // no output-touching literals (means it's an all-input clause with
+                    // nothing to OR meaningfully — keep separately).
+                    if (grp.Any(g => g.outLits.Count == 0))
+                    {
+                        foreach (var g in grp) merged.Add(clauses[g.origIdx]);
+                        continue;
+                    }
+                    // Build compound OR over per-clause output conjunctions.
+                    Expression OutConj(List<Expression> lits)
+                    {
+                        var acc = lits[0];
+                        for (int i = 1; i < lits.Count; i++)
+                            acc = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.And, acc, lits[i]);
+                        return acc;
+                    }
+                    Expression compoundOr = OutConj(grp[0].outLits);
+                    for (int i = 1; i < grp.Count; i++)
+                        compoundOr = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Or, compoundOr, OutConj(grp[i].outLits));
+                    var newClause = new List<Expression>(grp[0].inLits) { compoundOr };
+                    merged.Add(newClause);
+                    anyMerged = true;
+                    if (verbose)
+                        Console.WriteLine($"  Clause-merge: collapsed {grp.Count} clauses with input-key [{key}] into one (output disjunction)");
+                }
+                return anyMerged ? merged : clauses;
+            }
+            dnfExprs = MergeByInputKey(dnfExprs);
+            originalDnfExprs = MergeByInputKey(originalDnfExprs);
+        }
+
         // Build allVars for Z3 model parsing — split mutable vars into _pre and _post,
         // and expand tuple vars into component vars
         var allVars = new List<(string Name, string Type)>();
