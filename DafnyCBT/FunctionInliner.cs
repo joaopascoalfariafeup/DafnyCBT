@@ -17,19 +17,23 @@ internal class FunctionInliningSubstituter : Substituter
     private readonly Dictionary<string, Function> _inlinable;
     private readonly int _maxDepth;
     private readonly int _recursiveMaxDepth;
+    private readonly int _linearRecursiveMaxDepth;
     private readonly Dictionary<string, int> _inliningDepth;
     private readonly HashSet<string> _recursive;
+    private readonly HashSet<string> _linearRecursive;
     private readonly Microsoft.Dafny.Program _program;
 
-    internal FunctionInliningSubstituter(Microsoft.Dafny.Program program, Dictionary<string, Function> inlinable, int maxDepth = 2, int recursiveMaxDepth = 1)
+    internal FunctionInliningSubstituter(Microsoft.Dafny.Program program, Dictionary<string, Function> inlinable, int maxDepth = 2, int recursiveMaxDepth = 1, int linearRecursiveMaxDepth = 1)
         : base(null, new Dictionary<IVariable, Expression>(), new Dictionary<TypeParameter, DafnyType>(), null, program.SystemModuleManager)
     {
         _program = program;
         _inlinable = inlinable;
         _maxDepth = maxDepth;
         _recursiveMaxDepth = recursiveMaxDepth;
+        _linearRecursiveMaxDepth = linearRecursiveMaxDepth;
         _inliningDepth = new Dictionary<string, int>();
         _recursive = FunctionInliner.ComputeRecursive(inlinable);
+        _linearRecursive = FunctionInliner.ComputeLinearRecursive(inlinable);
     }
 
     // Used by InnerParamSubstituter to share the in-progress depth map.
@@ -40,18 +44,30 @@ internal class FunctionInliningSubstituter : Substituter
         Dictionary<string, int> inliningDepth,
         int maxDepth,
         int recursiveMaxDepth,
-        HashSet<string> recursive)
+        int linearRecursiveMaxDepth,
+        HashSet<string> recursive,
+        HashSet<string> linearRecursive)
         : base(null, substMap, new Dictionary<TypeParameter, DafnyType>(), null, program.SystemModuleManager)
     {
         _program = program;
         _inlinable = inlinable;
         _maxDepth = maxDepth;
         _recursiveMaxDepth = recursiveMaxDepth;
+        _linearRecursiveMaxDepth = linearRecursiveMaxDepth;
         _inliningDepth = inliningDepth;
         _recursive = recursive;
+        _linearRecursive = linearRecursive;
     }
 
-    private int EffectiveMaxDepth(string name) => _recursive.Contains(name) ? _recursiveMaxDepth : _maxDepth;
+    // Linear-recursive (≤1 self-call site): safe to unfold deeper.
+    // Non-linear-recursive (≥2 self-call sites): cap tightly — exponential blowup risk.
+    // Non-recursive: use the regular maxDepth.
+    private int EffectiveMaxDepth(string name)
+    {
+        if (_linearRecursive.Contains(name)) return _linearRecursiveMaxDepth;
+        if (_recursive.Contains(name)) return _recursiveMaxDepth;
+        return _maxDepth;
+    }
 
     public override Expression Substitute(Expression expr)
     {
@@ -71,7 +87,7 @@ internal class FunctionInliningSubstituter : Substituter
                 for (int i = 0; i < func.Ins.Count && i < substitutedArgs.Count; i++)
                     subMap[func.Ins[i]] = substitutedArgs[i];
 
-                var innerSub = new FunctionInliningSubstituter(_program, subMap, _inlinable, _inliningDepth, _maxDepth, _recursiveMaxDepth, _recursive);
+                var innerSub = new FunctionInliningSubstituter(_program, subMap, _inlinable, _inliningDepth, _maxDepth, _recursiveMaxDepth, _linearRecursiveMaxDepth, _recursive, _linearRecursive);
                 _inliningDepth[func.Name] = depth + 1;
                 try
                 {
@@ -107,7 +123,7 @@ internal class FunctionInliningSubstituter : Substituter
                 var lambdaSubMap = new Dictionary<IVariable, Expression>();
                 for (int i = 0; i < lambda.BoundVars.Count && i < substArgs.Count; i++)
                     lambdaSubMap[lambda.BoundVars[i]] = substArgs[i];
-                var lambdaSub = new FunctionInliningSubstituter(_program, lambdaSubMap, _inlinable, _inliningDepth, _maxDepth, _recursiveMaxDepth, _recursive);
+                var lambdaSub = new FunctionInliningSubstituter(_program, lambdaSubMap, _inlinable, _inliningDepth, _maxDepth, _recursiveMaxDepth, _linearRecursiveMaxDepth, _recursive, _linearRecursive);
                 var reduced = lambdaSub.Substitute(lambda.Term);
                 return new ParensExpression(lambda.Term.Origin, reduced);
             }
@@ -136,6 +152,25 @@ internal static class FunctionInliner
         return result;
     }
 
+    /// <summary>
+    /// Recursive functions with ≤1 self-call in their body unfold linearly with depth
+    /// (each unfold adds one copy). Those with ≥2 self-calls unfold exponentially
+    /// (each unfold doubles or more), so they're unsafe to unfold beyond depth 1.
+    /// Returns the names of recursive functions whose body has exactly one self-call.
+    /// </summary>
+    internal static HashSet<string> ComputeLinearRecursive(Dictionary<string, Function> inlinable)
+    {
+        var result = new HashSet<string>();
+        foreach (var kvp in inlinable)
+        {
+            var name = kvp.Key;
+            var body = kvp.Value.Body;
+            if (body != null && CountCalls(body, name) == 1)
+                result.Add(name);
+        }
+        return result;
+    }
+
     private static bool MentionsCall(Expression expr, string name)
     {
         var stack = new Stack<Expression>();
@@ -150,6 +185,23 @@ internal static class FunctionInliner
                 stack.Push(sub);
         }
         return false;
+    }
+
+    private static int CountCalls(Expression expr, string name)
+    {
+        int count = 0;
+        var stack = new Stack<Expression>();
+        stack.Push(expr);
+        while (stack.Count > 0)
+        {
+            var e = stack.Pop();
+            if (e == null) continue;
+            if (e is FunctionCallExpr fce && fce.Function != null && fce.Function.Name == name)
+                count++;
+            foreach (var sub in e.SubExpressions)
+                stack.Push(sub);
+        }
+        return count;
     }
 
     /// <summary>
@@ -177,16 +229,49 @@ internal static class FunctionInliner
     }
 
     /// <summary>
+    /// Count AST nodes in an expression. Used as a safety check against exponential
+    /// blowup when unfolding recursive functions with multiple self-calls.
+    /// </summary>
+    private static int CountNodes(Expression expr)
+    {
+        if (expr == null) return 0;
+        int count = 1;
+        var stack = new Stack<Expression>();
+        stack.Push(expr);
+        while (stack.Count > 0)
+        {
+            var e = stack.Pop();
+            foreach (var sub in e.SubExpressions)
+            {
+                if (sub != null)
+                {
+                    count++;
+                    stack.Push(sub);
+                }
+            }
+        }
+        return count;
+    }
+
+    /// <summary>
     /// Inline inlinable function calls in an Expression tree at the AST level, preserving node types.
     /// </summary>
     internal static Expression InlineExpression(Microsoft.Dafny.Program program, Expression expr,
-        Dictionary<string, Function> inlinable, int maxDepth = 2, int recursiveMaxDepth = 1)
+        Dictionary<string, Function> inlinable, int maxDepth = 2, int recursiveMaxDepth = 1, int linearRecursiveMaxDepth = 1)
     {
         if (inlinable.Count == 0) return expr;
         try
         {
-            var subst = new FunctionInliningSubstituter(program, inlinable, maxDepth, recursiveMaxDepth);
-            return subst.Substitute(expr);
+            var subst = new FunctionInliningSubstituter(program, inlinable, maxDepth, recursiveMaxDepth, linearRecursiveMaxDepth);
+            var result = subst.Substitute(expr);
+            if (System.Environment.GetEnvironmentVariable("DAFNYCBT_DEBUG_INLINE") == "1")
+            {
+                var beforeN = CountNodes(expr);
+                var afterN = CountNodes(result);
+                if (afterN != beforeN)
+                    System.Console.WriteLine($"  [INLINE] depth=(m{maxDepth},r{recursiveMaxDepth},lr{linearRecursiveMaxDepth}) nodes {beforeN} → {afterN}");
+            }
+            return result;
         }
         catch (System.NullReferenceException)
         {

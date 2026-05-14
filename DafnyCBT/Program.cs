@@ -1511,6 +1511,35 @@ class Program
                 preClauses.Add(ctorReq);
         }
 
+        // AST-level inlining of *linear-recursive* functions/predicates in PRECONDITIONS
+        // before DNF. Without this, recursive predicates like `Is2Pow(n+1)` stay opaque
+        // to Z3 — it can only verify them at the base case, collapsing the input space
+        // to one trivial witness (e.g. n=0). Unfolding 3 levels exposes the natural
+        // disjunctive structure (n+1 == 1) ∨ (n+1 == 2) ∨ (n+1 == 4) ∨ ..., which DNF
+        // then splits into separate clauses → diverse value-pinned tests per power-of-2.
+        //
+        // Restricted to *linear-recursive* (≤1 self-call) only:
+        //   - Skips non-recursive predicates (`Valid()`, autocontracts) which the
+        //     existing string-level inliner already handles. Double-inlining them
+        //     breaks the test emitter (class-state references duplicated).
+        //   - Skips tree-recursive (≥2 self-calls, e.g. `Min`, `Max` with two recursive
+        //     calls in the body) — each unfold doubles AST size, exponential blowup
+        //     hangs Z3.
+        if (program != null)
+        {
+            var allInlinable = FunctionInliner.CollectInlinable(program, skipNames: new HashSet<string> { "IsSorted" });
+            var linearRec = FunctionInliner.ComputeLinearRecursive(allInlinable);
+            if (linearRec.Count > 0)
+            {
+                var preInlinable = allInlinable
+                    .Where(kvp => linearRec.Contains(kvp.Key))
+                    .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+                var preLinearDepth = Math.Max(3, RecursiveUnrollDepth);
+                for (int pi = 0; pi < preClauses.Count; pi++)
+                    preClauses[pi] = FunctionInliner.InlineExpression(program, preClauses[pi], preInlinable, maxDepth: preLinearDepth, recursiveMaxDepth: preLinearDepth, linearRecursiveMaxDepth: preLinearDepth);
+            }
+        }
+
         // Decompose preconditions into DNF as AST
         var preDnfExprs = new List<List<Expression>> { new List<Expression>() }; // trivial "true"
         foreach (var pre in preClauses)
