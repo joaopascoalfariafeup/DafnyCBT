@@ -1476,6 +1476,31 @@ class Program
             }
         }
 
+        // Dedup syntactically-equivalent-but-textually-different relational
+        // literals within each DNF clause. Cross-products of `A ==> B` and
+        // `!A ==> C` style ensures can surface duplicates like `0 <= pos` and
+        // `pos >= 0`, or `0 > pos` and `pos < 0` — same constraint, different
+        // parse. Without dedup, Phase 1r treats them as separate safe-indices
+        // and may emit redundant /Rel tests; goal labels list them twice.
+        // Uses the same DnfEngine.CanonicalLiteralKey that TestEmitter consults,
+        // so SMT-side dedup and display-side dedup stay consistent.
+        static List<List<Expression>> DedupLiteralsInClauses(List<List<Expression>> clauses)
+        {
+            return clauses.Select(clause =>
+            {
+                var seen = new HashSet<string>();
+                var kept = new List<Expression>();
+                foreach (var lit in clause)
+                {
+                    var canon = DnfEngine.CanonicalLiteralKey(DnfEngine.ExprToString(lit));
+                    if (seen.Add(canon)) kept.Add(lit);
+                }
+                return kept;
+            }).ToList();
+        }
+        originalDnfExprs = DedupLiteralsInClauses(originalDnfExprs);
+        dnfExprs = DedupLiteralsInClauses(dnfExprs);
+
         // Detect whether inlining (typically recursive at depth ≥ 2) altered
         // the per-clause structure. If the inlined DNF has a different literal
         // count than the original DNF for the same clause, an if-then-else was

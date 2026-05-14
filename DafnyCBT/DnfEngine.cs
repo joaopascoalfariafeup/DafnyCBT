@@ -1225,6 +1225,42 @@ static class DnfEngine
             if (neg != null && !neg.StartsWith("!("))
                 s = neg;
         }
+        // Canonicalize relational orientation so `X >= Y` and `Y <= X` (and `X > Y`
+        // vs `Y < X`) map to the same key. Without this, DNF cross-products of
+        // `A ==> B` with `!A ==> C` surface antecedent-vs-negated-antecedent
+        // duplicates like `0 <= pos` and `pos >= 0` that downstream dedup paths
+        // (Program.cs dedup, TestEmitter display) treat as distinct.
+        // Strip balanced outer parens once before searching for top-level op.
+        var sParsed = s.Trim();
+        if (sParsed.StartsWith("(") && sParsed.EndsWith(")"))
+        {
+            var inner = sParsed.Substring(1, sParsed.Length - 2);
+            int depth = 0; bool ok = true;
+            foreach (var c in inner)
+            {
+                if (c == '(') depth++;
+                else if (c == ')') { depth--; if (depth < 0) { ok = false; break; } }
+            }
+            if (ok && depth == 0) sParsed = inner.Trim();
+        }
+        // Longest-first to disambiguate `<=` from `<` (and `>=` from `>`).
+        string[] relOps = { "<=", ">=", "==", "!=", "<", ">" };
+        foreach (var op in relOps)
+        {
+            int idx = FindTopLevelOperator(sParsed, " " + op + " ");
+            if (idx < 0) continue;
+            var lhs = sParsed.Substring(0, idx).Trim();
+            var rhs = sParsed.Substring(idx + op.Length + 2).Trim();
+            string canonOp = op;
+            if (op == ">") { canonOp = "<"; (lhs, rhs) = (rhs, lhs); }
+            else if (op == ">=") { canonOp = "<="; (lhs, rhs) = (rhs, lhs); }
+            else if (op == "==" || op == "!=")
+            {
+                if (string.Compare(lhs, rhs, StringComparison.Ordinal) > 0)
+                    (lhs, rhs) = (rhs, lhs);
+            }
+            return $"{lhs} {canonOp} {rhs}";
+        }
         return s;
     }
 
