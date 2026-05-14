@@ -3844,13 +3844,21 @@ class Program
                             Dictionary<string, string>? repValues = null;
                             if (useRel)
                             {
+                                // Merge the base's BVA tier predicates (b.extras) with the
+                                // input-exclusions from prior repeats. Without this, a base
+                                // labelled e.g. `{1}/O|Array|>=3/Rel/R8` would pass only the
+                                // relevance shadow blocks to Z3 and silently drop the tier
+                                // predicate — Z3 then picks length=2 despite the label saying
+                                // length>=3, producing a goal/input mismatch.
+                                var combinedExtrasRel = new List<string>(b.extras);
+                                combinedExtrasRel.AddRange(inputExclusions);
                                 var smt = relCtx!.Mode == "group"
                                     ? SmtTranslator.BuildGroupRelevanceQuery(
                                         inputs, outputs, relCtx.FullPreLits, relCtx.Clause,
-                                        method, mutableNames, relCtx.SafeIndices, inputExclusions)
+                                        method, mutableNames, relCtx.SafeIndices, combinedExtrasRel)
                                     : SmtTranslator.BuildRelevanceQuery(
                                         inputs, outputs, relCtx.FullPreLits, relCtx.Clause,
-                                        method, mutableNames, relCtx.SafeIndices, inputExclusions);
+                                        method, mutableNames, relCtx.SafeIndices, combinedExtrasRel);
                                 if (string.IsNullOrEmpty(smt))
                                 {
                                     perBaseRelExhausted[label] = true;

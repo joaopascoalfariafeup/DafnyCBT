@@ -1676,7 +1676,8 @@ static class SmtTranslator
                 var seq1 = ExprToSmt(mf1.E, inputs, mutableNames, isPostContext, insideOld);
                 if (seq0 != null && seq1 != null)
                 {
-                    var perm = $"(forall ((v Int)) (= (_mset_count v {seq0} (seq.len {seq0})) (_mset_count v {seq1} (seq.len {seq1}))))";
+                    var elemType = TypeUtils.GetSeqElementType(mf0.E.Type?.ToString() ?? "");
+                    var perm = BuildMultisetEqSmt(seq0, seq1, elemType);
                     return bin.Op == BinaryExpr.Opcode.Neq ? $"(not {perm})" : perm;
                 }
             }
@@ -2919,7 +2920,20 @@ static class SmtTranslator
             var lhs = DafnyExprToSmt(msetEqMatch.Groups[1].Value, inputs);
             var rhs = DafnyExprToSmt(msetEqMatch.Groups[2].Value, inputs);
             if (lhs != null && rhs != null)
-                return $"(forall ((v Int)) (= (_mset_count v {lhs} (seq.len {lhs})) (_mset_count v {rhs} (seq.len {rhs}))))";
+            {
+                // Try to infer element type from the inputs that the SMT terms reference.
+                // Fall back to unbounded forall if we can't determine it (string-pattern path
+                // doesn't have AST type info available).
+                string? elemType = null;
+                foreach (var (name, type) in inputs)
+                {
+                    if ((lhs.Contains(name) || rhs.Contains(name)) && TypeUtils.IsArrayType(type))
+                    { elemType = TypeUtils.GetSeqElementType(type); break; }
+                    if ((lhs.Contains(name) || rhs.Contains(name)) && TypeUtils.IsSeqType(type))
+                    { elemType = TypeUtils.GetSeqElementType(type); break; }
+                }
+                return BuildMultisetEqSmt(lhs, rhs, elemType);
+            }
         }
 
         // Handle empty set literal: {}
@@ -5374,6 +5388,36 @@ static class SmtTranslator
             smt = Regex.Replace(smt, $@"\b{Regex.Escape(key)}\b", renames[key]);
         }
         return smt;
+    }
+
+    /// <summary>
+    /// Builds the SMT for `multiset(seq0) == multiset(seq1)` as a bounded conjunction
+    /// over the element universe, instead of `(forall ((v Int)) ...)`.
+    ///
+    /// The forall form is sound but the unbounded `Int` quantifier slows Z3 sharply
+    /// when combined with other constraints (sortedness, relevance shadow blocks,
+    /// BVA tier predicates) — common in permutation+sortedness specs. The bounded
+    /// form reuses the closed-world assumption already in place for set/multiset
+    /// parameter types: element values outside the universe never appear in
+    /// generated inputs, so counting over the universe is equivalent.
+    ///
+    /// Falls back to the forall form when the element type isn't a known
+    /// Int-encoded type (string, complex generics) so we don't lose soundness.
+    /// </summary>
+    private static string BuildMultisetEqSmt(string seq0, string seq1, string? elemType)
+    {
+        // Only safe to bound for Int-encoded element types — the existing
+        // `_mset_count` helper is typed `(v Int) (s (Seq Int)) (n Int) -> Int`,
+        // so the universe values must be expressible as SMT Int literals.
+        bool isIntEncoded = elemType == "int" || elemType == "nat" || elemType == "char"
+            || elemType == "T" || _enumDatatypes.ContainsKey(elemType ?? "");
+        if (!isIntEncoded)
+            return $"(forall ((v Int)) (= (_mset_count v {seq0} (seq.len {seq0})) (_mset_count v {seq1} (seq.len {seq1}))))";
+
+        var universe = TypeUtils.GetElementUniverse(elemType!);
+        var eqs = universe.Select(v =>
+            $"(= (_mset_count {v} {seq0} (seq.len {seq0})) (_mset_count {v} {seq1} (seq.len {seq1}))) ");
+        return $"(and {string.Join("", eqs).TrimEnd()})";
     }
 
     /// <summary>
