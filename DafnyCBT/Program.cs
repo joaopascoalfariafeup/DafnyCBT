@@ -1619,6 +1619,45 @@ class Program
             hasNonInlinableFuncs = true; // force full postcondition expects in emitted tests
         }
 
+        // Recursive-function residuals after inlining: even when the post is syntactically
+        // well-formed, an inlined body containing `f(...)` with f recursive leaves Z3 with
+        // an uninterpreted residual call. Z3 freely assigns values to it and satisfies
+        // the post abstractly, picking degenerate inputs (typically the base case, e.g.
+        // `|a| = 1` for sequence-recursive Min/Max). The mutated impl then matches the
+        // spec on those trivial inputs and survives.
+        //
+        // Same fix shape as the unsolvable-patterns fallback above: drop the post as an
+        // SMT constraint, generate inputs from preconditions + BVA tiers + relevance,
+        // and rely on the emitted runtime `expect <full post>` to catch the bug. The
+        // runtime can evaluate `f(...)` concretely on the test input (Dafny functions are
+        // executable), so the spec is still enforced — just at the test-execution stage
+        // rather than the input-generation stage.
+        if (!hasNonInlinableFuncs && program != null)
+        {
+            var inlinableAll = FunctionInliner.CollectInlinable(program, skipNames: smtBuiltins);
+            var recursiveFns = FunctionInliner.ComputeRecursive(inlinableAll);
+            if (recursiveFns.Count > 0)
+            {
+                bool hasRecursiveResidual = false;
+                foreach (var lit in dnfExprs.SelectMany(c => c).Select(e => DnfEngine.ExprToString(e)))
+                {
+                    foreach (var fn in recursiveFns)
+                    {
+                        if (Regex.IsMatch(lit, $@"\b{Regex.Escape(fn)}\s*\("))
+                        { hasRecursiveResidual = true; break; }
+                    }
+                    if (hasRecursiveResidual) break;
+                }
+                if (hasRecursiveResidual)
+                {
+                    Console.WriteLine($"  Note: postconditions contain recursive-function residuals after inlining");
+                    Console.WriteLine($"  Falling back to precondition-only test generation with postcondition runtime checks");
+                    dnfExprs = new List<List<Expression>> { new List<Expression>() };
+                    hasNonInlinableFuncs = true;
+                }
+            }
+        }
+
         // Collect input/output variable info
         var inputs = method.Ins.Select(f => (f.Name, Type: f.Type.ToString())).ToList();
         var outputs = method.Outs.Select(f => (f.Name, Type: f.Type.ToString())).ToList();
