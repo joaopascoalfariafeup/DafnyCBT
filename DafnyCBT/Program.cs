@@ -16,6 +16,16 @@ class Program
     // is richer when available).
     static string RelevanceMode = "ladder";
     public static bool VacuityCheckEnabled = false;
+    // Phase 1e — "establish" check: for a clause whose post is a pure target-state
+    // predicate (references modified state, no old(), no return-only vars), generate
+    // an input where the clause is FALSE on the pre-state, so the method must actively
+    // establish it. Default ON (runs before Phase 1v) — directly discriminates
+    // "method does the work" from "input was already in the goal state".
+    public static bool EstablishCheckEnabled = true;
+    // Phase 1e-PreSat — complementary boundary: input where the clause is ALREADY true
+    // on the pre-state (method's correct behaviour is a no-op / idempotent). Default
+    // OFF (runs after Phase 1v) — lower-value completeness probe.
+    public static bool PreSatCheckEnabled = false;
     public static bool ReverseBvaOrder = false;
     public static bool LiteralBvaEnabled = true;
     // Unroll depth for recursive functions during spec inlining. Default 1
@@ -74,6 +84,8 @@ class Program
         noRelevanceOpt.AddAlias("-nr");
         var vacuityOpt = new Option<bool>("--vacuity", "Enable per-literal vacuity check (Phase 1v). For each safe candidate Q_k, try isolated mode first (find ins where Q_k is vacuous AND every other Q_j is non-vacuous → /Vik label) and fall back to non-isolated (Q_k vacuous but other Q_j may also be → /Vk label) when isolated is infeasible. Note: independently of this flag, every emitted test gets per-Q vacuity annotations (// VACUOUSLY TRUE) via a post-phase scan. Default: OFF.");
         vacuityOpt.AddAlias("-v1v");
+        var noEstablishOpt = new Option<bool>("--no-establish", "Disable Phase 1e establish-check. By default, for clauses whose post is a pure target-state predicate (references modified state; no old(); no return-only vars), DafnyCBT generates one input where the clause is FALSE on the pre-state — forcing the method to actively establish it (kills mutants that only pass when the input was already in the goal state). Default: establish-check ON.");
+        var preSatOpt = new Option<bool>("--presat", "Enable Phase 1e-PreSat: also generate an input where the clause is ALREADY true on the pre-state (idempotent / no-op boundary). Complements --no-establish's inverse. Default: OFF.");
         // Deprecated. The first/last/middle witness coverage previously gated
         // by --exists-decomposition is now provided by Phase 2 BVA's existential
         // boundary tiers (`/Eb<n>=lo`, `/Eb<n>=hi`, `/Eb<n>=mid`) — same coverage,
@@ -118,7 +130,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, vacuityOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -162,6 +174,12 @@ class Program
             VacuityCheckEnabled = ctx.ParseResult.GetValueForOption(vacuityOpt);
             if (VacuityCheckEnabled)
                 Console.WriteLine($"[DafnyCBT] Vacuity check (Phase 1v): ON (isolated with non-isolated fallback)");
+            EstablishCheckEnabled = !ctx.ParseResult.GetValueForOption(noEstablishOpt);
+            if (!EstablishCheckEnabled)
+                Console.WriteLine("[DafnyCBT] Establish check (Phase 1e): OFF");
+            PreSatCheckEnabled = ctx.ParseResult.GetValueForOption(preSatOpt);
+            if (PreSatCheckEnabled)
+                Console.WriteLine("[DafnyCBT] Pre-satisfied check (Phase 1e-PreSat): ON");
             // --exists-decomposition / --no-exists-decomposition: deprecated no-ops.
             // First/last/middle existential coverage is now via Phase 2 BVA tiers.
             _ = ctx.ParseResult.GetValueForOption(existsDecompOpt);
@@ -3548,6 +3566,118 @@ class Program
             if (!verbose) Console.Write("\r                          \r"); // clear progress line
             Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
 
+            // --- Phase 1e: establish / pre-satisfied check ---
+            // For a clause whose post is a pure target-state predicate, the input may
+            // already satisfy it (e.g. array already partitioned around f for FIND, or
+            // already sorted). Then any impl — correct, buggy, or no-op — trivially
+            // passes; the bug is hidden. Phase 1e generates an input where the clause
+            // is FALSE on the pre-state (Estab, default ON, before 1v): the method must
+            // actively establish the post, exposing impls that fail to. The inverse
+            // (PreSat, default OFF, after 1v) generates an input where the clause is
+            // already TRUE on pre-state — the idempotent/no-op boundary.
+            //
+            // Applicability (per clause): method has `modifies`; clause references ≥1
+            // modified-state var; NO `old(...)` (else pre/post entangle); NO return-only
+            // vars (no pre-state binding). Together these make `clause[X → X_pre]` a
+            // faithful "was the target already present on the input?" predicate.
+            var returnOnlyNames = outputs.Select(o => o.Name)
+                .Where(n => !mutableNames.Contains(n)).ToList();
+            bool ClauseEstablishApplicable(List<Expression> clause)
+            {
+                if (mutableNames.Count == 0 || clause.Count == 0) return false;
+                bool refsMutable = false;
+                foreach (var lit in clause)
+                {
+                    var s = DnfEngine.ExprToString(lit);
+                    if (Regex.IsMatch(s, @"\bold\s*\(")) return false;
+                    foreach (var rn in returnOnlyNames)
+                        if (Regex.IsMatch(s, @"\b" + Regex.Escape(rn) + @"\b")) return false;
+                    foreach (var mn in mutableNames)
+                        if (Regex.IsMatch(s, @"\b" + Regex.Escape(mn) + @"\b")) { refsMutable = true; break; }
+                }
+                return refsMutable;
+            }
+            // Build the clause translated on the PRE-state (mutables → _pre via
+            // isPostContext:false). Returns null if any literal is untranslatable.
+            string? ClauseOnPreSmt(List<Expression> clause)
+            {
+                var inAndOut = inputs.Concat(outputs).ToList();
+                SmtTranslator.ResetExprToSmtBudget();
+                var parts = new List<string>();
+                foreach (var lit in clause)
+                {
+                    var s = SmtTranslator.ExprToSmt(lit, inAndOut, mutableNames, isPostContext: false);
+                    if (s == null) return null;
+                    parts.Add(s);
+                }
+                return parts.Count == 1 ? parts[0] : "(and " + string.Join(" ", parts) + ")";
+            }
+            async Task RunEstablishPhase(bool negate, string labelSuffix, string phaseTag)
+            {
+                int added = 0, noScenario = 0, skipped = 0;
+                for (int pi = 0; pi < preCombinations.Count; pi++)
+                {
+                    if (TimedOut()) break;
+                    if (maxTests > 0 && testCases.Count >= maxTests) break;
+                    var (preLabel, preLits, preExclusions) = preCombinations[pi];
+                    var fullPreLits = new List<Expression>(preLits);
+                    foreach (var excl in preExclusions) fullPreLits.Add(DnfEngine.Negate(excl));
+                    var fullPreLabel = hasDisjunctivePre ? $"{preLabel}/" : "";
+                    for (int ci = 0; ci < dnfExprs.Count; ci++)
+                    {
+                        if (TimedOut()) break;
+                        if (maxTests > 0 && testCases.Count >= maxTests) break;
+                        var clause = dnfExprs[ci];
+                        if (!ClauseEstablishApplicable(clause)) continue;
+                        var preSmt = ClauseOnPreSmt(clause);
+                        if (preSmt == null) { skipped++; continue; }
+                        var extra = negate ? $"(not {preSmt})" : preSmt;
+                        var smt = SmtTranslator.BuildSmt2Query(
+                            inputs, outputs, preClauses, clause, method, false,
+                            null, new List<string> { extra }, fullPreLits, mutableNames);
+                        if (string.IsNullOrEmpty(smt)) { skipped++; continue; }
+                        var label = $"{fullPreLabel}{{{ci + 1}}}{labelSuffix}";
+                        if (verbose) Console.WriteLine($"  Solving {phaseTag} {label}...");
+                        var z3Result = await Z3Runner.RunZ3(z3Path, smt);
+                        var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
+                        if (!lines.Any(l => l == "sat")) { noScenario++; continue; }
+                        var witness = TypeUtils.ParseZ3Model(z3Result, allVars);
+                        if (witness.Count == 0) { noScenario++; continue; }
+                        // Structural-dup skip vs recent prior tests.
+                        var inKeys = BuildInputExclusion(witness);
+                        bool dup = false;
+                        if (inKeys != null)
+                        {
+                            int scanFrom = Math.Max(0, testCases.Count - MAX_SUBSUME_PRIOR);
+                            for (int ti = testCases.Count - 1; ti >= scanFrom; ti--)
+                                if (BuildInputExclusion(testCases[ti].values) == inKeys) { dup = true; break; }
+                        }
+                        if (dup) { skipped++; if (verbose) Console.WriteLine($"  {phaseTag} {label}: structural dup — skipped"); continue; }
+                        var specSmtE = SmtTranslator.BuildSmt2Query(
+                            inputs, outputs, preClauses, dnfEnsures, method, false,
+                            null, null, fullPreLits, mutableNames, skipBias: true);
+                        var uQueryE = !hasNonInlinableFuncs
+                            ? SmtTranslator.BuildUniquenessQuery(specSmtE, inputs, outputs, witness, mutableNames)
+                            : null;
+                        if (!string.IsNullOrEmpty(uQueryE) && !TimedOut())
+                        {
+                            var uRes = await Z3Runner.RunZ3(z3Path, uQueryE);
+                            var uLn = uRes.Split('\n').Select(l => l.Trim()).ToList();
+                            bool uniq = uLn.Any(l => l == "unsat");
+                            bool unk = !uniq && uLn.Any(l => l == "unknown");
+                            witness["__unique__"] = (uniq || (unk && TrustUnknownUniqueness)) ? "true" : "false";
+                        }
+                        testCases.Add((label, witness, clause));
+                        added++;
+                        if (verbose) Console.WriteLine($"  {phaseTag} {label}: SAT — added test case");
+                    }
+                }
+                if (added > 0 || noScenario > 0 || skipped > 0)
+                    Console.WriteLine($"  {phaseTag}: {added} test(s) added, {noScenario} no scenario, {skipped} skipped");
+            }
+            if (EstablishCheckEnabled && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
+                await RunEstablishPhase(negate: true, labelSuffix: "/Estab", phaseTag: "Establish");
+
             // --- Phase 1v: per-literal vacuity check (CEGIS) ---
             // For each clause's safe candidate literal Q_k, find (ins, outs) such that
             // Q_k is vacuously satisfied for this ins (no outs_alt violates Q_k while
@@ -3790,6 +3920,11 @@ class Program
                 if (vacAdded > 0 || vacNoScenario > 0 || vacSkipped > 0)
                     Console.WriteLine($"  Vacuity: {vacAdded} test(s) added, {vacNoScenario} no scenario, {vacSkipped} skipped");
             }
+
+            // Phase 1e-PreSat (Facet B): input where the clause is ALREADY true on the
+            // pre-state — idempotent / no-op boundary. After Phase 1v, OFF by default.
+            if (PreSatCheckEnabled && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
+                await RunEstablishPhase(negate: false, labelSuffix: "/PreSat", phaseTag: "PreSat");
 
             HashSet<string> phase2Keys = new HashSet<string>();
             // --- Phase 2: single-fault refined-range BVA (per clause, per variable) ---
