@@ -5390,6 +5390,124 @@ static class SmtTranslator
         return smt;
     }
 
+    private static string ScalarSmtSort(string t)
+        => t == "bool" ? "Bool" : t == "real" ? "Real" : "Int";
+
+    /// <summary>Domain guard for a scalar of type <paramref name="t"/> bound as
+    /// <paramref name="nm"/>, or null when the SMT sort already is the exact
+    /// domain (int/bool/real). MUST be faithful: over-approximating the bound
+    /// variable's domain is the unsound-merge direction (see the y:nat case).</summary>
+    private static string? ScalarBoundsPredicate(string nm, string t)
+    {
+        if (t == "nat") return $"(>= {nm} 0)";
+        if (t == "char") return $"(and (>= {nm} 32) (<= {nm} 126))";
+        if (_enumDatatypes.TryGetValue(t, out var ctors))
+            return $"(and (>= {nm} 0) (<= {nm} {ctors.Count - 1}))";
+        return null;
+    }
+
+    /// <summary>
+    /// Clause-merge projection probe. Builds an SMT query that is SAT iff there
+    /// exists a precondition-admissible input X for which clause
+    /// <paramref name="tExists"/> is feasible for SOME output but clause
+    /// <paramref name="tForall"/> is infeasible for EVERY output — i.e. the
+    /// input-projections of the two clauses differ in this direction:
+    ///
+    ///   ∃X. ( ∃Y.  P(X) ∧ typeof(Y)  ∧ tExists(X,Y) )
+    ///         ∧ ( ∀Y'. typeof(Y') ⟹ ¬tForall(X,Y') )
+    ///
+    /// Two DNF clauses may be merged only when this query is UNSAT in BOTH
+    /// directions (their input regions coincide), so a merge can never collapse
+    /// input-discriminable spec partitions — no silent mutation-kill loss.
+    ///
+    /// Returns null (caller MUST treat as "not mergeable" → keep the clauses
+    /// split) when any output / mutable-post var is not a plain scalar, or the
+    /// base query carries uninterpreted user functions: the flattened
+    /// seq/array/set/map encoding cannot be soundly universally quantified, and
+    /// Z3 may assign uninterpreted residuals freely on the ∀ side. Declining is
+    /// always sound (splitting only ever costs a redundant test slot).
+    /// </summary>
+    internal static string? BuildProjectionProbeQuery(
+        List<(string Name, string Type)> inputs,
+        List<(string Name, string Type)> outputs,
+        List<Expression> preClauses,
+        List<Expression> tExists,
+        List<Expression> tForall,
+        Method method,
+        HashSet<string>? mutableNames)
+    {
+        mutableNames ??= new HashSet<string>();
+
+        // outVars = every value that is existentially free in the base query
+        // (return outputs + mutable-post). baseName matches ExprToSmt's naming
+        // (return → its name; mutable-post → "<name>_post").
+        var outVars = new List<(string BaseName, string Type)>();
+        foreach (var (n, t) in outputs) outVars.Add((n, t));
+        foreach (var (n, t) in inputs)
+            if (mutableNames.Contains(n)) outVars.Add(($"{n}_post", t));
+        if (outVars.Count == 0) return null;
+
+        // Gate: scalars only. IsScalarSupported is true ONLY for
+        // int/nat/bool/real/char/enum — never tuple/array/seq/set/map — so this
+        // single test also rejects every collection-typed output.
+        foreach (var (_, t) in outVars)
+            if (!IsScalarSupported(t)) return null;
+
+        var baseSmt = BuildSmt2Query(
+            inputs, outputs, preClauses, tExists, method,
+            verbose: false, exclusions: null, extraConstraints: null,
+            preLiterals: preClauses, mutableNames: mutableNames, skipBias: true);
+
+        var checkIdx = baseSmt.LastIndexOf("(check-sat)");
+        if (checkIdx < 0) return null;
+
+        // Uninterpreted user-function declarations make the ∀ side unsound
+        // (Z3 picks convenient interpretations). Decline → caller splits.
+        if (Regex.IsMatch(baseSmt, @"\(declare-fun\s+\S+\s+\([^)]+\)"))
+            return null;
+
+        var renameMap = BuildOutputAltRenameMap(inputs, outputs, mutableNames, "u");
+        if (renameMap.Count == 0) return null;
+
+        var inputsAndOutputs = inputs.Concat(outputs).ToList();
+        var bodyParts = new List<string>();
+        foreach (var lit in tForall)
+        {
+            var litStr = DnfEngine.ExprToString(lit);
+            if (TypeUtils.IsSpecOnlyLiteral(litStr)) continue;
+            ResetExprToSmtBudget();
+            var smt = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true);
+            if (smt == null) return null;
+            bodyParts.Add(ApplyOutputAltRenames(smt, renameMap));
+        }
+        string forallConj = bodyParts.Count == 0 ? "true"
+            : bodyParts.Count == 1 ? bodyParts[0]
+            : $"(and {string.Join(" ", bodyParts)})";
+
+        var binders = new List<string>();
+        var guards = new List<string>();
+        foreach (var (baseName, t) in outVars)
+        {
+            if (!renameMap.TryGetValue(baseName, out var bound)) return null;
+            binders.Add($"({bound} {ScalarSmtSort(t)})");
+            var g = ScalarBoundsPredicate(bound, t);
+            if (g != null) guards.Add(g);
+        }
+        string? guardPred = guards.Count == 0 ? null
+            : guards.Count == 1 ? guards[0]
+            : $"(and {string.Join(" ", guards)})";
+        string forallBody = guardPred == null
+            ? $"(not {forallConj})"
+            : $"(=> {guardPred} (not {forallConj}))";
+
+        var sb = new System.Text.StringBuilder(baseSmt.Substring(0, checkIdx));
+        sb.AppendLine();
+        sb.AppendLine("; ─── Clause-merge projection probe: ∀ outputs' . ¬tForall ───");
+        sb.AppendLine($"(assert (forall ({string.Join(" ", binders)}) {forallBody}))");
+        sb.AppendLine("(check-sat)");
+        return RewriteNestedSeqRefs(sb.ToString(), inputs, outputs);
+    }
+
     /// <summary>
     /// Builds the SMT for `multiset(seq0) == multiset(seq1)` as a bounded conjunction
     /// over the element universe, instead of `(forall ((v Int)) ...)`.

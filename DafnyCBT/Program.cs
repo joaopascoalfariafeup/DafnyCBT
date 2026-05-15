@@ -1825,97 +1825,167 @@ class Program
         if (mutableNames.Count > 0 && verbose)
             Console.WriteLine($"  Mutable (pre/post split): {string.Join(", ", mutableNames)}");
 
-        // Clause-merge by input-fingerprint: DNF cross-product of `(A1 ∨ A2) ⟹ B`-style
-        // ensures with other clauses sometimes produces multiple clauses that share the
-        // same input-only literals and differ only in output-shape literals. For binary
-        // search, the not-found case splits into `pos < 0 ∧ val !in a` and
-        // `pos ≥ a.Length ∧ val !in a` — same input region (`val !in a`), different
-        // output representations of "not found". These are operationally equivalent:
-        // the impl's choice of output representation is what's being checked, but for
-        // *input generation* there's no extra signal from testing both shapes.
+        // Clause-merge by input-PROJECTION equivalence. DNF cross-product of a
+        // disjunctive `ensures` with other clauses can split one logical outcome
+        // into several clauses that differ only in OUTPUT shape over the SAME
+        // input region (e.g. BinarySearch not-found: `pos<0 ∧ val!in a` vs
+        // `pos≥|a| ∧ val!in a` — same inputs, two sentinel encodings). Testing
+        // every shape adds no input-discrimination signal, so merging saves test
+        // slots. But the opposite case (LongestCommonPrefix's three maximality
+        // disjuncts) are GENUINE input-discriminable partitions; merging those
+        // silently loses mutation kills (the 11a6d98 regression).
         //
-        // Merge: group clauses by their input-only-literal canonical key; for each
-        // group of size ≥ 2, replace with a single clause that keeps the shared input
-        // literals and OR's the per-clause output sub-conjunctions into one compound
-        // output literal. The runtime expect still uses the full original post (via
-        // `hasNonInlinableFuncs`-driven full-post emission, or directly), so semantics
-        // are preserved; we just reduce test-slot waste.
-        //
-        // A literal is "output-touching" if it references any return parameter or
-        // mutable-post variable (the same `outNames` set used by the relevance safety
-        // filter at line ~1973). Everything else is input-only.
+        // The only sound discriminator is: clauses A,B may merge iff their
+        // existential input projections coincide —
+        //     proj(T) := ∃ outputs . (pre ∧ typeof(outputs) ∧ T)
+        // i.e. no precondition-admissible input makes one feasible and the other
+        // not. Equivalent: both `∃X.(∃Y.A) ∧ (∀Y.¬B)` and its converse are UNSAT.
+        // Syntactic literal classification cannot decide this (`pos≥|a|` and
+        // `|prefix|==|str1|` are structurally identical yet must be treated
+        // oppositely), so we use a Z3 probe, gated by two cheap sound heuristics:
+        //   H1 — no clause mentions any input  ⇒ every proj is trivially the
+        //        full region ⇒ merge all (handles `rand(): i==0 ∨ i==1`).
+        //   H2 — partition by the canonical set of input-ONLY literals; clauses
+        //        in different partitions have different input regions ⇒ never
+        //        merged across (cheap, and sound since splitting only costs a
+        //        test slot, never a kill).
+        // Residue (same input-only set, ≥2 clauses): pairwise projection probe
+        // against the group representative (projection-equivalence is an
+        // equivalence relation, so rep comparison suffices). The probe declines
+        // (⇒ keep split) on non-scalar outputs, uninterpreted residuals, or any
+        // Z3 unknown/timeout — every decline is sound.
         {
-            var outNamesForMerge = outputs.Select(o => o.Name)
-                .Concat(inputs.Where(i => mutableNames.Contains(i.Name)).Select(i => i.Name))
-                .Distinct().ToList();
-            bool TouchesOutput(string litStr)
+            bool hasProjectable = outputs.Count > 0 || mutableNames.Count > 0;
+            var pureInNames = inputs.Where(i => !mutableNames.Contains(i.Name))
+                .Select(i => i.Name).ToList();
+            var retOutNames = outputs.Select(o => o.Name).ToList();
+            var mutNamesList = mutableNames.ToList();
+            bool MentionsAny(string s, IEnumerable<string> names)
             {
-                foreach (var n in outNamesForMerge)
-                    if (Regex.IsMatch(litStr, @"\b" + Regex.Escape(n) + @"\b"))
-                        return true;
+                foreach (var n in names)
+                    if (Regex.IsMatch(s, @"\b" + Regex.Escape(n) + @"\b")) return true;
                 return false;
             }
-            List<List<Expression>> MergeByInputKey(List<List<Expression>> clauses)
+            // input-only ⟺ references a pure input and NOTHING output/mutable.
+            bool IsInputOnly(string s) =>
+                MentionsAny(s, pureInNames) && !MentionsAny(s, retOutNames) && !MentionsAny(s, mutNamesList);
+            // "mentions input" for H1 — mutable PRE value counts as an input.
+            bool MentionsInput(string s) =>
+                MentionsAny(s, pureInNames) || MentionsAny(s, mutNamesList);
+
+            Expression AndChain(List<Expression> lits)
             {
-                if (clauses.Count < 2 || outNamesForMerge.Count == 0) return clauses;
-                var groups = new Dictionary<string, List<(List<Expression> inLits, List<Expression> outLits, int origIdx)>>();
-                var origOrder = new List<string>();
+                var acc = lits[0];
+                for (int i = 1; i < lits.Count; i++)
+                    acc = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.And, acc, lits[i]);
+                return acc;
+            }
+            Expression OrChain(List<Expression> terms)
+            {
+                var acc = terms[0];
+                for (int i = 1; i < terms.Count; i++)
+                    acc = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Or, acc, terms[i]);
+                return acc;
+            }
+
+            bool Unsat(string z3Out)
+            {
+                var first = z3Out.Trim().Split('\n', '\r').FirstOrDefault(l => l.Trim().Length > 0);
+                return first?.Trim() == "unsat";
+            }
+            async Task<bool> ProjectionsEquivalent(List<Expression> a, List<Expression> b)
+            {
+                var q1 = SmtTranslator.BuildProjectionProbeQuery(
+                    inputs, outputs, preClauses, a, b, method, mutableNames);
+                if (q1 == null) return false;
+                if (!Unsat(await Z3Runner.RunZ3(z3Path, q1))) return false;
+                var q2 = SmtTranslator.BuildProjectionProbeQuery(
+                    inputs, outputs, preClauses, b, a, method, mutableNames);
+                if (q2 == null) return false;
+                return Unsat(await Z3Runner.RunZ3(z3Path, q2));
+            }
+
+            async Task<List<List<Expression>>> MergeClauses(List<List<Expression>> clauses, string tag)
+            {
+                if (clauses.Count < 2 || !hasProjectable) return clauses;
+
+                // Heuristic 1: if no literal anywhere mentions an input, every
+                // clause projects to the full (unconstrained) input region →
+                // all mutually equivalent → collapse to one disjunction.
+                bool anyInput = clauses.Any(c => c.Any(l => MentionsInput(DnfEngine.ExprToString(l))));
+                if (!anyInput)
+                {
+                    var terms = clauses.Where(c => c.Count > 0).Select(AndChain).ToList();
+                    if (terms.Count <= 1) return clauses;
+                    if (verbose)
+                        Console.WriteLine($"  Clause-merge[{tag}]: H1 collapsed {clauses.Count} input-free clauses into one disjunction");
+                    return new List<List<Expression>> { new List<Expression> { OrChain(terms) } };
+                }
+
+                // Heuristic 2: group by canonical set of input-only literals.
+                var groups = new Dictionary<string, List<int>>();
+                var order = new List<string>();
+                var inOnlyOf = new List<List<Expression>>();
                 for (int ci = 0; ci < clauses.Count; ci++)
                 {
-                    var clause = clauses[ci];
-                    var inLits = new List<Expression>();
-                    var outLits = new List<Expression>();
-                    foreach (var lit in clause)
-                    {
-                        if (TouchesOutput(DnfEngine.ExprToString(lit))) outLits.Add(lit);
-                        else inLits.Add(lit);
-                    }
-                    // Key = sorted canonical strings of input-only literals.
+                    var inOnly = clauses[ci].Where(l => IsInputOnly(DnfEngine.ExprToString(l))).ToList();
+                    inOnlyOf.Add(inOnly);
                     var key = string.Join(" && ",
-                        inLits.Select(l => DnfEngine.CanonicalLiteralKey(DnfEngine.ExprToString(l)))
+                        inOnly.Select(l => DnfEngine.CanonicalLiteralKey(DnfEngine.ExprToString(l)))
                               .OrderBy(s => s, StringComparer.Ordinal));
-                    if (!groups.ContainsKey(key)) { groups[key] = new(); origOrder.Add(key); }
-                    groups[key].Add((inLits, outLits, ci));
+                    if (!groups.ContainsKey(key)) { groups[key] = new(); order.Add(key); }
+                    groups[key].Add(ci);
                 }
+
                 bool anyMerged = false;
                 var merged = new List<List<Expression>>();
-                foreach (var key in origOrder)
+                foreach (var key in order)
                 {
-                    var grp = groups[key];
-                    if (grp.Count == 1)
+                    var idxs = groups[key];
+                    if (idxs.Count == 1) { merged.Add(clauses[idxs[0]]); continue; }
+
+                    // Residue: probe every member against the representative.
+                    int rep = idxs[0];
+                    bool allEquiv = true;
+                    for (int k = 1; k < idxs.Count && allEquiv; k++)
+                        if (!await ProjectionsEquivalent(clauses[rep], clauses[idxs[k]]))
+                            allEquiv = false;
+
+                    if (!allEquiv)
                     {
-                        merged.Add(clauses[grp[0].origIdx]);
+                        foreach (var ci in idxs) merged.Add(clauses[ci]);
                         continue;
                     }
-                    // Multiple clauses with same input-key. Skip merge if any clause has
-                    // no output-touching literals (means it's an all-input clause with
-                    // nothing to OR meaningfully — keep separately).
-                    if (grp.Any(g => g.outLits.Count == 0))
+
+                    // Proven projection-equivalent: keep the shared input-only
+                    // literals once, OR the per-clause remainders. If any
+                    // remainder is empty the OR is vacuous → the merged region
+                    // is exactly the shared input-only constraint.
+                    var shared = inOnlyOf[rep];
+                    var rests = idxs.Select(ci =>
+                        clauses[ci].Where(l => !IsInputOnly(DnfEngine.ExprToString(l))).ToList()).ToList();
+                    var newClause = new List<Expression>(shared);
+                    if (rests.All(r => r.Count > 0))
+                        newClause.Add(OrChain(rests.Select(AndChain).ToList()));
+                    if (newClause.Count == 0)
                     {
-                        foreach (var g in grp) merged.Add(clauses[g.origIdx]);
-                        continue;
+                        // Degenerate: nothing shared and all remainders empty —
+                        // clauses were all `true`; emit a single empty clause.
+                        merged.Add(new List<Expression>());
                     }
-                    // Build compound OR over per-clause output conjunctions.
-                    Expression OutConj(List<Expression> lits)
+                    else
                     {
-                        var acc = lits[0];
-                        for (int i = 1; i < lits.Count; i++)
-                            acc = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.And, acc, lits[i]);
-                        return acc;
+                        merged.Add(newClause);
                     }
-                    Expression compoundOr = OutConj(grp[0].outLits);
-                    for (int i = 1; i < grp.Count; i++)
-                        compoundOr = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.Or, compoundOr, OutConj(grp[i].outLits));
-                    var newClause = new List<Expression>(grp[0].inLits) { compoundOr };
-                    merged.Add(newClause);
                     anyMerged = true;
                     if (verbose)
-                        Console.WriteLine($"  Clause-merge: collapsed {grp.Count} clauses with input-key [{key}] into one (output disjunction)");
+                        Console.WriteLine($"  Clause-merge[{tag}]: projection-equivalent group of {idxs.Count} (key [{key}]) collapsed into one");
                 }
                 return anyMerged ? merged : clauses;
             }
-            dnfExprs = MergeByInputKey(dnfExprs);
-            originalDnfExprs = MergeByInputKey(originalDnfExprs);
+
+            dnfExprs = await MergeClauses(dnfExprs, "dnf");
+            originalDnfExprs = await MergeClauses(originalDnfExprs, "orig");
         }
 
         // Build allVars for Z3 model parsing — split mutable vars into _pre and _post,
