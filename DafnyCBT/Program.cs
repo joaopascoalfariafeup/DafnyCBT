@@ -3612,6 +3612,10 @@ class Program
                 }
                 return parts.Count == 1 ? parts[0] : "(and " + string.Join(" ", parts) + ")";
             }
+            // label → (extra-constraint, clause, fullPreLits) so Phase 3 can register
+            // each /Estab (or /PreSat) witness as a base and re-issue varied inputs
+            // under the same hard ¬Post(pre) (resp. Post(pre)) constraint.
+            var establishCtx = new Dictionary<string, (string extra, List<Expression> clause, List<Expression> preLits)>();
             async Task RunEstablishPhase(bool negate, string labelSuffix, string phaseTag)
             {
                 int added = 0, noScenario = 0, skipped = 0;
@@ -3668,6 +3672,12 @@ class Program
                             witness["__unique__"] = (uniq || (unk && TrustUnknownUniqueness)) ? "true" : "false";
                         }
                         testCases.Add((label, witness, clause));
+                        establishCtx[label] = (extra, clause, fullPreLits);
+                        var ebKey = ScheduleKey(clause, new List<Expression>(), fullPreLits);
+                        if (!baseConditionExclusions.ContainsKey(ebKey))
+                            baseConditionExclusions[ebKey] = new List<string>();
+                        var ebExcl = BuildInputExclusion(witness);
+                        if (ebExcl != null) baseConditionExclusions[ebKey].Add(ebExcl);
                         added++;
                         if (verbose) Console.WriteLine($"  {phaseTag} {label}: SAT — added test case");
                     }
@@ -4022,6 +4032,23 @@ class Program
                     if (schedMatch.literals == null) continue;
                     var baseKey = ScheduleKey(schedMatch.literals, schedMatch.exclusions, schedMatch.preLiterals);
                     bases.Add((lbl, schedMatch.literals, schedMatch.preLiterals, schedMatch.exclusions, new List<string>(), baseKey));
+                }
+                // Phase 1e /Estab and /PreSat witnesses are written directly to testCases
+                // (like /Rel). Register them as Phase 3 bases too, carrying the hard
+                // ¬Post(pre) / Post(pre) constraint in `extras` — the Phase 3 extras
+                // propagation (commit b652c56) re-applies it on every repeat, so each
+                // repeat is a *fresh* input under the same establish constraint. This
+                // turns the single-shot establish test into a diversified family,
+                // pushing discriminator coverage (e.g. FIND's premature-break) toward
+                // deterministic kills instead of a one-in-three lottery.
+                foreach (var (lbl, _, lits) in testCases)
+                {
+                    if (!(lbl.EndsWith("/Estab") || lbl.EndsWith("/PreSat"))) continue;
+                    if (!seenBaseLabels.Add(lbl)) continue;
+                    if (!establishCtx.TryGetValue(lbl, out var ectx)) continue;
+                    var baseKey = ScheduleKey(ectx.clause, new List<Expression>(), ectx.preLits);
+                    bases.Add((lbl, ectx.clause, ectx.preLits, new List<Expression>(),
+                        new List<string> { ectx.extra }, baseKey));
                 }
 
                 if (bases.Count == 0)
