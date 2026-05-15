@@ -220,6 +220,43 @@ static class DnfEngine
         }
     }
 
+    // Boolean-shape detection for the bool-`==`-as-Iff rule. Primary signal is the
+    // resolved type; structural fallbacks cover cases where the type is null after
+    // AST substitution / inlining.
+    static bool IsBoolLiteral(Expression e)
+    {
+        var u = UnwrapExpr(e);
+        return u is LiteralExpr le && le.Value is bool;
+    }
+    static bool LooksBoolean(Expression e)
+    {
+        var u = UnwrapExpr(e);
+        if (u is LeafExpression) return false; // string-path: type unknown — be conservative
+        var t = u.Type;
+        if (t != null) { try { if (t.IsBoolType) return true; } catch { } }
+        // Structural fallbacks (resolved Type may be absent post-substitution).
+        if (u is QuantifierExpr) return true;                              // forall / exists
+        if (u is UnaryOpExpr { Op: UnaryOpExpr.Opcode.Not }) return true;
+        if (u is LiteralExpr lit && lit.Value is bool) return true;
+        if (u is BinaryExpr be)
+        {
+            switch (be.Op)
+            {
+                case BinaryExpr.Opcode.And: case BinaryExpr.Opcode.Or:
+                case BinaryExpr.Opcode.Imp: case BinaryExpr.Opcode.Iff:
+                case BinaryExpr.Opcode.Eq: case BinaryExpr.Opcode.Neq:
+                case BinaryExpr.Opcode.Lt: case BinaryExpr.Opcode.Le:
+                case BinaryExpr.Opcode.Gt: case BinaryExpr.Opcode.Ge:
+                case BinaryExpr.Opcode.In: case BinaryExpr.Opcode.NotIn:
+                    return true;
+            }
+        }
+        if (u is FunctionCallExpr fce && fce.Function != null
+            && fce.Function.ResultType != null)
+        { try { if (fce.Function.ResultType.IsBoolType) return true; } catch { } }
+        return false;
+    }
+
     // ───────────────── Core DNF and FDNF with dual returns ──────────────────
 
     /// <summary>
@@ -312,6 +349,37 @@ static class DnfEngine
                 neg.AddRange(CrossProduct(a.pos, b.neg));
                 neg.AddRange(CrossProduct(a.neg, b.pos));
                 return (pos, neg);
+            }
+
+            // Boolean `==` is logically `<==>`; boolean `!=` is `xor`. The very
+            // common spec shape `returns (b: bool) ensures b == pred(...)` would
+            // otherwise stay a single atomic clause, so Z3 is never forced into
+            // the `b ∧ pred` vs `¬b ∧ ¬pred` partition — exactly the split that
+            // discriminates the b-computation logic. Treat bool `==`/`!=` like
+            // Iff/Xor (skip if either side is a bool literal — `x == true` is
+            // better left as the atomic `x`, the contradiction-pruner collapses
+            // the trivial second clause anyway). Checked before the Eq-ITE rule
+            // is irrelevant: `b == (if C then A else B)` with bool branches still
+            // benefits more from the ITE split, so only fire when neither side
+            // is an ITE.
+            if ((op == BinaryExpr.Opcode.Eq || op == BinaryExpr.Opcode.Neq))
+            {
+                var bl = UnwrapExpr(binF.E0);
+                var br = UnwrapExpr(binF.E1);
+                bool eitherIte = bl is ITEExpr || br is ITEExpr;
+                if (!eitherIte && LooksBoolean(bl) && LooksBoolean(br)
+                    && !IsBoolLiteral(bl) && !IsBoolLiteral(br))
+                {
+                    var ba = ExprToDnfInner(binF.E0);
+                    var bb = ExprToDnfInner(binF.E1);
+                    var iffPos = new List<List<Expression>>();
+                    iffPos.AddRange(CrossProduct(ba.pos, bb.pos));
+                    iffPos.AddRange(CrossProduct(ba.neg, bb.neg));
+                    var iffNeg = new List<List<Expression>>();
+                    iffNeg.AddRange(CrossProduct(ba.pos, bb.neg));
+                    iffNeg.AddRange(CrossProduct(ba.neg, bb.pos));
+                    return op == BinaryExpr.Opcode.Eq ? (iffPos, iffNeg) : (iffNeg, iffPos);
+                }
             }
 
             // x == if C then A else B  →  (C && x == A) || (!C && x == B)
