@@ -257,6 +257,26 @@ static class DnfEngine
         return false;
     }
 
+    // An "atomic boolean reference" is a boolean variable / field (optionally
+    // under old()) or bool literal — it carries NO internal predicate structure.
+    // The bool-`==`-as-Iff rule only pays off when at least one side is a
+    // *compound* boolean (a predicate/function call, quantifier, or boolean
+    // connective): splitting `b == pred(...)` into `b∧pred` vs `¬b∧¬pred`
+    // exercises the b-computation. For `atom == atom` there is no predicate to
+    // partition against. In particular this skips FRAME conditions like
+    // `weekend == old(weekend)` (and `b1 == b2`), whose Iff-split adds no
+    // behavioural partition but doubles the FDNF cross-product, diluting the
+    // per-method test budget across every other clause.
+    static bool IsAtomicBoolRef(Expression e)
+    {
+        var u = UnwrapExpr(e);
+        if (u is OldExpr oe && oe.Expr != null) return IsAtomicBoolRef(oe.Expr);
+        return u is IdentifierExpr
+            || u is NameSegment
+            || u is MemberSelectExpr
+            || (u is LiteralExpr le && le.Value is bool);
+    }
+
     // ───────────────── Core DNF and FDNF with dual returns ──────────────────
 
     /// <summary>
@@ -367,7 +387,9 @@ static class DnfEngine
                 var bl = UnwrapExpr(binF.E0);
                 var br = UnwrapExpr(binF.E1);
                 bool eitherIte = bl is ITEExpr || br is ITEExpr;
-                if (!eitherIte && LooksBoolean(bl) && LooksBoolean(br)
+                bool bothAtomic = IsAtomicBoolRef(bl) && IsAtomicBoolRef(br);
+                if (!eitherIte && !bothAtomic
+                    && LooksBoolean(bl) && LooksBoolean(br)
                     && !IsBoolLiteral(bl) && !IsBoolLiteral(br))
                 {
                     var ba = ExprToDnfInner(binF.E0);
