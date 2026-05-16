@@ -2440,6 +2440,22 @@ class Program
                         }
                         bool IsConstSmt(string s) => Regex.IsMatch(s, @"^\s*-?\d+(\.\d+)?\s*$");
 
+                        // Return-output names: a relational literal that mentions
+                        // none of them is "input-only" — it constrains only the
+                        // input region (inputs / consts / `old(...)` pre-state),
+                        // even when it syntactically sits in a postcondition
+                        // (e.g. car_park's `old(|carPark|) >= normalSpaces -
+                        // badParkingBuffer`). For such a literal the three
+                        // boundary regions can be obtained by SUBSTITUTING the
+                        // literal in its own clause rather than conjoining a pin
+                        // onto the unmodified clause.
+                        var retNames = outputs.Select(o => o.Name).ToList();
+                        bool LitIsInputOnly(BinaryExpr b)
+                        {
+                            var s = DnfEngine.ExprToString(b.E0) + " " + DnfEngine.ExprToString(b.E1);
+                            return !retNames.Any(n => Regex.IsMatch(s, $@"\b{Regex.Escape(n)}\b"));
+                        }
+
                         // Per-literal: boundary + strict-companion. The strict-companion
                         // direction depends on the relation: `≥`/`>` → strictly-above,
                         // `≤`/`<` → strictly-below.
@@ -2456,6 +2472,33 @@ class Program
                                 BinaryExpr.Opcode.Ge => ">=",
                                 _ => "?"
                             })}{DnfEngine.ExprToString(bin.E1)}";
+
+                            // Mutation-aware boundary for an input-only relational
+                            // literal that occurs in (not just alongside) the
+                            // post-DNF clause: replace it with each of the three
+                            // regions `< / == / >`, keeping every OTHER literal of
+                            // the clause. This is what kills ROR `>=`→`==` (and
+                            // `<=`→`==`): the discriminating input is the clause's
+                            // own region with the relational literal crossed to
+                            // the far side of the boundary, which a same-side
+                            // strict pin conjoined onto the unmodified clause can
+                            // never reach (it would be UNSAT against the clause's
+                            // own copy of the literal, or land on a sibling clause
+                            // whose other disjuncts mask the comparison).
+                            if (!isPre && LitIsInputOnly(bin))
+                            {
+                                var clauseSansBin = clause.Where(l => !ReferenceEquals(Unwrap(l), bin)).ToList();
+                                foreach (var (sym, smtOp) in new[] { ("<", "<"), ("=", "="), (">", ">") })
+                                {
+                                    var rl = $"Lsub:{litStr}{sym}";
+                                    if (!emitted.Add($"{pi}|{ci}|{rl}")) continue;
+                                    schedule.Add(($"{clauseLabel}/B{rl}",
+                                        clauseSansBin, fullPreLits, new List<Expression>(),
+                                        new List<string> { $"({smtOp} {leftSmt} {rightSmt})" }, simpleMask, pi));
+                                }
+                                continue;
+                            }
+
                             var eqLabel = $"L:{litStr}=";
                             var strictOp = (bin.Op == BinaryExpr.Opcode.Ge || bin.Op == BinaryExpr.Opcode.Gt) ? ">" : "<";
                             var strictLabel = $"L:{litStr}{strictOp}";
