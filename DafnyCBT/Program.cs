@@ -73,6 +73,7 @@ class Program
         var z3QueryTimeoutOpt = new Option<int>("--z3-query-timeout", () => 2000, "Per-Z3-query timeout in milliseconds (default: 2000). Lower values give the per-method budget more headroom for hard methods; raise for slow corpora where genuine SAT/UNSAT answers need >2s.");
         var noModificationRelOpt = new Option<bool>("--no-modification-relevance", "Disable Phase 1r 'modification relevance' — by default, the relevance query asserts that some `modifies`-listed value actually changes between pre and post, filtering out witnesses where the impl could legitimately be a no-op (e.g. reverse on a length-1 array).");
         var noForallRelOpt = new Option<bool>("--no-forall-relevance", "Disable Phase 1r 'forall non-vacuity' — by default, the relevance query asserts that every clause-level `forall i :: lo <= i < hi ==> P(i)` literal has a non-empty range, filtering out witnesses where some forall is vacuously true via empty range.");
+        var noPermDomainPinOpt = new Option<bool>("--no-permutation-domain-pin", "Disable permutation-domain pinning — by default, when a `multiset(X)==multiset(Y)` literal is present (sort/permutation specs), every sequence/array element is constrained into the same bounded value universe the multiset equality is encoded over, making that encoding exact. Without it, the bounded `_mset_count` is unsound for out-of-universe elements, so Z3 can satisfy multiset-preservation with pre≠post differing only outside the universe — silently defeating modification-relevance (already-sorted no-op inputs pass; reorder bugs survive).");
         var trustUnknownOpt = new Option<bool>("--trust-unknown", () => false, "Trust Z3 output values when uniqueness check returns 'unknown' (default: false — safer: treat unknown as not-unique and fall back to full-postcondition expects)");
         var uniquenessRoundsOpt = new Option<int>("--uniqueness-rounds", () => 4, "Max rounds of uniqueness checking to enumerate all valid outputs (default: 4). When all valid outputs are enumerated, emit expect out == v1 || out == v2 || ...;");
         uniquenessRoundsOpt.AddAlias("-u");
@@ -130,7 +131,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -154,6 +155,7 @@ class Program
             Z3Runner.Z3QueryTimeoutMs = ctx.ParseResult.GetValueForOption(z3QueryTimeoutOpt);
             SmtTranslator.ModificationRelevance = !ctx.ParseResult.GetValueForOption(noModificationRelOpt);
             SmtTranslator.ForallNonVacuityRelevance = !ctx.ParseResult.GetValueForOption(noForallRelOpt);
+            SmtTranslator.PermutationDomainPin = !ctx.ParseResult.GetValueForOption(noPermDomainPinOpt);
             TrustUnknownUniqueness = ctx.ParseResult.GetValueForOption(trustUnknownOpt);
             SmtTranslator.DropPostWfGuards = ctx.ParseResult.GetValueForOption(dropPostWfOpt);
             TestValidator.SkipOnException = ctx.ParseResult.GetValueForOption(skipOnExceptionOpt);

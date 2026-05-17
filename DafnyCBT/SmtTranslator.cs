@@ -107,6 +107,21 @@ static class SmtTranslator
     internal static bool ModificationRelevance { get; set; } = true;
 
     /// <summary>
+    /// Permutation-domain pin — when a `multiset(seqA) == multiset(seqB)`
+    /// literal is present, the multiset equality is encoded as a bounded
+    /// `_mset_count` conjunction over a fixed value universe (GetElementUniverse).
+    /// That encoding is UNSOUND if a sequence element falls outside the universe
+    /// (its count is never compared), so Z3 can satisfy `multiset(pre)==
+    /// multiset(post)` while pre/post differ only in out-of-universe elements —
+    /// which silently defeats modification-relevance for permutation/sorting
+    /// specs (a sorted no-op input passes; the reorder bug is never exercised).
+    /// When true (default), every element of a sequence/array involved in a
+    /// permutation spec is pinned into that same universe, making the bounded
+    /// multiset equality EXACT. Disable via --no-permutation-domain-pin.
+    /// </summary>
+    internal static bool PermutationDomainPin { get; set; } = true;
+
+    /// <summary>
     /// Phase 1r "forall non-vacuity" — when true, the relevance query asserts
     /// that every top-level `forall i :: lo <= i &lt; hi ==> P(i)` clause literal
     /// has a non-empty range (`lo &lt; hi`). Filters out witnesses where some
@@ -241,6 +256,17 @@ static class SmtTranslator
         var allSpecExprs = (preClauses ?? Enumerable.Empty<Expression>())
             .Concat(postLiterals ?? Enumerable.Empty<Expression>())
             .Concat(preLiterals ?? Enumerable.Empty<Expression>());
+
+        // Permutation literal present? (`multiset(X) == multiset(Y)` / `!=`).
+        // The bounded `_mset_count` encoding is only sound if all sequence
+        // elements lie in the value universe — see PermutationDomainPin.
+        bool hasMsetPerm = PermutationDomainPin && allSpecExprs.Any(e =>
+        {
+            if (e == null) return false;
+            var s = DnfEngine.ExprToString(e);
+            return Regex.Matches(s, @"multiset\s*\(").Count >= 2
+                   && Regex.IsMatch(s, @"==|!=");
+        });
         // Detect collection literals in spec, including those reached via top-level
         // const references (e.g. `x in vowels` where `vowels` is a const set literal).
         bool refersToConstOfKind<T>() where T : Expression
@@ -487,9 +513,19 @@ static class SmtTranslator
                 if (type == "nat")
                     sb.AppendLine($"(assert (>= {name}_pre 0))");
             }
+            else if (mutableNames.Contains(name) && TypeUtils.IsMapType(type))
+            {
+                // Mutable map class field: emit the full map encoding under
+                // BOTH _pre and _post (mirrors the mutable-array pre/post
+                // split). Without this it would fall into the scalar branch
+                // below and the renamed `name_pre_domain`/`_values`/`_p{i}`
+                // spec refs would be undeclared → Z3 "unknown constant".
+                EmitMapEncoding(sb, $"{name}_pre", type);
+                EmitMapEncoding(sb, $"{name}_post", type);
+            }
             else if (mutableNames.Contains(name))
             {
-                // Scalar mutable (e.g., class field): declare _pre and _post
+                // Scalar / seq mutable (e.g., class field): declare _pre and _post
                 var smtType = TypeUtils.DafnyTypeToSmt(type);
                 sb.AppendLine($"(declare-const {name}_pre {smtType})");
                 sb.AppendLine($"(declare-const {name}_post {smtType})");
@@ -528,46 +564,8 @@ static class SmtTranslator
             }
             else if (TypeUtils.IsMapType(type))
             {
-                // Maps are encoded as two parallel arrays over bounded key universe:
-                //   domain (Array K Bool) â€” which keys are present
-                //   values (Array K V)    â€” the value for each key
-                var keyType = TypeUtils.GetMapKeyType(type);
-                var valType = TypeUtils.GetMapValueType(type);
-                var keyUniverse = TypeUtils.GetElementUniverse(keyType);
-                var valSmtType = TypeUtils.DafnyTypeToSmt(valType);
-                // Per-key variables: presence (Bool) and value
-                for (int i = 0; i < keyUniverse.Length; i++)
-                {
-                    sb.AppendLine($"(declare-const {name}_p{i} Bool)");
-                    sb.AppendLine($"(declare-const {name}_v{i} {valSmtType})");
-                }
-                // Domain array (like a set)
-                var domainChain = "((as const (Array Int Bool)) false)";
-                for (int i = 0; i < keyUniverse.Length; i++)
-                    domainChain = $"(store {domainChain} {keyUniverse[i]} {name}_p{i})";
-                sb.AppendLine($"(define-fun {name}_domain () (Array Int Bool) {domainChain})");
-                // Values array
-                var defaultVal = valSmtType == "Bool" ? "false" : valSmtType == "Real" ? "0.0" : "0";
-                var valuesChain = $"((as const (Array Int {valSmtType})) {defaultVal})";
-                for (int i = 0; i < keyUniverse.Length; i++)
-                    valuesChain = $"(store {valuesChain} {keyUniverse[i]} {name}_v{i})";
-                sb.AppendLine($"(define-fun {name}_values () (Array Int {valSmtType}) {valuesChain})");
-                // Value type constraints on per-key value variables
-                for (int i = 0; i < keyUniverse.Length; i++)
-                {
-                    if (valType == "nat")
-                        sb.AppendLine($"(assert (>= {name}_v{i} 0))");
-                    if (valType == "char")
-                    {
-                        sb.AppendLine($"(assert (>= {name}_v{i} 32))");
-                        sb.AppendLine($"(assert (<= {name}_v{i} 126))");
-                    }
-                    if (_enumDatatypes.TryGetValue(valType, out var valEnumCtors))
-                    {
-                        sb.AppendLine($"(assert (>= {name}_v{i} 0))");
-                        sb.AppendLine($"(assert (<= {name}_v{i} {valEnumCtors.Count - 1}))");
-                    }
-                }
+                // Non-mutable map param: single encoding under the bare name.
+                EmitMapEncoding(sb, name, type);
             }
             else if (TypeUtils.IsSeqType(type) && TypeUtils.IsTupleType(TypeUtils.GetSeqElementType(type)))
             {
@@ -714,6 +712,29 @@ static class SmtTranslator
             }
         }
 
+        // Permutation-domain pin: when a `multiset(..)==multiset(..)` literal is
+        // present, the multiset equality is encoded as a bounded `_mset_count`
+        // conjunction over GetElementUniverse(elemType). That is only SOUND if
+        // every sequence element lies in that universe — otherwise out-of-universe
+        // elements are uncounted and Z3 can satisfy `multiset(pre)==multiset(post)`
+        // with pre≠post differing only outside the universe (defeating
+        // modification-relevance for sort/permutation specs). Pin each element of
+        // the involved sequence into the SAME universe so the encoding is exact.
+        // Only for int-encoded element types (mirrors BuildMultisetEqSmt's bounded
+        // path; non-int-encoded uses the sound `forall v` form and needs no pin).
+        void EmitDomainPin(string sn, string et)
+        {
+            if (!hasMsetPerm) return;
+            bool intEncoded = et == "int" || et == "nat" || et == "char"
+                || et == "T" || _enumDatatypes.ContainsKey(et);
+            if (!intEncoded) return;
+            var uni = TypeUtils.GetElementUniverse(et);
+            if (uni.Length == 0) return;
+            var disj = string.Join(" ",
+                uni.Select(v => $"(= (seq.nth {sn} i) {(v < 0 ? $"(- {-v})" : v.ToString())})"));
+            sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {sn}))) (or {disj}))))");
+        }
+
         // Bound all sequence lengths for tractability; constrain char elements to printable ASCII
         foreach (var (name, type) in inputs.Concat(outputs).ToList())
         {
@@ -764,6 +785,7 @@ static class SmtTranslator
                                 sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {sn}))) (>= (seq.nth {sn} i) 0))))");
                             if (_enumDatatypes.TryGetValue(compType, out var enumCompCtors))
                                 sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {sn}))) (and (>= (seq.nth {sn} i) 0) (<= (seq.nth {sn} i) {enumCompCtors.Count - 1})))))");
+                            EmitDomainPin(sn, compType);
                         }
                     }
                 }
@@ -779,6 +801,7 @@ static class SmtTranslator
                             sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
                         if (_enumDatatypes.TryGetValue(elemTypeStr, out var enumElemCtors))
                             sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 0) (<= (seq.nth {smtName} i) {enumElemCtors.Count - 1})))))");
+                        EmitDomainPin(smtName, elemTypeStr);
                     }
                 }
                 else if (!TypeUtils.IsSupportedNestedSeqType(type))
@@ -802,6 +825,7 @@ static class SmtTranslator
                             sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
                         if (_enumDatatypes.TryGetValue(elemTypeStr, out var enumElemCtors2))
                             sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 0) (<= (seq.nth {smtName} i) {enumElemCtors2.Count - 1})))))");
+                        EmitDomainPin(smtName, elemTypeStr);
                     }
                 }
                 // (nested seq bounds are handled in the flat encoding declaration block above)
@@ -899,9 +923,16 @@ static class SmtTranslator
             {
                 var keyType = TypeUtils.GetMapKeyType(type);
                 var keyUniverse = TypeUtils.GetElementUniverse(keyType);
-                var smtName = mutableNames.Contains(name) ? $"{name}_pre" : name;
-                var cardTerms = string.Join(" ", Enumerable.Range(0, keyUniverse.Length).Select(i => $"(ite {smtName}_p{i} 1 0)"));
-                sb.AppendLine($"(define-fun {smtName}_card () Int (+ {cardTerms}))");
+                // Mutable map: both pre and post are encoded → define both
+                // cardinality helpers. Non-mutable: single bare-name helper.
+                var smtNames = mutableNames.Contains(name)
+                    ? new[] { $"{name}_pre", $"{name}_post" }
+                    : new[] { name };
+                foreach (var smtName in smtNames)
+                {
+                    var cardTerms = string.Join(" ", Enumerable.Range(0, keyUniverse.Length).Select(i => $"(ite {smtName}_p{i} 1 0)"));
+                    sb.AppendLine($"(define-fun {smtName}_card () Int (+ {cardTerms}))");
+                }
             }
         }
 
@@ -5431,6 +5462,51 @@ static class SmtTranslator
     // Recognise the renamed forms so the heap-drop still fires.
     static bool IsReprName(string n)
         => n == "Repr" || n == "Repr_pre" || n == "Repr_post";
+
+    // Emits the bounded-universe map encoding (per-key presence/value vars,
+    // domain/values define-funs, value-type constraints) under SMT base name
+    // `smt`. Used both for non-mutable map params (smt == name) and for the
+    // pre/post split of a MUTABLE map class field (smt == name_pre /
+    // name_post). Without the split, a mutable map field falls into the
+    // catch-all scalar `(declare-const name_pre …)` branch and the map
+    // encoding is never emitted, so renamed spec literals reference
+    // undeclared `name_pre_domain`/`name_pre_p0`/… → Z3 "unknown constant".
+    private static void EmitMapEncoding(System.Text.StringBuilder sb, string smt, string type)
+    {
+        var keyType = TypeUtils.GetMapKeyType(type);
+        var valType = TypeUtils.GetMapValueType(type);
+        var keyUniverse = TypeUtils.GetElementUniverse(keyType);
+        var valSmtType = TypeUtils.DafnyTypeToSmt(valType);
+        for (int i = 0; i < keyUniverse.Length; i++)
+        {
+            sb.AppendLine($"(declare-const {smt}_p{i} Bool)");
+            sb.AppendLine($"(declare-const {smt}_v{i} {valSmtType})");
+        }
+        var domainChain = "((as const (Array Int Bool)) false)";
+        for (int i = 0; i < keyUniverse.Length; i++)
+            domainChain = $"(store {domainChain} {keyUniverse[i]} {smt}_p{i})";
+        sb.AppendLine($"(define-fun {smt}_domain () (Array Int Bool) {domainChain})");
+        var defaultVal = valSmtType == "Bool" ? "false" : valSmtType == "Real" ? "0.0" : "0";
+        var valuesChain = $"((as const (Array Int {valSmtType})) {defaultVal})";
+        for (int i = 0; i < keyUniverse.Length; i++)
+            valuesChain = $"(store {valuesChain} {keyUniverse[i]} {smt}_v{i})";
+        sb.AppendLine($"(define-fun {smt}_values () (Array Int {valSmtType}) {valuesChain})");
+        for (int i = 0; i < keyUniverse.Length; i++)
+        {
+            if (valType == "nat")
+                sb.AppendLine($"(assert (>= {smt}_v{i} 0))");
+            if (valType == "char")
+            {
+                sb.AppendLine($"(assert (>= {smt}_v{i} 32))");
+                sb.AppendLine($"(assert (<= {smt}_v{i} 126))");
+            }
+            if (_enumDatatypes.TryGetValue(valType, out var valEnumCtors))
+            {
+                sb.AppendLine($"(assert (>= {smt}_v{i} 0))");
+                sb.AppendLine($"(assert (<= {smt}_v{i} {valEnumCtors.Count - 1}))");
+            }
+        }
+    }
 
     private static string ScalarSmtSort(string t)
         => t == "bool" ? "Bool" : t == "real" ? "Real" : "Int";

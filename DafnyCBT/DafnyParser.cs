@@ -99,6 +99,15 @@ static class DafnyParser
         return result;
     }
 
+    /// <summary>True if the method carries the Dafny `{:test}` attribute —
+    /// a genuine unit test run by `dafny test`, never a unit under test.</summary>
+    private static bool MethodHasTestAttribute(Method m)
+    {
+        for (var attr = m.Attributes; attr != null; attr = attr.Prev)
+            if (attr.Name == "test") return true;
+        return false;
+    }
+
     internal static List<Method> FindTestableMethodsAuto(Microsoft.Dafny.Program program,
         Dictionary<string, List<string>>? enumDatatypes = null,
         HashSet<string>? classNames = null,
@@ -116,10 +125,24 @@ static class DafnyParser
                     // generates a single test that satisfies the precondition and
                     // calls the method (no expects). Catches infinite-loop / crash
                     // mutants in unspecified helpers without requiring a contract.
+                    // The `*test*`-name exclusion was a blunt proxy for "test
+                    // scaffolding, not a unit under test". The precise signals:
+                    //  - genuine Dafny unit tests carry the `{:test}` attribute
+                    //    (run by `dafny test`) — skip those;
+                    //  - test drivers/harness (testingMethod(), TestMapMerge())
+                    //    have NO `ensures` — already excluded by Ens.Count>0.
+                    // A method named `test*` WITH a real postcondition (e.g.
+                    // `testPrimeness ensures result <==> prime(n)`) is a
+                    // misnamed real function; excluding it by name silently
+                    // skips it → false survivor (prime-database 2097/2104). So
+                    // the name heuristic now applies ONLY to contract-less
+                    // methods (the smoke/driver path); spec-bearing methods are
+                    // selected regardless of name, excluding only `{:test}`.
                     if (member is Method m && !m.IsGhost
                         && (m.Ens.Count > 0 || (smokeTests && m.Req.Count > 0))
-                        && !m.Name.Contains("test", StringComparison.OrdinalIgnoreCase)
-                        && !m.Name.Contains("Test", StringComparison.OrdinalIgnoreCase)
+                        && !MethodHasTestAttribute(m)
+                        && !(m.Ens.Count == 0
+                             && m.Name.Contains("test", StringComparison.OrdinalIgnoreCase))
                         && m.Name != "Main"
                         && m.Name != "_ctor")
                     {
