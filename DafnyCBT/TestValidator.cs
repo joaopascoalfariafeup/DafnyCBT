@@ -67,7 +67,7 @@ static class TestValidator
 
         // ── Extract source header (everything before the first "method TestsFor<Name>()") ──
         var genMethodMatch = Regex.Match(
-            generatedCode, @"^method TestsFor[\w']+\(\)\s*$", RegexOptions.Multiline);
+            generatedCode, @"^method TestsFor[\w'?]+\(\)\s*$", RegexOptions.Multiline);
         if (!genMethodMatch.Success)
         {
             Console.Error.WriteLine("[DafnyCBT] Could not find TestsFor method in output");
@@ -82,7 +82,7 @@ static class TestValidator
         // ── Extract individual test-case blocks, tracking source method ─────────
         var testBlocks = new List<(string comment, string body, string sourceMethod)>();
         var wrapperPattern = new Regex(
-            @"^method TestsFor([\w']+)\(\)\s*\r?\n\{\r?\n(.*?)\n\}\s*$",
+            @"^method TestsFor([\w'?]+)\(\)\s*\r?\n\{\r?\n(.*?)\n\}\s*$",
             RegexOptions.Multiline | RegexOptions.Singleline);
         var blockPattern = new Regex(
             @"(  // Test case[^\r\n]*\r?\n(?:  //[^\r\n]*\r?\n)*)  \{\r?\n(.*?)  \}",
@@ -1986,12 +1986,12 @@ static class TestValidator
     internal static string ReformatToByStatus(string generatedCode)
     {
         var genMethodMatch = Regex.Match(
-            generatedCode, @"^method TestsFor[\w']+\(\)\s*$", RegexOptions.Multiline);
+            generatedCode, @"^method TestsFor[\w'?]+\(\)\s*$", RegexOptions.Multiline);
         if (!genMethodMatch.Success) return generatedCode;
         var sourceHeader = generatedCode.Substring(0, genMethodMatch.Index);
 
         var wrapperPattern = new Regex(
-            @"^method TestsFor[\w']+\(\)\s*\r?\n\{\r?\n(.*?)\n\}\s*$",
+            @"^method TestsFor[\w'?]+\(\)\s*\r?\n\{\r?\n(.*?)\n\}\s*$",
             RegexOptions.Multiline | RegexOptions.Singleline);
         var blockPattern = new Regex(
             @"(  // Test case[^\r\n]*\r?\n(?:  //[^\r\n]*\r?\n)*)  \{\r?\n(.*?)  \}",

@@ -1853,7 +1853,7 @@ static class SmtTranslator
         // Skip 'Repr' (ghost set<object>, not an SMT-representable variable)
         if (expr is IdentifierExpr idExpr)
         {
-            if (idExpr.Name == "Repr") return null;
+            if (IsReprName(idExpr.Name)) return null;
             if (_enumConstructors.TryGetValue(idExpr.Name, out var enumInfo))
                 return enumInfo.ordinal.ToString();
             // Top-level const: declared as `(define-fun <name> () <Sort> <Rhs>)`
@@ -1864,7 +1864,7 @@ static class SmtTranslator
         }
         if (expr is NameSegment nameExpr)
         {
-            if (nameExpr.Name == "Repr") return null;
+            if (IsReprName(nameExpr.Name)) return null;
             if (_enumConstructors.TryGetValue(nameExpr.Name, out var enumInfo))
                 return enumInfo.ordinal.ToString();
             if (_constInlines.ContainsKey(nameExpr.Name))
@@ -2420,7 +2420,7 @@ static class SmtTranslator
         var exprStr = DnfEngine.ExprToString(expr);
         // Skip expressions referencing Repr or bare 'this' â€” these are heap constraints
         // that can't be represented in our SMT encoding
-        if (Regex.IsMatch(exprStr, @"\bRepr\b") || Regex.IsMatch(exprStr, @"\bthis\b"))
+        if (Regex.IsMatch(exprStr, @"\bRepr(_pre|_post)?\b") || Regex.IsMatch(exprStr, @"\bthis\b"))
             return null;
         var renamedInputsFb = BuildRenamedInputs(inputs, mutableNames, isPostContext && !insideOld);
         string rewrittenFb;
@@ -3419,7 +3419,7 @@ static class SmtTranslator
         if (notInMatch.Success)
         {
             var seqName = notInMatch.Groups[2].Value;
-            if (seqName == "Repr") return null; // heap ownership constraint
+            if (IsReprName(seqName)) return null; // heap ownership constraint
             var valExpr = DafnyExprToSmt(notInMatch.Groups[1].Value.Trim(), inputs);
             var hasSlice = notInMatch.Groups[3].Success;
             var sliceUpperBound = notInMatch.Groups[5].Success ? notInMatch.Groups[5].Value : null;
@@ -3463,7 +3463,7 @@ static class SmtTranslator
         if (inMatch.Success)
         {
             var seqName = inMatch.Groups[2].Value;
-            if (seqName == "Repr") return null; // heap ownership constraint
+            if (IsReprName(seqName)) return null; // heap ownership constraint
             var valExpr = DafnyExprToSmt(inMatch.Groups[1].Value.Trim(), inputs);
             var hasSlice = inMatch.Groups[3].Success;
             var sliceUpperBound = inMatch.Groups[5].Success ? inMatch.Groups[5].Value : null;
@@ -3804,7 +3804,7 @@ static class SmtTranslator
         if (Regex.IsMatch(expr, @"^\w+$"))
         {
             // Skip heap-related identifiers that have no SMT representation
-            if (expr == "this" || expr == "Repr") return null;
+            if (expr == "this" || IsReprName(expr)) return null;
             if (_enumConstructors.TryGetValue(expr, out var enumInfo))
                 return enumInfo.ordinal.ToString();
             return expr;
@@ -5419,6 +5419,18 @@ static class SmtTranslator
         }
         return smt;
     }
+
+    // `Repr` is the autocontracts ghost representation set (set<object>) — a
+    // heap framing artifact with no SMT representation, dropped from queries.
+    // When the field is mutable (`modifies Repr`) the pre/post rename rewrites
+    // `Repr` → `Repr_pre`/`Repr_post` in literal strings BEFORE translation, so
+    // bare-name guards (`== "Repr"`, `\bRepr\b`) miss it and `null !in Repr`
+    // falls into the seq-membership fallback over an undeclared `Repr_pre` →
+    // Z3 "unknown constant Repr_pre" → the whole query errors out (every
+    // autocontracts method with `null !in Repr`/`this in Repr` in Valid()).
+    // Recognise the renamed forms so the heap-drop still fires.
+    static bool IsReprName(string n)
+        => n == "Repr" || n == "Repr_pre" || n == "Repr_post";
 
     private static string ScalarSmtSort(string t)
         => t == "bool" ? "Bool" : t == "real" ? "Real" : "Int";
