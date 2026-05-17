@@ -1041,8 +1041,15 @@ static class DnfEngine
     /// </summary>
     internal static string? FindContradiction(List<Expression> literals)
     {
-        // Convert all literals to string keys for complement checking
-        var litKeys = literals.Select(ExprToString).ToList();
+        // Convert all literals to CANONICAL string keys for complement checking.
+        // Canonicalization collapses `!(X in Y)` → `X !in Y` and
+        // `!(X !in Y)` → `X in Y` (and relational orientation), so a
+        // contradictory pair that is only complementary *after* unwrapping the
+        // outer `!` — e.g. `!(element in old(elements))` ∧
+        // `!(element !in old(elements))`, which the raw-string check missed —
+        // is now detected. (CanonicalLiteralKey leaves quantified literals
+        // atomic, so `forall …` keys are unaffected.)
+        var litKeys = literals.Select(e => CanonicalLiteralKey(ExprToString(e))).ToList();
 
         // 1. Direct complement detection
         // Detects: L ∧ !(L), L ∧ !L, X in Y ∧ X !in Y, X == Y ∧ X != Y, etc.
@@ -1051,7 +1058,7 @@ static class DnfEngine
         {
             // Check if the operator-negated form of this literal is already present
             var negated = NegateOperatorInLiteral(key);
-            if (negated != null && allLits.Contains(negated))
+            if (negated != null && allLits.Contains(CanonicalLiteralKey(negated)))
                 return $"complement: {negated} ∧ {key}";
             allLits.Add(key);
         }
@@ -1333,6 +1340,19 @@ static class DnfEngine
             }
             if (ok && depth == 0) sParsed = inner.Trim();
         }
+        // Quantified literals are ATOMIC for canonicalization. The relational
+        // orientation pass below uses FindTopLevelOperator, which tracks only
+        // paren/bracket depth — NOT quantifier `::` scope — so for a literal
+        // like `forall i :: i in old(elements) && i != element <==> i in
+        // elements` it would treat the body's inner `!=` as a top-level
+        // operator and lexicographically swap operands ACROSS the `forall ::`
+        // boundary, mangling it into garbage (`element <==> i in elements !=
+        // forall i :: …`). A `forall`/`exists` literal must never be split on
+        // an operator that lies inside its body — keep it whole.
+        var pq = sParsed.TrimStart();
+        if (pq.StartsWith("forall ") || pq.StartsWith("exists ")
+            || pq.StartsWith("forall(") || pq.StartsWith("exists("))
+            return s;
         // Longest-first to disambiguate `<=` from `<` (and `>=` from `>`).
         string[] relOps = { "<=", ">=", "==", "!=", "<", ">" };
         foreach (var op in relOps)

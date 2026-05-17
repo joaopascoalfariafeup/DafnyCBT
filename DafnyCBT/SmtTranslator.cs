@@ -783,16 +783,26 @@ static class SmtTranslator
                 }
                 else if (!TypeUtils.IsSupportedNestedSeqType(type))
                 {
-                    // Regular (non-nested) seq: bound length and constrain elements
-                    var smtName = TypeUtils.SeqSmtName(name, type);
-                    sb.AppendLine($"(assert (>= (seq.len {smtName}) 0))");
-                    sb.AppendLine($"(assert (<= (seq.len {smtName}) {MAX_SEQ_LEN}))");
-                    if (elemTypeStr == "nat")
-                        sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (>= (seq.nth {smtName} i) 0))))");
-                    if (elemTypeStr == "char")
-                        sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
-                    if (_enumDatatypes.TryGetValue(elemTypeStr, out var enumElemCtors2))
-                        sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 0) (<= (seq.nth {smtName} i) {enumElemCtors2.Count - 1})))))");
+                    // Regular (non-nested) seq: bound length and constrain elements.
+                    // A mutable seq<T> class field is declared as the pre/post
+                    // split (`name_pre`/`name_post`), NOT the bare `name`; bound
+                    // BOTH (mirrors the mutable-array `_pre_seq`/`_post_seq`
+                    // branch above). Without this the bare `name` is undeclared
+                    // and Z3 errors out on the whole query.
+                    var seqSmtNames = mutableNames.Contains(name)
+                        ? new[] { $"{name}_pre", $"{name}_post" }
+                        : new[] { TypeUtils.SeqSmtName(name, type) };
+                    foreach (var smtName in seqSmtNames)
+                    {
+                        sb.AppendLine($"(assert (>= (seq.len {smtName}) 0))");
+                        sb.AppendLine($"(assert (<= (seq.len {smtName}) {MAX_SEQ_LEN}))");
+                        if (elemTypeStr == "nat")
+                            sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (>= (seq.nth {smtName} i) 0))))");
+                        if (elemTypeStr == "char")
+                            sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 32) (<= (seq.nth {smtName} i) 126)))))");
+                        if (_enumDatatypes.TryGetValue(elemTypeStr, out var enumElemCtors2))
+                            sb.AppendLine($"(assert (forall ((i Int)) (=> (and (<= 0 i) (< i (seq.len {smtName}))) (and (>= (seq.nth {smtName} i) 0) (<= (seq.nth {smtName} i) {enumElemCtors2.Count - 1})))))");
+                    }
                 }
                 // (nested seq bounds are handled in the flat encoding declaration block above)
             }
@@ -1233,19 +1243,25 @@ static class SmtTranslator
                 if (elem != "int" && elem != "nat") continue;
                 if (TypeUtils.IsSupportedNestedSeqType(type)) continue;
                 if (TypeUtils.IsTupleType(elem)) continue;
+                // Mutable seq<T> class field: the declared SMT var is the pre/post
+                // split (`name_pre`/`name_post`), NOT the bare `name`. Bias the
+                // pre value (the receiver state the test installs). Without this
+                // rename the bias emits `(seq.len name)` for an undeclared
+                // constant → Z3 "unknown constant" → the whole query errors out.
+                var sn = mutableNames.Contains(name) ? $"{name}_pre" : name;
                 if (!BiasMagnitudeOnly)
-                    sb.AppendLine($"(assert-soft (not (= (seq.len {name}) 0)) :weight 1)");
-                sb.AppendLine($"(assert-soft (<= (seq.len {name}) {BIAS_LEN}) :weight 2)");
+                    sb.AppendLine($"(assert-soft (not (= (seq.len {sn}) 0)) :weight 1)");
+                sb.AppendLine($"(assert-soft (<= (seq.len {sn}) {BIAS_LEN}) :weight 2)");
                 for (int k = 0; k < BIAS_POS; k++)
                 {
                     if (!BiasMagnitudeOnly)
                     {
-                        sb.AppendLine($"(assert-soft (=> (> (seq.len {name}) {k}) (not (= (seq.nth {name} {k}) 0))) :weight 2)");
-                        sb.AppendLine($"(assert-soft (=> (> (seq.len {name}) {k}) (not (= (seq.nth {name} {k}) 1))) :weight 1)");
+                        sb.AppendLine($"(assert-soft (=> (> (seq.len {sn}) {k}) (not (= (seq.nth {sn} {k}) 0))) :weight 2)");
+                        sb.AppendLine($"(assert-soft (=> (> (seq.len {sn}) {k}) (not (= (seq.nth {sn} {k}) 1))) :weight 1)");
                     }
-                    sb.AppendLine($"(assert-soft (=> (> (seq.len {name}) {k}) (<= (seq.nth {name} {k}) {BIAS_MAX})) :weight 3)");
+                    sb.AppendLine($"(assert-soft (=> (> (seq.len {sn}) {k}) (<= (seq.nth {sn} {k}) {BIAS_MAX})) :weight 3)");
                     if (elem == "int")
-                        sb.AppendLine($"(assert-soft (=> (> (seq.len {name}) {k}) (>= (seq.nth {name} {k}) (- {BIAS_MAX}))) :weight 3)");
+                        sb.AppendLine($"(assert-soft (=> (> (seq.len {sn}) {k}) (>= (seq.nth {sn} {k}) (- {BIAS_MAX}))) :weight 3)");
                 }
                 continue;
             }
@@ -1343,6 +1359,20 @@ static class SmtTranslator
                     foreach (var suffix in new[] { "_pre", "_post" })
                     {
                         var smtName = $"{name}{suffix}_seq";
+                        sb.AppendLine($"(get-value ((seq.len {smtName})))");
+                        for (int i = 0; i < 8; i++)
+                            sb.AppendLine($"(get-value ((seq.nth {smtName} {i})))");
+                    }
+                }
+                else if (mutableNames.Contains(name) && !TypeUtils.IsSupportedNestedSeqType(type))
+                {
+                    // Mutable seq<T> field: recover BOTH pre and post (the model
+                    // parser expects `name_pre`/`name_post`; the test installs
+                    // the pre value as the receiver's initial state). Mirrors the
+                    // mutable-array `_pre_seq`/`_post_seq` branch above. Without
+                    // this the bare `name` is undeclared → Z3 query error.
+                    foreach (var smtName in new[] { $"{name}_pre", $"{name}_post" })
+                    {
                         sb.AppendLine($"(get-value ((seq.len {smtName})))");
                         for (int i = 0; i < 8; i++)
                             sb.AppendLine($"(get-value ((seq.nth {smtName} {i})))");
