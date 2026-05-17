@@ -1638,6 +1638,27 @@ static class SmtTranslator
                 Expression? rhsConstExpr = null;
                 if (rhsName != null && _constInlines.TryGetValue(rhsName, out var crhs))
                     rhsConstExpr = UnwrapExpr(crhs.Rhs);
+
+                // `key in m.Keys` / `key !in m.Keys` — map-key membership.
+                // `m.Keys` is set-typed, so it would otherwise take the set
+                // branch and fail (`.Keys` has no standalone SMT form). Lower
+                // directly to a domain select on the underlying map.
+                {
+                    var keysRhs = UnwrapExpr(bin.E1);
+                    Expression? keysMapObj =
+                        keysRhs is MemberSelectExpr kms && kms.MemberName == "Keys" ? kms.Obj :
+                        keysRhs is ExprDotName kdn && kdn.SuffixName == "Keys" ? kdn.Lhs : null;
+                    if (keysMapObj != null && IsMapExprAst(keysMapObj, inputs))
+                    {
+                        var mapBase = ExprToSmt(keysMapObj, inputs, mutableNames, isPostContext, insideOld);
+                        if (mapBase != null)
+                        {
+                            var memberExpr = $"(select {mapBase}_domain {valSmt})";
+                            return bin.Op == BinaryExpr.Opcode.NotIn ? $"(not {memberExpr})" : memberExpr;
+                        }
+                    }
+                }
+
                 bool rhsIsSet = TypeUtils.IsSetType(rhsTypeStr)
                     || (rhsName != null && inputs.Any(v => v.Name == rhsName && TypeUtils.IsSetType(v.Type)))
                     || UnwrapExpr(bin.E1) is SetDisplayExpr
@@ -1741,6 +1762,35 @@ static class SmtTranslator
                     var perm = BuildMultisetEqSmt(seq0, seq1, elemType);
                     return bin.Op == BinaryExpr.Opcode.Neq ? $"(not {perm})" : perm;
                 }
+            }
+
+            // Map equality: p == m + n (and similar) → compare the parallel
+            // (Array Int Bool) domain and (Array Int V) values encodings.
+            // There is no scalar `p`/`m` constant and `+` on maps is Dafny's
+            // right-biased merge, not integer addition — the generic fallback
+            // would emit `(= p (+ m n))` over undeclared bare names → Z3
+            // "unknown constant". Lower both sides via the MapMerge* preamble
+            // helpers. Restricted to Int-valued maps (covers generics V→Int and
+            // int/nat/char/enum); bool/real-valued maps fall through unchanged
+            // (the MapMerge* helpers are (Array Int Int)).
+            if ((bin.Op == BinaryExpr.Opcode.Eq || bin.Op == BinaryExpr.Opcode.Neq)
+                && (IsMapExprAst(bin.E0, inputs) || IsMapExprAst(bin.E1, inputs)))
+            {
+                var mapType = ResolveMapDafnyType(bin.E0, inputs)
+                              ?? ResolveMapDafnyType(bin.E1, inputs);
+                if (mapType != null
+                    && TypeUtils.DafnyTypeToSmt(TypeUtils.GetMapValueType(mapType)) == "Int")
+                {
+                    var lhs = MapExprToDomainValues(bin.E0, inputs, mutableNames, isPostContext, insideOld);
+                    var rhs = MapExprToDomainValues(bin.E1, inputs, mutableNames, isPostContext, insideOld);
+                    if (lhs != null && rhs != null)
+                    {
+                        var conj = $"(and (= {lhs.Value.dom} {rhs.Value.dom}) "
+                                 + $"(= {lhs.Value.val} {rhs.Value.val}))";
+                        return bin.Op == BinaryExpr.Opcode.Neq ? $"(not {conj})" : conj;
+                    }
+                }
+                goto fallback;
             }
 
             var left = ExprToSmt(bin.E0, inputs, mutableNames, isPostContext, insideOld);
@@ -2771,6 +2821,65 @@ static class SmtTranslator
         }
         if (expr is OldExpr oldE) return IsMapExprAst(oldE.Expr, inputs);
         return false;
+    }
+
+    /// <summary>
+    /// Resolves the Dafny map type string of a map-valued expression
+    /// (identifier / old(identifier) / map merge or subtraction). Used to
+    /// decide the value SMT sort for map-equality lowering. Returns null if the
+    /// expression is not a recognisable map.
+    /// </summary>
+    static string? ResolveMapDafnyType(Expression expr, List<(string Name, string Type)> inputs)
+    {
+        expr = UnwrapExpr(expr);
+        var name = GetOriginalName(expr);
+        if (name != null)
+        {
+            var match = inputs.FirstOrDefault(v => v.Name == name);
+            if (match != default && TypeUtils.IsMapType(match.Type)) return match.Type;
+        }
+        if (expr is OldExpr oldE) return ResolveMapDafnyType(oldE.Expr, inputs);
+        if (expr is BinaryExpr be
+            && (be.Op == BinaryExpr.Opcode.Add || be.Op == BinaryExpr.Opcode.Sub))
+            return ResolveMapDafnyType(be.E0, inputs) ?? ResolveMapDafnyType(be.E1, inputs);
+        var t = expr.Type?.ToString();
+        return t != null && TypeUtils.IsMapType(t) ? t : null;
+    }
+
+    /// <summary>
+    /// Lowers a map-valued expression to its parallel (domain, values) SMT
+    /// arrays. Handles a bare map identifier / output / old(map) — base name
+    /// → {base}_domain / {base}_values — and right-biased merge `a + b` via the
+    /// MapMergeDomain / MapMergeValues preamble helpers. Returns null for forms
+    /// not yet supported (map subtraction, map displays), letting the caller
+    /// fall back unchanged.
+    /// </summary>
+    static (string dom, string val)? MapExprToDomainValues(Expression expr,
+        List<(string Name, string Type)> inputs, HashSet<string> mutableNames,
+        bool isPostContext, bool insideOld)
+    {
+        expr = UnwrapExpr(expr);
+
+        // Right-biased merge: a + b
+        if (expr is BinaryExpr be && be.Op == BinaryExpr.Opcode.Add)
+        {
+            var l = MapExprToDomainValues(be.E0, inputs, mutableNames, isPostContext, insideOld);
+            var r = MapExprToDomainValues(be.E1, inputs, mutableNames, isPostContext, insideOld);
+            if (l == null || r == null) return null;
+            return ($"(MapMergeDomain {l.Value.dom} {r.Value.dom})",
+                    $"(MapMergeValues {l.Value.dom} {l.Value.val} {r.Value.dom} {r.Value.val})");
+        }
+
+        // Bare map identifier / output / old(map): base → base_domain/_values.
+        // ExprToSmt already resolves old()/mutable pre/post renaming.
+        if (IsMapExprAst(expr, inputs))
+        {
+            var baseSmt = ExprToSmt(expr, inputs, mutableNames, isPostContext, insideOld);
+            if (baseSmt == null) return null;
+            return ($"{baseSmt}_domain", $"{baseSmt}_values");
+        }
+
+        return null;
     }
 
     /// <summary>
