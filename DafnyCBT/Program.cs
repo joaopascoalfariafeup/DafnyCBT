@@ -37,6 +37,18 @@ class Program
     // repeats, |x|=2 → ≤1). Reallocates round-robin budget to larger/diverse
     // bases. Set from --cap-small-size-repeats. Default off.
     public static bool CapSmallSizeRepeats = false;
+    // [spike] Dead-clause pruning: once a clause's plain (no-tier) combination
+    // is definitively Z3-UNSAT, every tier sub-combination of that same clause
+    // is also UNSAT (tiers only ADD constraints). Persist that fact across the
+    // Phase 1/2/2b solve passes so dead clauses (e.g. an inlined recursive
+    // base-case branch made unreachable by the surrounding bound, k==i+1 ∧
+    // k≤i) are skipped instead of re-solved per tier. NOT output-neutral:
+    // never *removes* a test (pruned solves are provably UNSAT → produce
+    // nothing), but the freed solve budget lets Phase 3's round-robin reach
+    // additional repeats within the same -n/timeout (monotone: tests ≥, never
+    // fewer; ~37% faster on fold-heavy methods). Default OFF (--dead-clause-
+    // pruning); behaviour-affecting → corpus kill-regression before default-on.
+    public static bool DeadClausePruning = false;
     // Per-candidate CEGIS attempt cap. Used for both isolated and plain modes.
     // With Phase A's relevance-style query baking in the isolation precondition,
     // 3 attempts is more than enough — the historical 10-attempt cap from the
@@ -78,6 +90,7 @@ class Program
         var noModificationRelOpt = new Option<bool>("--no-modification-relevance", "Disable Phase 1r 'modification relevance' — by default, the relevance query asserts that some `modifies`-listed value actually changes between pre and post, filtering out witnesses where the impl could legitimately be a no-op (e.g. reverse on a length-1 array).");
         var noForallRelOpt = new Option<bool>("--no-forall-relevance", "Disable Phase 1r 'forall non-vacuity' — by default, the relevance query asserts that every clause-level `forall i :: lo <= i < hi ==> P(i)` literal has a non-empty range, filtering out witnesses where some forall is vacuously true via empty range.");
         var noPermDomainPinOpt = new Option<bool>("--no-permutation-domain-pin", "Disable permutation-domain pinning — by default, when a `multiset(X)==multiset(Y)` literal is present (sort/permutation specs), every sequence/array element is constrained into the same bounded value universe the multiset equality is encoded over, making that encoding exact. Without it, the bounded `_mset_count` is unsound for out-of-universe elements, so Z3 can satisfy multiset-preservation with pre≠post differing only outside the universe — silently defeating modification-relevance (already-sorted no-op inputs pass; reorder bugs survive).");
+        var deadClausePruningOpt = new Option<bool>("--dead-clause-pruning", () => false, "[spike] Once a DNF clause's plain (no-tier) combination is definitively Z3-UNSAT, skip all of that clause's boundary/categorical tier sub-combinations across the Phase 1/2/2b passes (a tier only ADDS constraints to an already-UNSAT formula → provably UNSAT). Targets dead clauses like an inlined recursive base-case branch `k==i+1` made unreachable by the spec's own `k<=i` bound (~25-34 wasted Z3 solves on SeqMaxSum; ~37% faster). Monotone, not output-neutral: never removes a test, but the freed solve budget lets Phase 3 reach extra repeats within the same -n/timeout. Default off.");
         var capSmallSizeRepeatsOpt = new Option<bool>("--cap-small-size-repeats", () => false, "[spike] In Phase 3 round-robin, cap repeats of the degenerate-value tiers: 0 repeats for `|x|=1` (singleton) and boundary `=0` tiers, ≤1 repeat for `|x|=2` and boundary `=1`. Repeated tiny/extremal-constant inputs rarely expose new behaviour (sort/swap/interior bugs need ≥3 elements or a non-boundary index); the freed budget is reallocated by the round-robin to larger / more diverse bases. Default off.");
         var boundedFoldOpt = new Option<bool>("--bounded-fold", () => false, "[spike] Recognise recursive additive prefix-sum folds (f(s,n) = sum of first n elements) at the AST level and emit a bounded closed form Σ_{i<MAX_SEQ_LEN} ite(i<n, s[i], 0) instead of an uninterpreted residual. Gives Z3 a real objective for `exists n :: … f(s,n) …` specs (the Sum2/min/prime/Inorder/BelowZero recursive-fold cluster) so the discriminating input is found deterministically. Default off.");
         var trustUnknownOpt = new Option<bool>("--trust-unknown", () => false, "Trust Z3 output values when uniqueness check returns 'unknown' (default: false — safer: treat unknown as not-unique and fall back to full-postcondition expects)");
@@ -137,7 +150,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, boundedFoldOpt, capSmallSizeRepeatsOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, boundedFoldOpt, capSmallSizeRepeatsOpt, deadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -164,6 +177,7 @@ class Program
             SmtTranslator.PermutationDomainPin = !ctx.ParseResult.GetValueForOption(noPermDomainPinOpt);
             SmtTranslator.BoundedFoldEnabled = ctx.ParseResult.GetValueForOption(boundedFoldOpt);
             CapSmallSizeRepeats = ctx.ParseResult.GetValueForOption(capSmallSizeRepeatsOpt);
+            DeadClausePruning = ctx.ParseResult.GetValueForOption(deadClausePruningOpt);
             TrustUnknownUniqueness = ctx.ParseResult.GetValueForOption(trustUnknownOpt);
             SmtTranslator.DropPostWfGuards = ctx.ParseResult.GetValueForOption(dropPostWfOpt);
             TestValidator.SkipOnException = ctx.ParseResult.GetValueForOption(skipOnExceptionOpt);
@@ -3294,6 +3308,10 @@ class Program
         //   Any superset mask is also guaranteed UNSAT → skip without calling Z3.
         // knownUnsatBaseMasks: per (preIdx), masks whose base entry (no boundary) was Z3 UNSAT.
         //   All boundary-tier entries for the same (mask, preIdx) are also guaranteed UNSAT.
+        // Persisted across the Phase 1/2/2b SolveRange invocations (this method's
+        // scope) so a dead clause discovered in one phase is not re-solved per
+        // tier in the next. (preIdx, postMask) identity is phase-stable.
+        var persistentBaseUnsatMasks = new HashSet<(int preIdx, int mask)>();
         async Task<int> SolveRange(
             List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule,
             int from, int to, int displayTotal,
@@ -3308,7 +3326,12 @@ class Program
             int contradictionCount = 0;
             int subsumedCount = 0;
             // Track base (no boundary) UNSAT results per (preIdx, mask) to skip their boundary tiers
-            var baseUnsatMasks = new HashSet<(int preIdx, int mask)>();
+            // Default-on: share the UNSAT-base set across phases (dead-clause
+            // pruning). --no-dead-clause-pruning restores the per-call local
+            // (each phase re-solves dead-clause tiers — slower, identical tests).
+            var baseUnsatMasks = DeadClausePruning
+                ? persistentBaseUnsatMasks
+                : new HashSet<(int preIdx, int mask)>();
             for (int i = from; i < to; i++)
             {
                 if (TimedOut()) { Console.WriteLine("  Timeout reached, stopping."); break; }
