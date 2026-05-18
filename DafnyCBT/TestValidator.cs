@@ -81,8 +81,14 @@ static class TestValidator
 
         // ── Extract individual test-case blocks, tracking source method ─────────
         var testBlocks = new List<(string comment, string body, string sourceMethod)>();
+        // `[^{}]*` (not just whitespace) between `()` and the body brace so an
+        // optional wrapper clause — e.g. `decreases *`, emitted whenever the
+        // source has any `decreases *` method — does not defeat the per-wrapper
+        // scan. Before, that clause made this regex match zero wrappers, so the
+        // fallback below lumped every method's tests under a single hard-coded
+        // "Main" label (corrupting per-method kill@k accounting).
         var wrapperPattern = new Regex(
-            @"^method TestsFor([\w'?]+)\(\)\s*\r?\n\{\r?\n(.*?)\n\}\s*$",
+            @"^method TestsFor([\w'?]+)\(\)[^{}]*\{\r?\n(.*?)\n\}\s*$",
             RegexOptions.Multiline | RegexOptions.Singleline);
         var blockPattern = new Regex(
             @"(  // Test case[^\r\n]*\r?\n(?:  //[^\r\n]*\r?\n)*)  \{\r?\n(.*?)  \}",
@@ -1991,7 +1997,7 @@ static class TestValidator
         var sourceHeader = generatedCode.Substring(0, genMethodMatch.Index);
 
         var wrapperPattern = new Regex(
-            @"^method TestsFor[\w'?]+\(\)\s*\r?\n\{\r?\n(.*?)\n\}\s*$",
+            @"^method TestsFor[\w'?]+\(\)[^{}]*\{\r?\n(.*?)\n\}\s*$",
             RegexOptions.Multiline | RegexOptions.Singleline);
         var blockPattern = new Regex(
             @"(  // Test case[^\r\n]*\r?\n(?:  //[^\r\n]*\r?\n)*)  \{\r?\n(.*?)  \}",
