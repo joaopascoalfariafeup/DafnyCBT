@@ -33,6 +33,10 @@ class Program
     // type-correct uninterpreted stub). Higher values fully unroll linear
     // recursions like ProdF(s) = s[0]*ProdF(s[1..]) up to N seq elements.
     public static int RecursiveUnrollDepth = 1;
+    // [spike] Phase 3: cap repeats of tiny collection-size tiers (|x|=1 → 0
+    // repeats, |x|=2 → ≤1). Reallocates round-robin budget to larger/diverse
+    // bases. Set from --cap-small-size-repeats. Default off.
+    public static bool CapSmallSizeRepeats = false;
     // Per-candidate CEGIS attempt cap. Used for both isolated and plain modes.
     // With Phase A's relevance-style query baking in the isolation precondition,
     // 3 attempts is more than enough — the historical 10-attempt cap from the
@@ -74,6 +78,8 @@ class Program
         var noModificationRelOpt = new Option<bool>("--no-modification-relevance", "Disable Phase 1r 'modification relevance' — by default, the relevance query asserts that some `modifies`-listed value actually changes between pre and post, filtering out witnesses where the impl could legitimately be a no-op (e.g. reverse on a length-1 array).");
         var noForallRelOpt = new Option<bool>("--no-forall-relevance", "Disable Phase 1r 'forall non-vacuity' — by default, the relevance query asserts that every clause-level `forall i :: lo <= i < hi ==> P(i)` literal has a non-empty range, filtering out witnesses where some forall is vacuously true via empty range.");
         var noPermDomainPinOpt = new Option<bool>("--no-permutation-domain-pin", "Disable permutation-domain pinning — by default, when a `multiset(X)==multiset(Y)` literal is present (sort/permutation specs), every sequence/array element is constrained into the same bounded value universe the multiset equality is encoded over, making that encoding exact. Without it, the bounded `_mset_count` is unsound for out-of-universe elements, so Z3 can satisfy multiset-preservation with pre≠post differing only outside the universe — silently defeating modification-relevance (already-sorted no-op inputs pass; reorder bugs survive).");
+        var capSmallSizeRepeatsOpt = new Option<bool>("--cap-small-size-repeats", () => false, "[spike] In Phase 3 round-robin, cap repeats of the degenerate-value tiers: 0 repeats for `|x|=1` (singleton) and boundary `=0` tiers, ≤1 repeat for `|x|=2` and boundary `=1`. Repeated tiny/extremal-constant inputs rarely expose new behaviour (sort/swap/interior bugs need ≥3 elements or a non-boundary index); the freed budget is reallocated by the round-robin to larger / more diverse bases. Default off.");
+        var boundedFoldOpt = new Option<bool>("--bounded-fold", () => false, "[spike] Recognise recursive additive prefix-sum folds (f(s,n) = sum of first n elements) at the AST level and emit a bounded closed form Σ_{i<MAX_SEQ_LEN} ite(i<n, s[i], 0) instead of an uninterpreted residual. Gives Z3 a real objective for `exists n :: … f(s,n) …` specs (the Sum2/min/prime/Inorder/BelowZero recursive-fold cluster) so the discriminating input is found deterministically. Default off.");
         var trustUnknownOpt = new Option<bool>("--trust-unknown", () => false, "Trust Z3 output values when uniqueness check returns 'unknown' (default: false — safer: treat unknown as not-unique and fall back to full-postcondition expects)");
         var uniquenessRoundsOpt = new Option<int>("--uniqueness-rounds", () => 4, "Max rounds of uniqueness checking to enumerate all valid outputs (default: 4). When all valid outputs are enumerated, emit expect out == v1 || out == v2 || ...;");
         uniquenessRoundsOpt.AddAlias("-u");
@@ -131,7 +137,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, boundedFoldOpt, capSmallSizeRepeatsOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -156,6 +162,8 @@ class Program
             SmtTranslator.ModificationRelevance = !ctx.ParseResult.GetValueForOption(noModificationRelOpt);
             SmtTranslator.ForallNonVacuityRelevance = !ctx.ParseResult.GetValueForOption(noForallRelOpt);
             SmtTranslator.PermutationDomainPin = !ctx.ParseResult.GetValueForOption(noPermDomainPinOpt);
+            SmtTranslator.BoundedFoldEnabled = ctx.ParseResult.GetValueForOption(boundedFoldOpt);
+            CapSmallSizeRepeats = ctx.ParseResult.GetValueForOption(capSmallSizeRepeatsOpt);
             TrustUnknownUniqueness = ctx.ParseResult.GetValueForOption(trustUnknownOpt);
             SmtTranslator.DropPostWfGuards = ctx.ParseResult.GetValueForOption(dropPostWfOpt);
             TestValidator.SkipOnException = ctx.ParseResult.GetValueForOption(skipOnExceptionOpt);
@@ -329,6 +337,15 @@ class Program
         // can construct properly-resolved replacement expressions instead of
         // falling back to string-based LeafExpression literals.
         DnfEngine.SystemModuleManager = program.SystemModuleManager;
+
+        // --bounded-fold spike: AST-recognise additive prefix-sum folds so the
+        // SMT translator can emit a bounded closed form for them (and the
+        // recursive-residual fallback below can skip them).
+        SmtTranslator.RecognizedFolds = SmtTranslator.BoundedFoldEnabled
+            ? BoundedFold.Recognize(program)
+            : new System.Collections.Generic.Dictionary<string, FoldInfo>();
+        if (SmtTranslator.RecognizedFolds.Count > 0)
+            Console.WriteLine($"[DafnyCBT] Bounded-fold recognised: {string.Join(", ", SmtTranslator.RecognizedFolds.Keys)}");
 
         if (program == null)
         {
@@ -1681,6 +1698,11 @@ class Program
         {
             var inlinableAll = FunctionInliner.CollectInlinable(program, skipNames: smtBuiltins);
             var recursiveFns = FunctionInliner.ComputeRecursive(inlinableAll);
+            // --bounded-fold: a recognised prefix-sum fold is NOT an
+            // unsolvable residual — the SMT translator emits a closed form for
+            // it — so it must not trigger the precondition-only fallback.
+            if (SmtTranslator.BoundedFoldEnabled)
+                recursiveFns.ExceptWith(SmtTranslator.RecognizedFolds.Keys);
             if (recursiveFns.Count > 0)
             {
                 bool hasRecursiveResidual = false;
@@ -4224,6 +4246,28 @@ class Program
                         {
                             if (testCases.Count >= minTests || TimedOut()) break;
                             if (maxTests > 0 && testCases.Count >= maxTests) { nextActive.Add(label); continue; }
+
+                            // [spike] Cap Phase-3 repeats of tiny collection-size
+                            // tiers. The `|x|=K` size base test itself was already
+                            // emitted in Phase 2b; here we only limit its round-robin
+                            // /R repeats. `|x|=1` → 0 repeats, `|x|=2` → ≤1 — beyond
+                            // that, drop the base (don't re-add to nextActive) so the
+                            // freed budget flows to larger / more diverse bases.
+                            if (CapSmallSizeRepeats)
+                            {
+                                // Degenerate-value tiers (0 repeats): empty/singleton
+                                // collection `|x|=1`, boundary constant `=0`.
+                                // Near-degenerate (≤1 repeat): `|x|=2`, boundary `=1`.
+                                // The Phase-2b/literal-BVA base test is already
+                                // emitted; only its round-robin /R repeats are capped.
+                                int ssCap =
+                                    Regex.IsMatch(label, @"/O\|[^|]+\|=1(?:$|/)") ? 0 :  // size |x|=1
+                                    Regex.IsMatch(label, @"/B[\w']+=0(?:$|/)")    ? 0 :  // boundary =0
+                                    Regex.IsMatch(label, @"/O\|[^|]+\|=2(?:$|/)") ? 1 :  // size |x|=2
+                                    Regex.IsMatch(label, @"/B[\w']+=1(?:$|/)")    ? 1 :  // boundary =1
+                                    int.MaxValue;
+                                if (perBaseRoundIdx[label] >= ssCap) continue;
+                            }
 
                             var b = bases.First(x => x.label == label);
                             var inputExclusions = perBaseExclusions[label];

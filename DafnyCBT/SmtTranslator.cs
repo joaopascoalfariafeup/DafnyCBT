@@ -177,6 +177,13 @@ static class SmtTranslator
     // force a specific value, so correctness is preserved. Toggled by --no-bias CLI.
     internal static bool AntiTrivialBiasEnabled = false;
     internal static int AntiTrivialBiasSeed = 0;
+    // --bounded-fold spike (default OFF). When on, recursive functions
+    // recognised by BoundedFold as additive prefix-sum folds are emitted as a
+    // bounded closed form Σ_{i<MAX_SEQ_LEN} ite(i < depth, seq[i], 0) instead
+    // of an uninterpreted residual — giving Z3 a real objective for
+    // `exists n :: … f(s, n) …` specs (Sum2/min/prime/Inorder/BelowZero).
+    internal static bool BoundedFoldEnabled = false;
+    internal static Dictionary<string, FoldInfo> RecognizedFolds = new();
     // When true, EmitAntiTrivialBias emits only the magnitude / length bounds
     // (weight-3 caps that keep integers in [-BIAS_MAX, BIAS_MAX] and seq lengths
     // ≤ BIAS_LEN) and skips the weight-1/2 anti-trivial pushes (≠ 0, ≠ 1).
@@ -2429,6 +2436,32 @@ static class SmtTranslator
                     var isArray = inputs.Any(v => v.Name == baseName && TypeUtils.IsArrayType(v.Type));
                     var seqSmt = isArray ? $"{argSmt}_seq" : argSmt;
                     return BuildIsSortedSmt(seqSmt);
+                }
+            }
+            // --bounded-fold: recognised additive prefix-sum fold → bounded
+            // closed form instead of an uninterpreted residual. Mirrors the
+            // IsSorted finite-expansion above. `seq[i]` reads past the (pinned)
+            // length are dead — guarded by `i < depth` with depth ≤ |seq|.
+            if (BoundedFoldEnabled
+                && RecognizedFolds.TryGetValue(funcCall.Name, out var foldInfo)
+                && funcCall.Args.Count == (foldInfo.Kind == FoldKind.RangeSum ? 3 : 2))
+            {
+                var collSmt = ExprToSmt(funcCall.Args[foldInfo.CollParamIdx], inputs, mutableNames, isPostContext, insideOld);
+                var hiSmt = ExprToSmt(funcCall.Args[foldInfo.HiParamIdx], inputs, mutableNames, isPostContext, insideOld);
+                var loSmt = foldInfo.Kind == FoldKind.RangeSum
+                    ? ExprToSmt(funcCall.Args[foldInfo.LoParamIdx], inputs, mutableNames, isPostContext, insideOld)
+                    : "0";
+                if (collSmt != null && hiSmt != null && loSmt != null)
+                {
+                    var baseName = collSmt.EndsWith("_post") ? collSmt[..^5]
+                                 : collSmt.EndsWith("_pre") ? collSmt[..^4] : collSmt;
+                    var isArray = inputs.Any(v => v.Name == baseName && TypeUtils.IsArrayType(v.Type));
+                    var seqExpr = isArray ? $"{collSmt}_seq" : collSmt;
+                    // Σ_{k=0}^{MAX_SEQ_LEN-1} ite(lo ≤ k ∧ k < hi, coll[k], 0).
+                    // PrefixSum has lo=0 so the guard collapses to k < hi.
+                    var terms = Enumerable.Range(0, MAX_SEQ_LEN).Select(k =>
+                        $"(ite (and (<= {loSmt} {k}) (< {k} {hiSmt})) (seq.nth {seqExpr} {k}) 0)");
+                    return $"(+ 0 {string.Join(" ", terms)})";
                 }
             }
             // Generic: defined function (finitely unrolled) or uninterpreted function
