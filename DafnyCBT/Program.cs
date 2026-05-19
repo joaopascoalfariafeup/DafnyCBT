@@ -51,14 +51,18 @@ class Program
     // -n/timeout (tests ≥, never fewer; ~⅓ faster on fold-heavy methods).
     // Default ON; --no-dead-clause-pruning to disable (A/B + safety valve).
     public static bool DeadClausePruning = true;
-    // [spike] Precondition-only diversity fill (Phase 4). When the targeted
-    // phases (1/2/2b/3) underfill minTests because the postcondition's
-    // distinct satisfiable-witness space is exhausted (e.g. SeqMaxSum:
-    // 6 of 20 — dead clause {1} + tight clause {2}), append precondition-only
-    // anti-trivial-biased, input-diversified inputs carrying the FULL
-    // postcondition as a runtime `expect`. Sound under the correct-spec
-    // assumption (precond-valid input passes on correct, fails on mutant only
-    // when discriminating → only adds tests, no false kills). Default off.
+    // [spike] Precondition-only diversity fill (Phase 4). PURE-ADDITIVE: Phase
+    // 1/2/2b/3 run exactly as baseline (no reserve, full minTests target);
+    // Phase 4 fires ONLY when those phases genuinely exhaust their bases
+    // below minTests (postcondition witness space spent, e.g. SeqMaxSum:
+    // ~4-6 of 20 — dead clause {1} + tight clause {2}). It then fills the
+    // remaining EMPTY slots with precondition-only, anti-trivial-biased,
+    // input-diversified inputs carrying the FULL postcondition runtime
+    // `expect`. Monotone: every baseline test is still generated bit-identical;
+    // Phase 4 only appends. Sound under correct-spec (precond-valid input
+    // passes on correct, fails on mutant only when discriminating) → only adds
+    // tests/kills, never removes one. Default off (measure gain corpus-wide;
+    // soundness is structural like dead-clause-pruning).
     public static bool PrecondFill = false;
     // Per-candidate CEGIS attempt cap. Used for both isolated and plain modes.
     // With Phase A's relevance-style query baking in the isolation precondition,
@@ -101,7 +105,7 @@ class Program
         var noModificationRelOpt = new Option<bool>("--no-modification-relevance", "Disable Phase 1r 'modification relevance' — by default, the relevance query asserts that some `modifies`-listed value actually changes between pre and post, filtering out witnesses where the impl could legitimately be a no-op (e.g. reverse on a length-1 array).");
         var noForallRelOpt = new Option<bool>("--no-forall-relevance", "Disable Phase 1r 'forall non-vacuity' — by default, the relevance query asserts that every clause-level `forall i :: lo <= i < hi ==> P(i)` literal has a non-empty range, filtering out witnesses where some forall is vacuously true via empty range.");
         var noPermDomainPinOpt = new Option<bool>("--no-permutation-domain-pin", "Disable permutation-domain pinning — by default, when a `multiset(X)==multiset(Y)` literal is present (sort/permutation specs), every sequence/array element is constrained into the same bounded value universe the multiset equality is encoded over, making that encoding exact. Without it, the bounded `_mset_count` is unsound for out-of-universe elements, so Z3 can satisfy multiset-preservation with pre≠post differing only outside the universe — silently defeating modification-relevance (already-sorted no-op inputs pass; reorder bugs survive).");
-        var precondFillOpt = new Option<bool>("--precond-fill", () => false, "[spike] Phase 4: when the targeted phases underfill the -n budget because the postcondition's distinct satisfiable-witness space is exhausted, fill the remaining slots with precondition-only, anti-trivial-biased, input-diversified inputs, each emitted with the FULL postcondition as a runtime expect. Converts budget-starved survivors (e.g. SeqMaxSum's segSumaMaxima2: 6/20 → fills to 20) into reliably-killed via robustness sampling under the executable-spec oracle. Sound: only adds tests, no false kills under the correct-spec assumption. Default off.");
+        var precondFillOpt = new Option<bool>("--precond-fill", () => false, "[spike] Phase 4, PURE-ADDITIVE: Phase 1/2/2b/3 run exactly as baseline; only when they genuinely exhaust their bases below the -n budget (postcondition witness space spent, e.g. SeqMaxSum's segSumaMaxima2 ~4-6/20) does Phase 4 fill the remaining EMPTY slots with precondition-only, anti-trivial-biased, input-diversified inputs, each emitted with the FULL postcondition as a runtime expect. Every baseline test is still generated bit-identical; Phase 4 only appends — monotone (only adds tests/kills, no false kills under correct-spec). Recovers budget-starved survivors via robustness sampling under the executable-spec oracle. Default off.");
         var noDeadClausePruningOpt = new Option<bool>("--no-dead-clause-pruning", () => false, "Disable dead-clause pruning. By default, once a DNF clause's plain (no-tier) combination is definitively Z3-UNSAT, all of that clause's boundary/categorical tier sub-combinations are skipped across the Phase 1/2/2b passes (a tier only ADDS constraints to an already-UNSAT formula → provably UNSAT; never prunes a SAT tier, so no test/kill is lost). Targets dead clauses like an inlined recursive base-case branch `k==i+1` made unreachable by the spec's own `k<=i` bound (~25-34 wasted Z3 solves on SeqMaxSum; ~⅓ faster). Monotone, not output-neutral: the freed solve budget lets the budget-bounded Phase 3 round-robin reach extra repeats within the same -n/timeout (tests ≥, never fewer). This flag forces every tier to be solved individually (slower; A/B / safety valve).");
         var capSmallSizeRepeatsOpt = new Option<bool>("--cap-small-size-repeats", () => false, "[spike] In Phase 3 round-robin, cap repeats of the degenerate-value tiers: 0 repeats for `|x|=1` (singleton) and boundary `=0` tiers, ≤1 repeat for `|x|=2` and boundary `=1`. Repeated tiny/extremal-constant inputs rarely expose new behaviour (sort/swap/interior bugs need ≥3 elements or a non-boundary index); the freed budget is reallocated by the round-robin to larger / more diverse bases. Default off.");
         var boundedFoldOpt = new Option<bool>("--bounded-fold", () => false, "[spike] Recognise recursive additive prefix-sum folds (f(s,n) = sum of first n elements) at the AST level and emit a bounded closed form Σ_{i<MAX_SEQ_LEN} ite(i<n, s[i], 0) instead of an uninterpreted residual. Gives Z3 a real objective for `exists n :: … f(s,n) …` specs (the Sum2/min/prime/Inorder/BelowZero recursive-fold cluster) so the discriminating input is found deterministically. Default off.");
@@ -4165,17 +4169,7 @@ class Program
                 await RunPhase2b();
             }
 
-            // --precond-fill reserves a slice of the -n budget so Phase 4
-            // always injects precondition-only diversity instead of letting
-            // Phase 3 pad to minTests with clustered postcondition repeats.
-            // The reserve is taken from Phase 3's repeats ONLY — the targeted
-            // Phase 1/2/2b tests are never reduced (phase3Target is floored at
-            // the post-Phase-2b count).
-            int phase3Target = (PrecondFill && minTests >= 4)
-                ? Math.Max(testCases.Count, minTests - Math.Max(2, (minTests + 1) / 3))
-                : minTests;
-
-            if (testCases.Count < phase3Target && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
+            if (testCases.Count < minTests && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
             {
                 // --- Phase 3: round-robin repeats ---
                 // Iterate every distinct ScheduleEntry that produced a test in original
@@ -4284,13 +4278,13 @@ class Program
                     }
 
                     var active = new List<string>(bases.Select(b => b.label));
-                    while (active.Count > 0 && testCases.Count < phase3Target && !TimedOut())
+                    while (active.Count > 0 && testCases.Count < minTests && !TimedOut())
                     {
                         if (maxTests > 0 && testCases.Count >= maxTests) break;
                         var nextActive = new List<string>();
                         foreach (var label in active)
                         {
-                            if (testCases.Count >= phase3Target || TimedOut()) break;
+                            if (testCases.Count >= minTests || TimedOut()) break;
                             if (maxTests > 0 && testCases.Count >= maxTests) { nextActive.Add(label); continue; }
 
                             // [spike] Cap Phase-3 repeats of tiny collection-size
