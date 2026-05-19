@@ -2474,8 +2474,37 @@ static class SmtTranslator
             goto fallback;
         }
 
-        // UnaryExpr for |expr| (sequence length / set cardinality) â€” may be UnaryOpExpr with Cardinality
-        // Handled in fallback for now.
+        // UnaryExpr for |expr| (sequence length / set cardinality) â€” may be UnaryOpExpr with Cardinality.
+        // |seq|/|set var| still go through the fallback; the ONE shape handled
+        // here is the cardinality of an INDEX set-comprehension that counts
+        // indices satisfying a predicate:  |set i: int | range(i)|  (Term == i).
+        // The string fallback mistranslates this to a single dangling-index
+        // boolean (= count (= a[i] b[i])) â€” count decoupled from the real
+        // size. Encode it faithfully as a bounded indicator sum over the
+        // finite index domain (0 .. MAX_SEQ_LEN-1), exactly the bounded-fold
+        // pattern:  (+ 0 (ite range@0 1 0) (ite range@1 1 0) ...).
+        if (expr is UnaryOpExpr { Op: UnaryOpExpr.Opcode.Cardinality } cardOp
+            && UnwrapExpr(cardOp.E) is SetComprehension sc
+            && sc.BoundVars.Count == 1
+            && sc.Range != null
+            && GetOriginalName(UnwrapExpr(sc.Term)) == sc.BoundVars[0].Name)
+        {
+            var bv = sc.BoundVars[0];
+            _boundVars.Add(bv.Name);
+            var rangeSmt = ExprToSmt(sc.Range, inputs, mutableNames, isPostContext, insideOld);
+            _boundVars.Remove(bv.Name);
+            if (rangeSmt != null)
+            {
+                var bvPat = @"(?<![a-zA-Z_0-9])" + Regex.Escape(bv.Name) + @"(?![a-zA-Z_0-9])";
+                var terms = new List<string>();
+                for (int k = 0; k < MAX_SEQ_LEN; k++)
+                {
+                    var inst = Regex.Replace(rangeSmt, bvPat, k.ToString());
+                    terms.Add($"(ite {inst} 1 0)");
+                }
+                return $"(+ 0 {string.Join(" ", terms)})";
+            }
+        }
 
         // SetDisplayExpr: {e1, e2, ...} â€” set literal
         if (expr is SetDisplayExpr setDisplay)
