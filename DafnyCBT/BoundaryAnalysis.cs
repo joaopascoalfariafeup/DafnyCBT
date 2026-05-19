@@ -320,6 +320,25 @@ static class BoundaryAnalysis
             int lastSz = tierCount - 1;
             result.Add(($"|{varName}|>={lastSz}", new List<string> { $"(>= {smtBase}_card {lastSz})" }, $"|{varName}| >= {lastSz}"));
         }
+        else if (SmtTranslator._adtDatatypes.TryGetValue(varType, out var adtCtors))
+        {
+            // ADT structural tiers: one per constructor head. For a recursive
+            // ADT like `Tree = Empty | Node(int,Tree,Tree)`, this emits a tier
+            // pinning `t` to `Empty` and a tier forcing `t` to be a `Node`
+            // (depth left for Z3 to fill). For non-recursive multi-ctor ADTs
+            // (Pair, Option, ...) each ctor gets its own tier — full coverage.
+            // Skip if the ADT only has a single ctor (no discrimination needed).
+            if (adtCtors.Count >= 2)
+            {
+                foreach (var c in adtCtors)
+                {
+                    var label = $"{varName}={c.CtorName}";
+                    var dKey = $"{varName}.{c.CtorName}?";
+                    var constraint = $"((_ is {c.CtorName}) {smtScalar})";
+                    result.Add((label, new List<string> { constraint }, dKey));
+                }
+            }
+        }
         return result;
     }
 

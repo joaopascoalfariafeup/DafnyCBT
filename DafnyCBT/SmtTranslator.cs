@@ -2018,6 +2018,63 @@ static class SmtTranslator
             goto fallback;
         }
 
+        // MatchExpr: `match e { case Ctor1(a,b) => body1 case Ctor2 => body2 ... }`.
+        // Lower to nested ites over the constructor discriminators, binding the
+        // case-pattern formals to the corresponding destructor applications via
+        // an SMT `let`. Source must resolve to a registered ADT. Falls back if
+        // the patterns are anything other than flat `Ctor(name1, name2, ...)`
+        // (nested or literal patterns in case heads are deferred to v2).
+        if (expr is MatchExpr matchExpr)
+        {
+            var srcSmt = ExprToSmt(matchExpr.Source, inputs, mutableNames, isPostContext, insideOld);
+            if (srcSmt == null) goto fallback;
+
+            var caseBodies = new List<(string CtorName, List<(string FormalName, int Ordinal)> Binders, string BodySmt)>();
+            bool allOk = true;
+            foreach (var mc in matchExpr.Cases)
+            {
+                var ctorName = mc.Ctor?.Name;
+                if (ctorName == null || !_adtConstructors.ContainsKey(ctorName)) { allOk = false; break; }
+                var binders = new List<(string, int)>();
+                for (int i = 0; i < mc.Arguments.Count; i++)
+                {
+                    var bv = mc.Arguments[i];
+                    binders.Add((bv.Name, i));
+                    _boundVars.Add(bv.Name);
+                }
+                var bodySmt = ExprToSmt(mc.Body, inputs, mutableNames, isPostContext, insideOld);
+                foreach (var (n, _) in binders) _boundVars.Remove(n);
+                if (bodySmt == null) { allOk = false; break; }
+                caseBodies.Add((ctorName, binders, bodySmt));
+            }
+            if (!allOk) goto fallback;
+            if (caseBodies.Count == 0) goto fallback;
+
+            // Wrap each body in a `let` binding the case formals to (Ctor_i src),
+            // then fold over discriminator ites in reverse (last case = default else).
+            string Wrap(string ctor, List<(string FormalName, int Ordinal)> bs, string body)
+            {
+                if (bs.Count == 0) return body;
+                var bindings = string.Join(" ", bs.Select(b => $"({b.FormalName} ({ctor}_{b.Ordinal} {srcSmt}))"));
+                return $"(let ({bindings}) {body})";
+            }
+            var result = Wrap(caseBodies[^1].CtorName, caseBodies[^1].Binders, caseBodies[^1].BodySmt);
+            for (int i = caseBodies.Count - 2; i >= 0; i--)
+            {
+                var (ctor, bs, body) = caseBodies[i];
+                var wrapped = Wrap(ctor, bs, body);
+                result = $"(ite ((_ is {ctor}) {srcSmt}) {wrapped} {result})";
+            }
+            return result;
+        }
+
+        // NestedMatchExpr (concrete syntax form) — handled via UnwrapExpr which
+        // follows ConcreteSyntaxExpression.ResolvedExpression. If unwrap didn't
+        // reach a MatchExpr (e.g., shape with literal patterns Dafny couldn't
+        // lower to the simple match shape), we fall through to the string
+        // fallback below — which dumps the `match` token unchanged. That
+        // typically still produces a sound but coarser query.
+
         // ForallExpr / ExistsExpr
         if (expr is ForallExpr or ExistsExpr)
         {
@@ -2045,8 +2102,13 @@ static class SmtTranslator
                     : $"(and {rangeSmt} {bodySmt})";
             }
 
-            // For quantifiers with seq.nth, expand finitely to avoid Z3 quantifier instantiation failures
-            if (boundVars.Count >= 1 && boundVars.Count <= 2 && bodySmt.Contains("seq.nth"))
+            // For quantifiers with seq.nth, expand finitely to avoid Z3 quantifier instantiation failures.
+            // Skip the expansion when the seq is computed via an ADT match (body contains
+            // `((_ is `): each instance would duplicate the full nested-ite-let-let-... encoding,
+            // blowing up SMT size (BST: 64 × 2 copies of Inorder(t)'s deep encoding → Z3 thrash).
+            // Leave as plain forall; Z3's seq theory + uninterpreted-function residuals are bounded.
+            bool bodyHasAdtMatch = bodySmt.Contains("((_ is ");
+            if (!bodyHasAdtMatch && boundVars.Count >= 1 && boundVars.Count <= 2 && bodySmt.Contains("seq.nth"))
             {
                 if (boundVars.Count == 1)
                 {
