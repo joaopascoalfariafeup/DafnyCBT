@@ -89,6 +89,14 @@ static class SmtTranslator
     // is rejected by Dafny ("return statement is not allowed in this context, because
     // it is guarded by a specification-only expression").
     internal static HashSet<string> _ghostFunctions = new();
+    // ADT-recursive functions (recursive + ADT-typed parameter + body uses ADT match):
+    // emitted in the preamble as `(define-fun-rec name (params...) ReturnSort body)`
+    // instead of an uninterpreted `(declare-fun ...)`. Gives Z3 the actual recursive
+    // definition so `Inorder(Empty)` reduces to `(as seq.empty (Seq Int))`,
+    // `Inorder(Node(5,Empty,Empty))` reduces to `[5]`, etc. — drastically narrows
+    // the search space for ADT-recursive specs (BST family). Populated by Program.cs
+    // post-resolution.
+    internal static Dictionary<string, Microsoft.Dafny.Function> _adtRecursiveFunctions = new();
     // True if any postcondition literal could not be translated to SMT
     internal static bool _hasUntranslatedPost = false;
     // Tracks precondition strings that were successfully translated to SMT.
@@ -1086,8 +1094,69 @@ static class SmtTranslator
         // available so seq/array/bool arguments get their real SMT sort. Fall back
         // to Int-everywhere for callers we couldn't resolve (e.g. spec literals
         // referencing a function whose decl wasn't traversed).
-        foreach (var (funcName, arity) in _uninterpFuncs)
+        //
+        // For functions registered in _adtRecursiveFunctions, emit `(define-fun-rec
+        // name (params) ResultSort body)` instead — gives Z3 the actual recursive
+        // definition so the spec is no longer underspecified. Falls back to
+        // declare-fun if the body translation fails (preserves soundness).
+        var rawUninterpFuncs = new Dictionary<string, int>(_uninterpFuncs);
+        var emittedDefs = new HashSet<string>();
+        // First emit non-recursive declare-funs for everything (so define-fun-rec
+        // bodies can reference them as forward decls if needed). We'll then overwrite
+        // ADT-recursive ones via define-fun-rec.
+        foreach (var (funcName, arity) in rawUninterpFuncs)
         {
+            if (_adtRecursiveFunctions.ContainsKey(funcName)) continue; // emitted below
+            string argTypes, returnType;
+            if (_functionSignatures.TryGetValue(funcName, out var sig) && sig.ArgSorts.Count == arity)
+            {
+                argTypes = string.Join(" ", sig.ArgSorts);
+                returnType = sig.ReturnSort;
+            }
+            else
+            {
+                argTypes = string.Join(" ", Enumerable.Repeat("Int", arity));
+                returnType = "Int";
+            }
+            sb.AppendLine($"(declare-fun {funcName} ({argTypes}) {returnType})");
+        }
+        // Now emit (define-fun-rec ...) for ADT-recursive functions that surfaced.
+        // Translating the body may add transitively-referenced functions to
+        // _uninterpFuncs — collect those and emit them as declare-fun as well.
+        var addedDuringBody = new Dictionary<string, int>();
+        foreach (var (funcName, _) in rawUninterpFuncs)
+        {
+            if (!_adtRecursiveFunctions.TryGetValue(funcName, out var fnAst)) continue;
+            var paramList = new List<(string Name, string Type)>();
+            foreach (var p in fnAst.Ins) paramList.Add((p.Name, p.Type.ToString()));
+            var sigParams = string.Join(" ", paramList.Select(p =>
+                $"({p.Name} {TypeUtils.DafnyTypeToSmt(p.Type)})"));
+            var retSort = TypeUtils.DafnyTypeToSmt(fnAst.ResultType.ToString());
+            // Translate the body. Use the function's params as the "inputs" list;
+            // they're top-level bound names visible inside the body. Mark them as
+            // bound so name renaming and WF guards behave correctly.
+            foreach (var p in paramList) _boundVars.Add(p.Name);
+            var bodyBefore = new Dictionary<string, int>(_uninterpFuncs);
+            var bodySmt = ExprToSmt(fnAst.Body, paramList, new HashSet<string>(), isPostContext: false);
+            foreach (var p in paramList) _boundVars.Remove(p.Name);
+            // Capture transitive references introduced while translating the body.
+            foreach (var (n, k) in _uninterpFuncs)
+                if (!bodyBefore.ContainsKey(n) && n != funcName) addedDuringBody[n] = k;
+            if (bodySmt == null)
+            {
+                // Fallback to declare-fun on body-translation failure.
+                sb.AppendLine($"(declare-fun {funcName} ({string.Join(" ", paramList.Select(p => TypeUtils.DafnyTypeToSmt(p.Type)))}) {retSort})");
+            }
+            else
+            {
+                sb.AppendLine($"(define-fun-rec {funcName} ({sigParams}) {retSort} {bodySmt})");
+            }
+            emittedDefs.Add(funcName);
+        }
+        // Emit declare-fun for transitively-referenced functions discovered above.
+        foreach (var (funcName, arity) in addedDuringBody)
+        {
+            if (emittedDefs.Contains(funcName) || rawUninterpFuncs.ContainsKey(funcName)) continue;
             string argTypes, returnType;
             if (_functionSignatures.TryGetValue(funcName, out var sig) && sig.ArgSorts.Count == arity)
             {

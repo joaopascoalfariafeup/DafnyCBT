@@ -577,6 +577,61 @@ class Program
         SmtTranslator._functionSignatures = funcSigs;
         SmtTranslator._ghostFunctions = ghostFunctions;
 
+        // ADT-recursive functions: recursive (body mentions own name) + at least
+        // one ADT-typed parameter + body matches on an ADT. Emitted as
+        // `(define-fun-rec ...)` in SMT instead of the underspecified uninterpreted
+        // residual — gives Z3 the real definition so models reflect what e.g.
+        // `Inorder(Node(5,Empty,Empty))` actually computes.
+        var adtRecursiveFunctions = new Dictionary<string, Function>();
+        bool BodyMentionsCall(Expression e, string name)
+        {
+            if (e == null) return false;
+            var stack = new Stack<Expression>();
+            stack.Push(e);
+            while (stack.Count > 0)
+            {
+                var x = stack.Pop();
+                if (x is FunctionCallExpr fce && fce.Function != null && fce.Function.Name == name) return true;
+                foreach (var sub in x.SubExpressions) if (sub != null) stack.Push(sub);
+            }
+            return false;
+        }
+        bool BodyHasMatch(Expression e)
+        {
+            if (e == null) return false;
+            var stack = new Stack<Expression>();
+            stack.Push(e);
+            while (stack.Count > 0)
+            {
+                var x = stack.Pop();
+                // Match both the resolved MatchExpr and the concrete-syntax
+                // NestedMatchExpr (Dafny may leave function bodies in either form).
+                var typeName = x.GetType().Name;
+                if (typeName == "MatchExpr" || typeName == "NestedMatchExpr") return true;
+                foreach (var sub in x.SubExpressions) if (sub != null) stack.Push(sub);
+            }
+            return false;
+        }
+        foreach (var topDecl in DafnyParser.AllTopLevelDecls(program))
+        {
+            if (topDecl is TopLevelDeclWithMembers tld2)
+            {
+                foreach (var member in tld2.Members)
+                {
+                    if (member is Function fn && fn.Body != null)
+                    {
+                        if (!BodyMentionsCall(fn.Body, fn.Name)) continue;
+                        if (!fn.Ins.Any(p => adtDatatypes.ContainsKey(p.Type.ToString()))) continue;
+                        if (!BodyHasMatch(fn.Body)) continue;
+                        adtRecursiveFunctions[fn.Name] = fn;
+                    }
+                }
+            }
+        }
+        SmtTranslator._adtRecursiveFunctions = adtRecursiveFunctions;
+        if (adtRecursiveFunctions.Count > 0)
+            Console.WriteLine($"[DafnyCBT] ADT-recursive (define-fun-rec): {string.Join(", ", adtRecursiveFunctions.Keys)}");
+
         // Collect user-defined class names — parameters of class/reference type can't be
         // represented as concrete SMT values and must be rejected.
         var classNames = new HashSet<string>(DafnyParser.AllTopLevelDecls(program)
@@ -1387,7 +1442,14 @@ class Program
         var astInlined = new bool[dnfEnsures.Count];
         if (program != null)
         {
-            var astInlinable = FunctionInliner.CollectInlinable(program, skipNames: smtBuiltins);
+            // Skip inlining for ADT-recursive functions — they're emitted as
+            // `(define-fun-rec ...)` in the SMT preamble, so the spec-side
+            // reference resolves to the real recursive definition rather than
+            // an uninterpreted residual. Inlining would compete with the
+            // define-fun-rec and produce inconsistent SMT.
+            var skipForInline = new HashSet<string>(smtBuiltins);
+            skipForInline.UnionWith(SmtTranslator._adtRecursiveFunctions.Keys);
+            var astInlinable = FunctionInliner.CollectInlinable(program, skipNames: skipForInline);
             if (astInlinable.Count > 0)
             {
                 for (int i = 0; i < dnfEnsures.Count; i++)
@@ -1621,7 +1683,9 @@ class Program
         //     hangs Z3.
         if (program != null)
         {
-            var allInlinable = FunctionInliner.CollectInlinable(program, skipNames: new HashSet<string> { "IsSorted" });
+            var preSkip = new HashSet<string> { "IsSorted" };
+            preSkip.UnionWith(SmtTranslator._adtRecursiveFunctions.Keys);
+            var allInlinable = FunctionInliner.CollectInlinable(program, skipNames: preSkip);
             var linearRec = FunctionInliner.ComputeLinearRecursive(allInlinable);
             if (linearRec.Count > 0)
             {
