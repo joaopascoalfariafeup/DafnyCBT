@@ -471,6 +471,36 @@ static class SmtTranslator
                 }
                 sb.AppendLine($"(declare-datatypes ({sortDecls}) ({string.Join(" ", ctorBlocks)}))");
                 sb.AppendLine();
+
+                // Emit `_treeSize_<adt>` define-fun-rec for each referenced recursive
+                // ADT (≥1 ctor with an ADT-typed field). Used by the anti-trivial bias
+                // to soft-cap structural size, preventing Z3 from picking arbitrarily
+                // deep recursive shapes that make (define-fun-rec) queries (Inorder,
+                // BST, etc.) slow. Counts the number of constructor nodes; nullary
+                // ctors contribute 0, non-nullary contribute 1 + size of each ADT-
+                // typed child.
+                foreach (var name in referencedAdts)
+                {
+                    var ctors = _adtDatatypes[name];
+                    bool isRecursive = ctors.Any(c => c.Formals.Any(f => _adtDatatypes.ContainsKey(f.Type)));
+                    if (!isRecursive) continue;
+                    var arms = new List<string>();
+                    for (int ci = 0; ci < ctors.Count - 1; ci++)
+                    {
+                        var c = ctors[ci];
+                        arms.Add($"((_ is {c.CtorName}) t) {SizeForCtor(c, name)}");
+                    }
+                    var lastSize = SizeForCtor(ctors[^1], name);
+                    // Fold from the right: (ite ((_ is c0) t) s0 (ite ((_ is c1) t) s1 ... sN))
+                    string body = lastSize;
+                    for (int ci = ctors.Count - 2; ci >= 0; ci--)
+                    {
+                        var c = ctors[ci];
+                        body = $"(ite ((_ is {c.CtorName}) t) {SizeForCtor(c, name)} {body})";
+                    }
+                    sb.AppendLine($"(define-fun-rec _treeSize_{name} ((t {name})) Int {body})");
+                }
+                sb.AppendLine();
             }
         }
 
@@ -1321,6 +1351,28 @@ static class SmtTranslator
     private const int BIAS_POS = 3;
     private const int BIAS_MAX = 10;   // prefer |scalar| <= BIAS_MAX
     private const int BIAS_LEN = 8;    // prefer seq/array length <= BIAS_LEN
+    private const int BIAS_TREE_SIZE = 4; // prefer _treeSize(t) <= BIAS_TREE_SIZE
+
+    /// <summary>
+    /// SMT expression computing the size contribution of one ctor application.
+    /// Nullary ctor → 0. Non-nullary with k ADT-typed children → `(+ 1 child1 child2 ...)`.
+    /// Non-ADT fields are ignored (they don't drive recursive structural growth).
+    /// </summary>
+    private static string SizeForCtor(
+        (string CtorName, List<(string Name, string Type)> Formals) c,
+        string adtName)
+    {
+        if (c.Formals.Count == 0) return "0";
+        var childTerms = new List<string>();
+        for (int fi = 0; fi < c.Formals.Count; fi++)
+        {
+            var f = c.Formals[fi];
+            if (_adtDatatypes.ContainsKey(f.Type))
+                childTerms.Add($"(_treeSize_{f.Type} ({c.CtorName}_{fi} t))");
+        }
+        if (childTerms.Count == 0) return "1";
+        return $"(+ 1 {string.Join(" ", childTerms)})";
+    }
     internal static void EmitAntiTrivialBias(
         System.Text.StringBuilder sb,
         List<(string Name, string Type)> inputs,
@@ -1369,6 +1421,28 @@ static class SmtTranslator
                     sb.AppendLine($"(assert-soft (=> (> (seq.len {sn}) {k}) (<= (seq.nth {sn} {k}) {BIAS_MAX})) :weight 3)");
                     if (elem == "int")
                         sb.AppendLine($"(assert-soft (=> (> (seq.len {sn}) {k}) (>= (seq.nth {sn} {k}) (- {BIAS_MAX}))) :weight 3)");
+                }
+                continue;
+            }
+
+            // Recursive ADT (has at least one ctor whose field is itself an ADT) —
+            // soft-cap the structural size via the `_treeSize_<adt>` define-fun-rec
+            // emitted in the preamble. Two soft asserts (mirroring the seq pattern):
+            //   - `_treeSize(t) ≠ 0` with weight 1 — bias *away* from nullary-only
+            //     (Empty), which Z3 picks otherwise as the cheapest model under any
+            //     tier that doesn't directly constrain the ADT (e.g. `/Ox>0` would
+            //     pick `t0=Empty, x=1` instead of `t0=Node(…), x>i`).
+            //   - `_treeSize(t) ≤ BIAS_TREE_SIZE` with weight 2 — prevents arbitrarily
+            //     deep shapes that explode the recursive-postcondition query.
+            if (_adtDatatypes.TryGetValue(type, out var adtCtorsAt))
+            {
+                bool isRecursive = adtCtorsAt.Any(c => c.Formals.Any(f => _adtDatatypes.ContainsKey(f.Type)));
+                if (isRecursive)
+                {
+                    var sym = mutableNames.Contains(name) ? $"{name}_pre" : name;
+                    if (!BiasMagnitudeOnly)
+                        sb.AppendLine($"(assert-soft (not (= (_treeSize_{type} {sym}) 0)) :weight 1)");
+                    sb.AppendLine($"(assert-soft (<= (_treeSize_{type} {sym}) {BIAS_TREE_SIZE}) :weight 2)");
                 }
                 continue;
             }
