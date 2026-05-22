@@ -200,6 +200,14 @@ static class SmtTranslator
     // one literal vacuous while keeping the others non-vacuous, but where we
     // still want bounded magnitudes for performance and readability.
     internal static bool BiasMagnitudeOnly = false;
+    // When > 0, EmitAntiTrivialBias adds `(assert-soft (>= (seq.len s) MinSeqLen) :weight 1)`
+    // for each seq/array input, biasing Z3 toward larger collections. Default 0
+    // (no extra bias — current behaviour). Useful for fold-heavy corpora
+    // (verifixer_mutants) where killing witnesses are inherently multi-element
+    // (`[5,-3]` etc.) and Phase 1's free model otherwise picks len=1 or 2.
+    // Soft, weight 1 — loses to hard spec constraints and to the upper cap
+    // weight 2, so a spec that forces len=1 still gets len=1.
+    internal static int MinSeqLen = 0;
     // When set (via --seed CLI), forces this exact seed on every SMT query,
     // overriding the per-method name hash and ignoring --no-bias / skipBias.
     // Emits the seed options unconditionally. Useful for reproducibility
@@ -1411,6 +1419,8 @@ static class SmtTranslator
                 if (!BiasMagnitudeOnly)
                     sb.AppendLine($"(assert-soft (not (= (seq.len {sn}) 0)) :weight 1)");
                 sb.AppendLine($"(assert-soft (<= (seq.len {sn}) {BIAS_LEN}) :weight 2)");
+                if (MinSeqLen > 0)
+                    sb.AppendLine($"(assert-soft (>= (seq.len {sn}) {MinSeqLen}) :weight 1)");
                 for (int k = 0; k < BIAS_POS; k++)
                 {
                     if (!BiasMagnitudeOnly)
@@ -1457,6 +1467,8 @@ static class SmtTranslator
                 if (!BiasMagnitudeOnly)
                     sb.AppendLine($"(assert-soft (not (= (seq.len {seqSym}) 0)) :weight 1)");
                 sb.AppendLine($"(assert-soft (<= (seq.len {seqSym}) {BIAS_LEN}) :weight 2)");
+                if (MinSeqLen > 0)
+                    sb.AppendLine($"(assert-soft (>= (seq.len {seqSym}) {MinSeqLen}) :weight 1)");
                 for (int k = 0; k < BIAS_POS; k++)
                 {
                     if (!BiasMagnitudeOnly)
