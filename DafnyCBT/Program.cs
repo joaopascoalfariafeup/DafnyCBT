@@ -2500,18 +2500,41 @@ class Program
                         }
                     }
 
-                    foreach (var (vname, vtype) in inputs)
+                    // Variable-centric BVA emission deferred: when literal-centric
+                    // is ON (default), the literal-centric block below runs FIRST
+                    // (moved up via the InvokeVariableCentric() helper called
+                    // after that block). When literal-centric is OFF
+                    // (--no-literal-bva), variable-centric is the only Phase 2
+                    // mechanism and runs at its original location.
+                    //
+                    // Why the swap: variable-centric tiers like `/Br=N-1` come
+                    // from a LINEARISED bound of a possibly-nonlinear inequality
+                    // (e.g. `r*r <= N` → linearised as `r <= N`). Emitting them
+                    // first caused the spec-derived `/BL:` tiers to be silently
+                    // subsumed by these linear approximations, hiding the
+                    // structural boundary witnesses (Clover's `r*r = N`
+                    // perfect-square pin reached N=4 directly when the
+                    // literal-centric path went first, vs hidden behind /BN=0,1
+                    // when variable-centric went first). Variable-centric is
+                    // still EMITTED — it adds numeric/relational tiers the
+                    // literal-centric path doesn't reach (e.g. abs's `x=0`/`x=1`
+                    // boundary diversity) — just no longer FIRST.
+                    void InvokeVariableCentricPins()
                     {
-                        if (mutableNames.Contains(vname)) continue; // mutable pre-state handled as post-state below
-                        EmitPins(vname, vtype, BoundaryAnalysis.VarKind.Input);
+                        foreach (var (vname, vtype) in inputs)
+                        {
+                            if (mutableNames.Contains(vname)) continue; // mutable pre-state handled as post-state below
+                            EmitPins(vname, vtype, BoundaryAnalysis.VarKind.Input);
+                        }
+                        foreach (var (vname, vtype) in outputs)
+                            EmitPins(vname, vtype, BoundaryAnalysis.VarKind.Output);
+                        if (mutableFieldsList != null)
+                        {
+                            foreach (var (fname, ftype) in mutableFieldsList)
+                                EmitPins(fname, ftype, BoundaryAnalysis.VarKind.MutablePost);
+                        }
                     }
-                    foreach (var (vname, vtype) in outputs)
-                        EmitPins(vname, vtype, BoundaryAnalysis.VarKind.Output);
-                    if (mutableFieldsList != null)
-                    {
-                        foreach (var (fname, ftype) in mutableFieldsList)
-                            EmitPins(fname, ftype, BoundaryAnalysis.VarKind.MutablePost);
-                    }
+                    if (!LiteralBvaEnabled) InvokeVariableCentricPins();
 
                     // Literal-centric Phase 2 BVA (--literal-bva): scan every relational
                     // post-clause literal `E1 op E2` (op ∈ {<, ≤, >, ≥}) and emit
@@ -2769,6 +2792,15 @@ class Program
                                 clause, fullPreLits, new List<Expression>(), new List<string> { allFlipSmt }, simpleMask, pi));
                             emitted.Add($"{pi}|{ci}|{scLabel}");
                         }
+
+                        // Variable-centric BVA emission, AFTER the literal-centric
+                        // block when literal-centric is enabled. Spec-derived
+                        // `/BL:` tiers therefore appear first in the schedule and
+                        // get the witness slot; variable-centric `/B<varname>=`
+                        // tiers still emit but only solve when not subsumed —
+                        // covering numeric/relational ground the literal-centric
+                        // path doesn't reach (e.g. abs's `x=0`/`x=1` boundary).
+                        InvokeVariableCentricPins();
                     }
                 }
             }
