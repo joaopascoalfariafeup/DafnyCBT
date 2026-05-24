@@ -2653,6 +2653,27 @@ class Program
                             schedule.Add(($"{clauseLabel}/B{strictLabel}",
                                 clause, fullPreLits, new List<Expression>(), new List<string> { $"({strictOp} {leftSmt} {rightSmt})" }, simpleMask, pi));
                             emitted.Add($"{pi}|{ci}|{strictLabel}");
+
+                            // Off-by-one inside-boundary neighbor (NEW).
+                            // For non-strict `<=` / `>=` literals, the boundary
+                            // tier above pins `E1 = E2`; the neighbor pins one
+                            // step inside the asserted region (away from the
+                            // boundary) — `E1 = E2 ± 1`. This is the off-by-one
+                            // detector that the legacy variable-centric path
+                            // contributed via its `=lo+1` / `=hi-1` numeric
+                            // tiers. For strict `<` / `>` literals the
+                            // boundary already IS the just-inside position
+                            // (e.g. `x < N` boundary is `x = N-1`), so no
+                            // additional neighbor is meaningful — skip.
+                            if (bin.Op == BinaryExpr.Opcode.Le || bin.Op == BinaryExpr.Opcode.Ge)
+                            {
+                                var sign = bin.Op == BinaryExpr.Opcode.Le ? "-" : "+";
+                                var nbrLabel = $"L:{litStr}={sign}1";
+                                schedule.Add(($"{clauseLabel}/B{nbrLabel}",
+                                    clause, fullPreLits, new List<Expression>(),
+                                    new List<string> { $"(= {leftSmt} ({sign} {rightSmt} 1))" }, simpleMask, pi));
+                                emitted.Add($"{pi}|{ci}|{nbrLabel}");
+                            }
                         }
 
                         // Chained-relation detection: pairs (L1, L2) where L1 is `LO op1
@@ -2716,6 +2737,32 @@ class Program
                                         clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (= {expSmt} {hiSmt}) ({loCmpOp} {loSmt} {expSmt}))" }, simpleMask, pi));
                                     emitted.Add($"{pi}|{ci}|{hLabel}");
                                 }
+
+                                // Off-by-one inside-boundary neighbors on chains (NEW).
+                                // For `LO ≤ EXP ≤ HI` (or strict variants), emit
+                                // `EXP = LO + 1` and `EXP = HI - 1` — one step
+                                // inside each bound. Catches off-by-one defects
+                                // adjacent to the boundary that the boundary or
+                                // mid tiers miss (e.g. a loop guard wrong by 1
+                                // index near the chain ends). Each tier is
+                                // strengthened with the opposite-end constraint
+                                // for the same structural-distinctness reason as
+                                // the =lo/=hi boundary tiers (so the LO+1 vs
+                                // LO+2 collapse doesn't happen when LO+1 = HI).
+                                // Skipped when the literal's own strictness makes
+                                // the neighbor land on the boundary (e.g. `LO <
+                                // EXP`: LO+1 IS the boundary already emitted by
+                                // the literal-level /BL:LO<EXP= tier).
+                                var loNbrLabel = $"{rangeLabel}/=lo+1";
+                                var hiNbrLabel = $"{rangeLabel}/=hi-1";
+                                schedule.Add(($"{clauseLabel}/B{loNbrLabel}",
+                                    clause, fullPreLits, new List<Expression>(),
+                                    new List<string> { $"(and (= {expSmt} (+ {loSmt} 1)) ({hiCmpOp} {expSmt} {hiSmt}))" }, simpleMask, pi));
+                                emitted.Add($"{pi}|{ci}|{loNbrLabel}");
+                                schedule.Add(($"{clauseLabel}/B{hiNbrLabel}",
+                                    clause, fullPreLits, new List<Expression>(),
+                                    new List<string> { $"(and (= {expSmt} (- {hiSmt} 1)) ({loCmpOp} {loSmt} {expSmt}))" }, simpleMask, pi));
+                                emitted.Add($"{pi}|{ci}|{hiNbrLabel}");
                             }
                         }
 
