@@ -2644,15 +2644,34 @@ class Program
                                 continue;
                             }
 
-                            var eqLabel = $"L:{litStr}=";
-                            var strictOp = (bin.Op == BinaryExpr.Opcode.Ge || bin.Op == BinaryExpr.Opcode.Gt) ? ">" : "<";
-                            var strictLabel = $"L:{litStr}{strictOp}";
-                            schedule.Add(($"{clauseLabel}/B{eqLabel}",
-                                clause, fullPreLits, new List<Expression>(), new List<string> { $"(= {leftSmt} {rightSmt})" }, simpleMask, pi));
-                            emitted.Add($"{pi}|{ci}|{eqLabel}");
-                            schedule.Add(($"{clauseLabel}/B{strictLabel}",
-                                clause, fullPreLits, new List<Expression>(), new List<string> { $"({strictOp} {leftSmt} {rightSmt})" }, simpleMask, pi));
-                            emitted.Add($"{pi}|{ci}|{strictLabel}");
+                            // Skip the boundary + strict-companion tiers for STRICT literals
+                            // (`<` / `>`) in this non-substitution path: the literal is already
+                            // asserted in the clause, so:
+                            //   - boundary `(= E1 E2)` contradicts the strict assertion → UNSAT
+                            //     (and would just cost a Z3 call to be skipped at solve time);
+                            //   - strict-companion `(op E1 E2)` is the literal itself → emits the
+                            //     same SAT region as Phase 1's /Rel query, no narrowing.
+                            // For non-strict literals (`<=` / `>=`) both tiers are useful (the
+                            // boundary pins the inclusive endpoint, the strict-companion picks
+                            // the strict interior). The `/BLsub:` input-only-substitution path
+                            // above already handles strict literals correctly — it REMOVES the
+                            // original literal and substitutes a new region in its place, so
+                            // the boundary case becomes reachable. (Same insight as the
+                            // off-by-one neighbor below: strict literals' boundary is already
+                            // the just-inside position.)
+                            bool isStrict = bin.Op == BinaryExpr.Opcode.Lt || bin.Op == BinaryExpr.Opcode.Gt;
+                            if (!isStrict)
+                            {
+                                var eqLabel = $"L:{litStr}=";
+                                var strictOp = bin.Op == BinaryExpr.Opcode.Ge ? ">" : "<";
+                                var strictLabel = $"L:{litStr}{strictOp}";
+                                schedule.Add(($"{clauseLabel}/B{eqLabel}",
+                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"(= {leftSmt} {rightSmt})" }, simpleMask, pi));
+                                emitted.Add($"{pi}|{ci}|{eqLabel}");
+                                schedule.Add(($"{clauseLabel}/B{strictLabel}",
+                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"({strictOp} {leftSmt} {rightSmt})" }, simpleMask, pi));
+                                emitted.Add($"{pi}|{ci}|{strictLabel}");
+                            }
 
                             // Off-by-one inside-boundary neighbor (NEW).
                             // For non-strict `<=` / `>=` literals, the boundary
