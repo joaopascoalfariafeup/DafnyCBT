@@ -28,6 +28,16 @@ class Program
     public static bool PreSatCheckEnabled = false;
     public static bool ReverseBvaOrder = false;
     public static bool LiteralBvaEnabled = true;
+    // Off-by-one inside-boundary neighbor tiers in Phase 2 literal-centric BVA.
+    // Default OFF for uniform "3 tiers per discriminating partition" semantics
+    // (matches existential boundary): per-literal emits 2 tiers (boundary +
+    // strict-companion), chain emits 3 (=lo + =hi + mid). With the flag ON,
+    // the off-by-one neighbor tiers re-enable (=±1 per literal, =lo+1 / =hi-1
+    // per chain) — the previous default. Useful for off-by-one-heavy corpora
+    // (LVR / VER fault clusters) where the explicit neighbor witness drives
+    // Z3 to a model away from the boundary that the strict-companion's
+    // model-minimisation bias might otherwise miss.
+    public static bool BvaNeighborsEnabled = false;
     // Unroll depth for recursive functions during spec inlining. Default 1
     // (one level of substitution; residual recursive calls fall back to a
     // type-correct uninterpreted stub). Higher values fully unroll linear
@@ -150,6 +160,8 @@ class Program
             "Deprecated. Literal-centric Phase 2 BVA is now the default; this flag is a no-op. Use --no-literal-bva / -nlbva to opt out.");
         literalBvaOpt.AddAlias("-lbva");
         literalBvaOpt.IsHidden = true;
+        var bvaNeighborsOpt = new Option<bool>("--bva-neighbors",
+            "Phase 2 literal-centric BVA: also emit the off-by-one inside-boundary neighbor tiers (`= bound ± 1` per literal, `= lo+1` / `= hi-1` per chain). Default OFF — Phase 2 emits 2 per-literal tiers (boundary + strict-companion) and 3 chain tiers (`=lo` / `=hi` / `mid`), uniform with existential boundary's 3-tier count. ON re-enables the previous behaviour: explicit just-inside-boundary witnesses driving Z3 away from the strict-companion's model-minimised default. Useful on off-by-one-heavy corpora (LVR / VER fault clusters).");
         var seedOpt = new Option<int?>("--seed",
             "Force a fixed Z3 random seed for every SMT query, overriding the per-method name hash and bypassing the --no-bias / skipBias gating. Useful for reproducibility experiments and seed-sensitivity studies. When omitted, the usual per-method deterministic seed is used (but only when bias is on).");
         var relevanceModeOpt = new Option<string>("--relevance-mode", () => "ladder",
@@ -168,7 +180,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, boundedFoldOpt, minSeqLenOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, boundedFoldOpt, minSeqLenOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -232,6 +244,7 @@ class Program
             if (ReverseBvaOrder)
                 Console.WriteLine("[DafnyCBT] BVA order: Phase 2b → Phase 2 (reversed)");
             LiteralBvaEnabled = !ctx.ParseResult.GetValueForOption(noLiteralBvaOpt);
+            BvaNeighborsEnabled = ctx.ParseResult.GetValueForOption(bvaNeighborsOpt);
             if (!LiteralBvaEnabled)
                 Console.WriteLine("[DafnyCBT] Phase 2 BVA: variable-centric (legacy — literal-centric disabled)");
             SmtTranslator.ForcedSeed = ctx.ParseResult.GetValueForOption(seedOpt);
@@ -2694,12 +2707,18 @@ class Program
                                 // Off-by-one inside-boundary neighbor: one step further inside
                                 // from the effective bound. Catches LVR/VER faults replacing
                                 // `E1` with `E1±1` and ROR-induced shifts of one step.
-                                var nbrSign = isUpperBoundLit ? "-" : "+";
-                                var nbrLabel = $"L:{litStr}={nbrSign}{(isStrict ? 2 : 1)}";
-                                schedule.Add(($"{clauseLabel}/B{nbrLabel}",
-                                    clause, fullPreLits, new List<Expression>(),
-                                    new List<string> { $"(= {leftSmt} ({nbrSign} {bound} 1))" }, simpleMask, pi));
-                                emitted.Add($"{pi}|{ci}|{nbrLabel}");
+                                // Gated by --bva-neighbors (default OFF) to keep Phase 2's
+                                // per-literal tier count at 2 (boundary + strict-companion),
+                                // uniform with existential boundary tiers.
+                                if (BvaNeighborsEnabled)
+                                {
+                                    var nbrSign = isUpperBoundLit ? "-" : "+";
+                                    var nbrLabel = $"L:{litStr}={nbrSign}{(isStrict ? 2 : 1)}";
+                                    schedule.Add(($"{clauseLabel}/B{nbrLabel}",
+                                        clause, fullPreLits, new List<Expression>(),
+                                        new List<string> { $"(= {leftSmt} ({nbrSign} {bound} 1))" }, simpleMask, pi));
+                                    emitted.Add($"{pi}|{ci}|{nbrLabel}");
+                                }
                             }
                         }
 
@@ -2780,16 +2799,19 @@ class Program
                                 // the neighbor land on the boundary (e.g. `LO <
                                 // EXP`: LO+1 IS the boundary already emitted by
                                 // the literal-level /BL:LO<EXP= tier).
-                                var loNbrLabel = $"{rangeLabel}/=lo+1";
-                                var hiNbrLabel = $"{rangeLabel}/=hi-1";
-                                schedule.Add(($"{clauseLabel}/B{loNbrLabel}",
-                                    clause, fullPreLits, new List<Expression>(),
-                                    new List<string> { $"(and (= {expSmt} (+ {loSmt} 1)) ({hiCmpOp} {expSmt} {hiSmt}))" }, simpleMask, pi));
-                                emitted.Add($"{pi}|{ci}|{loNbrLabel}");
-                                schedule.Add(($"{clauseLabel}/B{hiNbrLabel}",
-                                    clause, fullPreLits, new List<Expression>(),
-                                    new List<string> { $"(and (= {expSmt} (- {hiSmt} 1)) ({loCmpOp} {loSmt} {expSmt}))" }, simpleMask, pi));
-                                emitted.Add($"{pi}|{ci}|{hiNbrLabel}");
+                                if (BvaNeighborsEnabled)
+                                {
+                                    var loNbrLabel = $"{rangeLabel}/=lo+1";
+                                    var hiNbrLabel = $"{rangeLabel}/=hi-1";
+                                    schedule.Add(($"{clauseLabel}/B{loNbrLabel}",
+                                        clause, fullPreLits, new List<Expression>(),
+                                        new List<string> { $"(and (= {expSmt} (+ {loSmt} 1)) ({hiCmpOp} {expSmt} {hiSmt}))" }, simpleMask, pi));
+                                    emitted.Add($"{pi}|{ci}|{loNbrLabel}");
+                                    schedule.Add(($"{clauseLabel}/B{hiNbrLabel}",
+                                        clause, fullPreLits, new List<Expression>(),
+                                        new List<string> { $"(and (= {expSmt} (- {hiSmt} 1)) ({loCmpOp} {loSmt} {expSmt}))" }, simpleMask, pi));
+                                    emitted.Add($"{pi}|{ci}|{hiNbrLabel}");
+                                }
                             }
                         }
 
@@ -2867,14 +2889,15 @@ class Program
                             emitted.Add($"{pi}|{ci}|{scLabel}");
                         }
 
-                        // Variable-centric BVA emission, AFTER the literal-centric
-                        // block when literal-centric is enabled. Spec-derived
-                        // `/BL:` tiers therefore appear first in the schedule and
-                        // get the witness slot; variable-centric `/B<varname>=`
-                        // tiers still emit but only solve when not subsumed —
-                        // covering numeric/relational ground the literal-centric
-                        // path doesn't reach (e.g. abs's `x=0`/`x=1` boundary).
-                        InvokeVariableCentricPins();
+                        // Variable-centric BVA is now strictly legacy: only fires
+                        // when literal-centric is disabled (`--no-literal-bva` —
+                        // handled at the top of EmitPhase2Entries). With
+                        // literal-centric ON (default), Phase 2 emits only the
+                        // literal-centric tiers (+ optional neighbors via
+                        // `--bva-neighbors`); specific-value coverage of bare
+                        // variables falls to Phase 2b's categorical tiers
+                        // (`/Ox=0,1,2,>=3`). This single-mechanism architecture
+                        // means literal-centric is the canonical Phase 2.
                     }
                 }
             }
