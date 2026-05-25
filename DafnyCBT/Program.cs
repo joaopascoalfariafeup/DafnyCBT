@@ -2644,53 +2644,61 @@ class Program
                                 continue;
                             }
 
-                            // Skip the boundary + strict-companion tiers for STRICT literals
-                            // (`<` / `>`) in this non-substitution path: the literal is already
-                            // asserted in the clause, so:
-                            //   - boundary `(= E1 E2)` contradicts the strict assertion → UNSAT
-                            //     (and would just cost a Z3 call to be skipped at solve time);
-                            //   - strict-companion `(op E1 E2)` is the literal itself → emits the
-                            //     same SAT region as Phase 1's /Rel query, no narrowing.
-                            // For non-strict literals (`<=` / `>=`) both tiers are useful (the
-                            // boundary pins the inclusive endpoint, the strict-companion picks
-                            // the strict interior). The `/BLsub:` input-only-substitution path
-                            // above already handles strict literals correctly — it REMOVES the
-                            // original literal and substitutes a new region in its place, so
-                            // the boundary case becomes reachable. (Same insight as the
-                            // off-by-one neighbor below: strict literals' boundary is already
-                            // the just-inside position.)
+                            // Uniform treatment: normalize strict `<` / `>` to non-strict
+                            // form via the integer-typed identity `X < Y ≡ X ≤ Y-1`
+                            // (and `X > Y ≡ X ≥ Y+1`). Then emit the same three tiers
+                            // against the *effective* (possibly shifted) bound:
+                            //   - boundary       `X = bound`             (inclusive endpoint)
+                            //   - strict-companion `X < bound`  / `X > bound`  (strict interior)
+                            //   - off-by-one neighbor `X = bound ∓ 1`    (one step inside, away from boundary)
+                            // For `<= / >=`: bound = E2, no shift.
+                            // For `< / >`  : bound = E2 ∓ 1 (the integer-boundary).
+                            // Gated to integer-typed literals (int/nat/char/enum), since for
+                            // real-typed strict literals there is no integer step to shift
+                            // by and the SMT `(- E2 1)` would be type-mismatched against a
+                            // real-valued expression. The current shape of `bin.E0` /
+                            // `bin.E1` types is checked for "real"; everything else is
+                            // assumed Int-encoded in our SMT (the standard encoding).
+                            var leftTypeStr  = (bin.E0?.Type?.ToString() ?? "").Trim();
+                            var rightTypeStr = (bin.E1?.Type?.ToString() ?? "").Trim();
+                            bool eitherReal = leftTypeStr == "real" || rightTypeStr == "real";
                             bool isStrict = bin.Op == BinaryExpr.Opcode.Lt || bin.Op == BinaryExpr.Opcode.Gt;
-                            if (!isStrict)
+                            bool emitTiers = !isStrict || !eitherReal;
+                            if (emitTiers)
                             {
-                                var eqLabel = $"L:{litStr}=";
-                                var strictOp = bin.Op == BinaryExpr.Opcode.Ge ? ">" : "<";
-                                var strictLabel = $"L:{litStr}{strictOp}";
+                                // The effective bound (possibly shifted by ±1 for strict integer ops):
+                                //   <=  → bound = rightSmt          ;  neighbor = (- bound 1)
+                                //   <   → bound = (- rightSmt 1)    ;  neighbor = (- bound 1) = (- rightSmt 2)
+                                //   >=  → bound = rightSmt          ;  neighbor = (+ bound 1)
+                                //   >   → bound = (+ rightSmt 1)    ;  neighbor = (+ bound 1) = (+ rightSmt 2)
+                                bool isUpperBoundLit = bin.Op == BinaryExpr.Opcode.Le || bin.Op == BinaryExpr.Opcode.Lt;
+                                string bound = isStrict
+                                    ? (isUpperBoundLit ? $"(- {rightSmt} 1)" : $"(+ {rightSmt} 1)")
+                                    : rightSmt;
+                                // Boundary labels carry a `-1` / `+1` shift marker so they don't
+                                // collide with the non-strict literal's own boundary key when
+                                // both literals appear in the same clause (rare but possible).
+                                var shiftLabelTag = isStrict ? (isUpperBoundLit ? "-1" : "+1") : "";
+                                var eqLabel = $"L:{litStr}={shiftLabelTag}";
                                 schedule.Add(($"{clauseLabel}/B{eqLabel}",
-                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"(= {leftSmt} {rightSmt})" }, simpleMask, pi));
+                                    clause, fullPreLits, new List<Expression>(),
+                                    new List<string> { $"(= {leftSmt} {bound})" }, simpleMask, pi));
                                 emitted.Add($"{pi}|{ci}|{eqLabel}");
+                                // Strict-companion against the (possibly shifted) bound.
+                                var strictOp = isUpperBoundLit ? "<" : ">";
+                                var strictLabel = $"L:{litStr}{strictOp}{shiftLabelTag}";
                                 schedule.Add(($"{clauseLabel}/B{strictLabel}",
-                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"({strictOp} {leftSmt} {rightSmt})" }, simpleMask, pi));
+                                    clause, fullPreLits, new List<Expression>(),
+                                    new List<string> { $"({strictOp} {leftSmt} {bound})" }, simpleMask, pi));
                                 emitted.Add($"{pi}|{ci}|{strictLabel}");
-                            }
-
-                            // Off-by-one inside-boundary neighbor (NEW).
-                            // For non-strict `<=` / `>=` literals, the boundary
-                            // tier above pins `E1 = E2`; the neighbor pins one
-                            // step inside the asserted region (away from the
-                            // boundary) — `E1 = E2 ± 1`. This is the off-by-one
-                            // detector that the legacy variable-centric path
-                            // contributed via its `=lo+1` / `=hi-1` numeric
-                            // tiers. For strict `<` / `>` literals the
-                            // boundary already IS the just-inside position
-                            // (e.g. `x < N` boundary is `x = N-1`), so no
-                            // additional neighbor is meaningful — skip.
-                            if (bin.Op == BinaryExpr.Opcode.Le || bin.Op == BinaryExpr.Opcode.Ge)
-                            {
-                                var sign = bin.Op == BinaryExpr.Opcode.Le ? "-" : "+";
-                                var nbrLabel = $"L:{litStr}={sign}1";
+                                // Off-by-one inside-boundary neighbor: one step further inside
+                                // from the effective bound. Catches LVR/VER faults replacing
+                                // `E1` with `E1±1` and ROR-induced shifts of one step.
+                                var nbrSign = isUpperBoundLit ? "-" : "+";
+                                var nbrLabel = $"L:{litStr}={nbrSign}{(isStrict ? 2 : 1)}";
                                 schedule.Add(($"{clauseLabel}/B{nbrLabel}",
                                     clause, fullPreLits, new List<Expression>(),
-                                    new List<string> { $"(= {leftSmt} ({sign} {rightSmt} 1))" }, simpleMask, pi));
+                                    new List<string> { $"(= {leftSmt} ({nbrSign} {bound} 1))" }, simpleMask, pi));
                                 emitted.Add($"{pi}|{ci}|{nbrLabel}");
                             }
                         }
