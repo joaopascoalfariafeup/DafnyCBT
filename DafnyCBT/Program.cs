@@ -2795,12 +2795,17 @@ class Program
                                 var loCmpOp = strictLo ? "<" : "<=";
                                 var expLabel = DnfEngine.ExprToString(b1.E1);
                                 var rangeLabel = $"L:{DnfEngine.ExprToString(b1.E0)}{(strictLo ? "<" : "<=")}{expLabel}{(strictHi ? "<" : "<=")}{DnfEngine.ExprToString(b2.E1)}";
-                                // mid: strictly-inside (uses ORIGINAL bounds with strict
-                                // comparison — no shift needed because mid is the strict
-                                // interior of the literal-level bounds).
+                                // mid: strictly between the *effective* bounds, so the
+                                // tier doesn't collapse to =lo or =hi when the range is
+                                // small. For `0 ≤ i < a.Length` (strict upper, integer)
+                                // with a.Length=2: effHi = a.Length - 1 = 1, so mid is
+                                // `0 < i < 1` — UNSAT, correctly excludes the
+                                // degenerate case where the only "interior" position is
+                                // already the =hi position (a.Length must be ≥ 3 for a
+                                // real interior to exist).
                                 var midLabel = $"{rangeLabel}/mid";
                                 schedule.Add(($"{clauseLabel}/B{midLabel}",
-                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (> {expSmt} {loSmt}) (< {expSmt} {hiSmt}))" }, simpleMask, pi));
+                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (> {expSmt} {effLo}) (< {expSmt} {effHi}))" }, simpleMask, pi));
                                 emitted.Add($"{pi}|{ci}|{midLabel}");
                                 // =lo: EXP = effLo, with opposite-end constraint EXP op HI.
                                 // For integer strict-lo, effLo = LO+1, so this is the
