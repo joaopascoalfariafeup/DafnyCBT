@@ -2631,31 +2631,23 @@ class Program
                                 _ => "?"
                             })}{DnfEngine.ExprToString(bin.E1)}";
 
-                            // Mutation-aware boundary for an input-only relational
-                            // literal that occurs in (not just alongside) the
-                            // post-DNF clause: replace it with each of the three
-                            // regions `< / == / >`, keeping every OTHER literal of
-                            // the clause. This is what kills ROR `>=`→`==` (and
-                            // `<=`→`==`): the discriminating input is the clause's
-                            // own region with the relational literal crossed to
-                            // the far side of the boundary, which a same-side
-                            // strict pin conjoined onto the unmodified clause can
-                            // never reach (it would be UNSAT against the clause's
-                            // own copy of the literal, or land on a sibling clause
-                            // whose other disjuncts mask the comparison).
-                            if (!isPre && LitIsInputOnly(bin))
-                            {
-                                var clauseSansBin = clause.Where(l => !ReferenceEquals(Unwrap(l), bin)).ToList();
-                                foreach (var (sym, smtOp) in new[] { ("<", "<"), ("=", "="), (">", ">") })
-                                {
-                                    var rl = $"Lsub:{litStr}{sym}";
-                                    if (!emitted.Add($"{pi}|{ci}|{rl}")) continue;
-                                    schedule.Add(($"{clauseLabel}/B{rl}",
-                                        clauseSansBin, fullPreLits, new List<Expression>(),
-                                        new List<string> { $"({smtOp} {leftSmt} {rightSmt})" }, simpleMask, pi));
-                                }
-                                continue;
-                            }
+                            // Phase 2 emits only constraint-NARROWING tiers within
+                            // each existing DNF clause. The legacy BLsub: substitution
+                            // path (which removed an input-only literal from the clause
+                            // and substituted a different region in its place) was
+                            // removed: the substituted clause is a SYNTHETIC region
+                            // outside the spec's natural DNF partition — the remaining
+                            // literals were derived under the assumption of the
+                            // substituted literal's polarity (e.g. `y == x` in clause
+                            // `x > 0 ∧ y == x` is the consequent of the original
+                            // `x > 0 ⇒ y == x` implication). Substituting `x > 0` with
+                            // `x < 0` while keeping `y == x` produces input/output
+                            // pairs the spec never validates (e.g. `x=-9, y=-9` for
+                            // abs), which then masks faults under alt-enum's disjunctive
+                            // expect. Mutation-detection coverage that the BLsub path
+                            // claimed is provided by Phase 1's `/Rel` for each DNF
+                            // clause plus Phase 2's non-substitution tiers — both stay
+                            // strictly inside the spec.
 
                             // Uniform treatment: normalize strict `<` / `>` to non-strict
                             // form via the integer-typed identity `X < Y ≡ X ≤ Y-1`
