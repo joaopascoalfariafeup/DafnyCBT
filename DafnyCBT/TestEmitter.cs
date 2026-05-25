@@ -1834,6 +1834,15 @@ static class TestEmitter
                 // (so it can't actually be compiled), the emitted `expect` will fail at
                 // build time and the test will be classified as syntax/type error — same
                 // outcome as today's silent skip, but with the diagnostic visible.
+                // Substitute the method's formal type-parameter names with
+                // their concrete instantiations from typeParamMap (e.g.
+                // `Candidate` → `int` when MajorityVote is instantiated for
+                // an int element type). DnfEngine.ExprToString preserves the
+                // resolved-AST's type-arg names, so without this rewrite the
+                // emitted `expect HasMajority<Candidate>(...)` references a
+                // formal type-param that isn't in scope in the test method
+                // and Dafny rejects with a syntax/type error.
+                preStr = ApplyTypeParamMap(preStr, typeParamMap);
                 bool hasQuantifier = Regex.IsMatch(preStr, @"\b(exists|forall)\b");
                 if (hasQuantifier)
                 {
