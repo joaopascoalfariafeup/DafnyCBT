@@ -2601,9 +2601,12 @@ class Program
                         // Return-output names: a relational literal that mentions
                         // none of them is "input-only" — it constrains only the
                         // input region (inputs / consts / `old(...)` pre-state),
-                        // even when it syntactically sits in a postcondition.
-                        // (Used for legacy BLsub substitution — removed; the
-                        // helper is kept for potential future use.)
+                        // even when it syntactically sits in a postcondition
+                        // (e.g. car_park's `old(|carPark|) >= normalSpaces -
+                        // badParkingBuffer`). For such a literal the three
+                        // boundary regions can be obtained by SUBSTITUTING the
+                        // literal in its own clause rather than conjoining a pin
+                        // onto the unmodified clause.
                         var retNames = outputs.Select(o => o.Name).ToList();
                         bool LitIsInputOnly(BinaryExpr b)
                         {
@@ -2611,42 +2614,11 @@ class Program
                             return !retNames.Any(n => Regex.IsMatch(s, $@"\b{Regex.Escape(n)}\b"));
                         }
 
-                        // Pre-scan: identify literals that are part of a detected
-                        // chain `LO op1 EXP op2 HI`. Their per-literal tiers are
-                        // strictly subsumed by the chain's `=lo`/`=hi`/`mid` tiers
-                        // (which carry the opposite-end constraint and prevent the
-                        // tier-collapse that per-literal tiers alone allow). So
-                        // we skip per-literal emission for chain-constituent
-                        // literals. The chain emission loop below populates
-                        // `chainLiterals` as it identifies pairs.
-                        bool IsLeOrLtPre(BinaryExpr.Opcode op) =>
-                            op == BinaryExpr.Opcode.Le || op == BinaryExpr.Opcode.Lt;
-                        var chainLiterals = new HashSet<BinaryExpr>();
-                        for (int li = 0; li < rels.Count; li++)
-                        {
-                            var (b1, _) = rels[li];
-                            if (!IsLeOrLtPre(b1.Op)) continue;
-                            var l1Rhs = DnfEngine.ExprToString(b1.E1);
-                            for (int lj = 0; lj < rels.Count; lj++)
-                            {
-                                if (li == lj) continue;
-                                var (b2, _) = rels[lj];
-                                if (!IsLeOrLtPre(b2.Op)) continue;
-                                if (l1Rhs != DnfEngine.ExprToString(b2.E0)) continue;
-                                chainLiterals.Add(b1);
-                                chainLiterals.Add(b2);
-                            }
-                        }
-
                         // Per-literal: boundary + strict-companion. The strict-companion
                         // direction depends on the relation: `≥`/`>` → strictly-above,
-                        // `≤`/`<` → strictly-below. Literals identified as part of a
-                        // detected chain above are skipped — their per-literal tiers
-                        // are strictly subsumed by the chain's `=lo`/`=hi`/`mid` tiers
-                        // (which carry the opposite-end constraint).
+                        // `≤`/`<` → strictly-below.
                         foreach (var (bin, isPre) in rels)
                         {
-                            if (chainLiterals.Contains(bin)) continue;
                             var leftSmt = TranslateExpr(bin.E0, !isPre);
                             var rightSmt = TranslateExpr(bin.E1, !isPre);
                             if (leftSmt == null || rightSmt == null) continue;
@@ -2772,54 +2744,35 @@ class Program
                                 var expSmt = TranslateExpr(b1.E1, postCtx: true);
                                 var hiSmt = TranslateExpr(b2.E1, postCtx: true);
                                 if (loSmt == null || expSmt == null || hiSmt == null) continue;
-                                // Integer-only gate for the shifted-bound emission: strict
-                                // bounds normalize via `LO < EXP ≡ LO+1 ≤ EXP` (and `EXP < HI
-                                // ≡ EXP ≤ HI-1`) only when the comparand is integer-typed.
-                                // For real-typed chains, fall back to the non-shifted emission
-                                // (skip the =hi when strict upper, =lo when strict lower —
-                                // same as the previous behaviour).
-                                var loType  = (b1.E0?.Type?.ToString() ?? "").Trim();
-                                var expType = (b1.E1?.Type?.ToString() ?? "").Trim();
-                                var hiType  = (b2.E1?.Type?.ToString() ?? "").Trim();
-                                bool anyReal = loType == "real" || expType == "real" || hiType == "real";
-                                // Effective bounds: shift by ±1 for strict integer chains so
-                                // =lo / =hi can be emitted symmetrically. For real-typed
-                                // chains, no shift and the previous skip-on-strict logic
-                                // applies.
-                                string effLo = (strictLo && !anyReal) ? $"(+ {loSmt} 1)" : loSmt;
-                                string effHi = (strictHi && !anyReal) ? $"(- {hiSmt} 1)" : hiSmt;
-                                // Comparison op used in the opposite-end constraint:
-                                //   strict   → `<` (the original spec literal's strictness)
-                                //   non-strict → `<=`
-                                var hiCmpOp = strictHi ? "<" : "<=";
-                                var loCmpOp = strictLo ? "<" : "<=";
                                 var expLabel = DnfEngine.ExprToString(b1.E1);
                                 var rangeLabel = $"L:{DnfEngine.ExprToString(b1.E0)}{(strictLo ? "<" : "<=")}{expLabel}{(strictHi ? "<" : "<=")}{DnfEngine.ExprToString(b2.E1)}";
-                                // mid: strictly-inside (uses ORIGINAL bounds with strict
-                                // comparison — no shift needed because mid is the strict
-                                // interior of the literal-level bounds).
+                                // mid: strictly-inside.
                                 var midLabel = $"{rangeLabel}/mid";
                                 schedule.Add(($"{clauseLabel}/B{midLabel}",
                                     clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (> {expSmt} {loSmt}) (< {expSmt} {hiSmt}))" }, simpleMask, pi));
                                 emitted.Add($"{pi}|{ci}|{midLabel}");
-                                // =lo: EXP = effLo, with opposite-end constraint EXP op HI.
-                                // For integer strict-lo, effLo = LO+1, so this is the
-                                // "just-inside the strict lower bound" tier — the natural
-                                // integer boundary. For real strict-lo, effLo = LO and the
-                                // tier is skipped (would be UNSAT against `LO < EXP`).
-                                if (!strictLo || !anyReal)
+                                // Boundary EXP=LO (only when L1 is non-strict; for `LO <
+                                // EXP`, EXP=LO is UNSAT given the precondition). Strengthen
+                                // with `EXP < HI` (or `EXP <= HI` if L2 is non-strict)
+                                // so the boundary tier is structurally distinct from the
+                                // EXP=HI tier even when LO == HI is satisfiable — without
+                                // this strengthening Z3 may pick the degenerate single-point
+                                // model (LO == EXP == HI) that satisfies both =lo and =hi
+                                // tiers identically, defeating boundary diversity.
+                                var hiCmpOp = strictHi ? "<" : "<=";
+                                var loCmpOp = strictLo ? "<" : "<=";
+                                if (!strictLo)
                                 {
                                     var lLabel = $"{rangeLabel}/=lo";
                                     schedule.Add(($"{clauseLabel}/B{lLabel}",
-                                        clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (= {expSmt} {effLo}) ({hiCmpOp} {expSmt} {hiSmt}))" }, simpleMask, pi));
+                                        clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (= {expSmt} {loSmt}) ({hiCmpOp} {expSmt} {hiSmt}))" }, simpleMask, pi));
                                     emitted.Add($"{pi}|{ci}|{lLabel}");
                                 }
-                                // =hi: EXP = effHi, symmetric with =lo.
-                                if (!strictHi || !anyReal)
+                                if (!strictHi)
                                 {
                                     var hLabel = $"{rangeLabel}/=hi";
                                     schedule.Add(($"{clauseLabel}/B{hLabel}",
-                                        clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (= {expSmt} {effHi}) ({loCmpOp} {loSmt} {expSmt}))" }, simpleMask, pi));
+                                        clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (= {expSmt} {hiSmt}) ({loCmpOp} {loSmt} {expSmt}))" }, simpleMask, pi));
                                     emitted.Add($"{pi}|{ci}|{hLabel}");
                                 }
 
