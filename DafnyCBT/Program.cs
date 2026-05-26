@@ -2788,18 +2788,11 @@ class Program
                                 // applies.
                                 string effLo = (strictLo && !anyReal) ? $"(+ {loSmt} 1)" : loSmt;
                                 string effHi = (strictHi && !anyReal) ? $"(- {hiSmt} 1)" : hiSmt;
-                                // Opposite-end comparison op: ALWAYS strict (`<`),
-                                // regardless of the literal's own strictness. The
-                                // strictness is what prevents =lo and =hi from
-                                // collapsing to the same model in degenerate cases
-                                // (e.g. for `0 ≤ i ≤ HI`, if HI=0 then i=0 satisfies
-                                // both =lo (i=0 ∧ 0≤i≤HI) and =hi (i=HI=0 ∧ 0≤i)
-                                // identically under a non-strict opposite-end —
-                                // forcing the strict opposite-end `i < HI` on =lo
-                                // and `0 < i` on =hi keeps them distinct whenever
-                                // the range can be widened by ≥1 unit).
-                                var hiCmpOp = "<";
-                                var loCmpOp = "<";
+                                // Comparison op used in the opposite-end constraint:
+                                //   strict   → `<` (the original spec literal's strictness)
+                                //   non-strict → `<=`
+                                var hiCmpOp = strictHi ? "<" : "<=";
+                                var loCmpOp = strictLo ? "<" : "<=";
                                 var expLabel = DnfEngine.ExprToString(b1.E1);
                                 var rangeLabel = $"L:{DnfEngine.ExprToString(b1.E0)}{(strictLo ? "<" : "<=")}{expLabel}{(strictHi ? "<" : "<=")}{DnfEngine.ExprToString(b2.E1)}";
                                 // mid: strictly between the *effective* bounds, so the
