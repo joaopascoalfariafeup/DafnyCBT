@@ -76,6 +76,42 @@ static class SmtTranslator
     public static bool DropPostWfGuards = true;
     // Tracks bound variables from quantifiers to suppress WF guards that reference them
     internal static HashSet<string> _boundVars = new();
+    // Shadow-depth counter per source name. Incremented when a binder with that
+    // name is entered, decremented when exited. depth>0 at entry signals that an
+    // outer binder already uses this name, so the new one must be alpha-renamed
+    // to avoid SMT-LIB scope collision (e.g. `exists i :: forall i :: i < i`,
+    // where the inner forall's name collides with the outer existential's).
+    internal static Dictionary<string, int> _boundVarShadowDepth = new();
+    // IVariable identity → SMT emit name for the currently-active binder.
+    // Consulted by IdentifierExpr/NameSegment emission to disambiguate references
+    // when shadowing occurred.
+    internal static Dictionary<IVariable, string> _boundVarSmtName = new();
+
+    /// <summary>
+    /// Register a binder. Returns the SMT name to emit for this bound variable.
+    /// If the source name collides with an outer in-scope binder, mints a fresh
+    /// name (`<name>_s<depth>`). Caller must pair with ExitBoundVar.
+    /// </summary>
+    internal static string EnterBoundVar(BoundVar bv)
+    {
+        _boundVarShadowDepth.TryGetValue(bv.Name, out int depth);
+        string smt = depth == 0 ? bv.Name : $"{bv.Name}_s{depth}";
+        _boundVarShadowDepth[bv.Name] = depth + 1;
+        _boundVarSmtName[bv] = smt;
+        _boundVars.Add(bv.Name);
+        return smt;
+    }
+
+    /// <summary>Undo EnterBoundVar — pop shadow depth and remove the IVariable mapping.</summary>
+    internal static void ExitBoundVar(BoundVar bv)
+    {
+        _boundVarSmtName.Remove(bv);
+        if (_boundVarShadowDepth.TryGetValue(bv.Name, out int depth))
+        {
+            if (depth <= 1) { _boundVarShadowDepth.Remove(bv.Name); _boundVars.Remove(bv.Name); }
+            else _boundVarShadowDepth[bv.Name] = depth - 1;
+        }
+    }
     // Tracks uninterpreted functions discovered during expression translation
     internal static Dictionary<string, int> _uninterpFuncs = new();
     // Program-scoped function signatures: name → (SMT arg sorts, SMT return sort).
@@ -2103,6 +2139,11 @@ static class SmtTranslator
             // in the SMT preamble (see emitConstDecls), so the SMT name == const name.
             if (_constInlines.ContainsKey(idExpr.Name))
                 return idExpr.Name;
+            // Shadow-resolved binder: if this IdentifierExpr's Var is a bound var
+            // with an alpha-renamed SMT name, use it. Avoids collision when an
+            // inner quantifier shadows an outer-binder source name.
+            if (idExpr.Var != null && _boundVarSmtName.TryGetValue(idExpr.Var, out var shadowed))
+                return shadowed;
             return RenameMutable(idExpr.Name, mutableNames, isPostContext, insideOld);
         }
         if (expr is NameSegment nameExpr)
@@ -2112,6 +2153,12 @@ static class SmtTranslator
                 return enumInfo.ordinal.ToString();
             if (_constInlines.ContainsKey(nameExpr.Name))
                 return nameExpr.Name;
+            // If the NameSegment resolved to an IdentifierExpr for a shadowed
+            // bound var, consult the shadow map.
+            if (UnwrapExpr(nameExpr) is IdentifierExpr resolvedId
+                && resolvedId.Var != null
+                && _boundVarSmtName.TryGetValue(resolvedId.Var, out var shadowedNs))
+                return shadowedNs;
             return RenameMutable(nameExpr.Name, mutableNames, isPostContext, insideOld);
         }
 
@@ -2236,16 +2283,18 @@ static class SmtTranslator
             var quantExpr = (QuantifierExpr)expr;
             var quantifier = expr is ForallExpr ? "forall" : "exists";
             var boundVars = quantExpr.BoundVars;
-            var bindings = string.Join(" ", boundVars.Select(bv =>
-                $"({bv.Name} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
+            // Enter binders first (alpha-renaming on shadow collision), then
+            // build the binder list using the assigned SMT names.
+            var smtNames = boundVars.Select(bv => EnterBoundVar(bv)).ToList();
+            var bindings = string.Join(" ", boundVars.Select((bv, i) =>
+                $"({smtNames[i]} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
 
-            foreach (var bv in boundVars) _boundVars.Add(bv.Name);
             var bodySmt = ExprToSmt(quantExpr.Term, inputs, mutableNames, isPostContext, insideOld);
             // Translate the range guard (e.g., "1 < nr < n" in "forall nr | 1 < nr < n :: body")
             string? rangeSmt = null;
             if (quantExpr.Range != null)
                 rangeSmt = ExprToSmt(quantExpr.Range, inputs, mutableNames, isPostContext, insideOld);
-            foreach (var bv in boundVars) _boundVars.Remove(bv.Name);
+            foreach (var bv in boundVars) ExitBoundVar(bv);
 
             if (bodySmt == null) goto fallback;
 
@@ -4851,8 +4900,7 @@ static class SmtTranslator
         }
         if (iteExpr is not ITEExpr ite) return result;
 
-        var bvNames = forallExpr.BoundVars.Select(bv => bv.Name).ToList();
-        foreach (var n in bvNames) _boundVars.Add(n);
+        var smtNames = forallExpr.BoundVars.Select(bv => EnterBoundVar(bv)).ToList();
         ResetExprToSmtBudget();
         var rangeSmt = rangeExpr != null ? ExprToSmt(rangeExpr, inputsAndOutputs, mutableNames, isPostContext: true) : null;
         ResetExprToSmtBudget();
@@ -4861,12 +4909,12 @@ static class SmtTranslator
         var thnSmt = ExprToSmt(ite.Thn, inputsAndOutputs, mutableNames, isPostContext: true);
         ResetExprToSmtBudget();
         var elsSmt = ExprToSmt(ite.Els, inputsAndOutputs, mutableNames, isPostContext: true);
-        foreach (var n in bvNames) _boundVars.Remove(n);
+        foreach (var bv in forallExpr.BoundVars) ExitBoundVar(bv);
 
         if (condSmt == null || thnSmt == null || elsSmt == null) return result;
 
-        var bvBindings = string.Join(" ", forallExpr.BoundVars.Select(bv =>
-            $"({bv.Name} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
+        var bvBindings = string.Join(" ", forallExpr.BoundVars.Select((bv, i) =>
+            $"({smtNames[i]} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
 
         string Wrap(string body) => $"(exists ({bvBindings}) {body})";
         string AndAll(params string?[] parts) {
@@ -5183,7 +5231,7 @@ static class SmtTranslator
 
         if (cases.Count == 0) return result;  // body had no droppable conjuncts
 
-        foreach (var n in bvNames) _boundVars.Add(n);
+        var smtNames = vars.Select(bv => EnterBoundVar(bv)).ToList();
 
         string? rangeSmt = null;
         if (rangeExpr != null)
@@ -5192,8 +5240,8 @@ static class SmtTranslator
             rangeSmt = ExprToSmt(rangeExpr, inputsAndOutputs, mutableNames, isPostContext);
         }
 
-        var bvBindings = string.Join(" ", vars.Select(bv =>
-            $"({bv.Name} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
+        var bvBindings = string.Join(" ", vars.Select((bv, i) =>
+            $"({smtNames[i]} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
 
         foreach (var caseConjuncts in cases)
         {
@@ -5216,7 +5264,7 @@ static class SmtTranslator
             result.Add(($"(exists ({bvBindings}) {bodySmt})", polarity));
         }
 
-        foreach (var n in bvNames) _boundVars.Remove(n);
+        foreach (var bv in vars) ExitBoundVar(bv);
         return result;
     }
 
@@ -5279,8 +5327,7 @@ static class SmtTranslator
             if (last is not ForallExpr && last is not ExistsExpr) return result;
         }
 
-        var bvNames = existsExpr.BoundVars.Select(bv => bv.Name).ToList();
-        foreach (var n in bvNames) _boundVars.Add(n);
+        var smtNames = existsExpr.BoundVars.Select(bv => EnterBoundVar(bv)).ToList();
 
         // Translate every conjunct and the range once.
         var conjSmts = new List<string?>();
@@ -5299,11 +5346,11 @@ static class SmtTranslator
             rangeSmt = ExprToSmt(existsExpr.Range, inputsAndOutputs, mutableNames, isPostContext);
             if (rangeSmt == null) ok = false;
         }
-        foreach (var n in bvNames) _boundVars.Remove(n);
+        foreach (var bv in existsExpr.BoundVars) ExitBoundVar(bv);
         if (!ok) return result;
 
-        var bvBindings = string.Join(" ", existsExpr.BoundVars.Select(bv =>
-            $"({bv.Name} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
+        var bvBindings = string.Join(" ", existsExpr.BoundVars.Select((bv, i) =>
+            $"({smtNames[i]} {TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int")})"));
 
         // For `requireQuantifierLast`, callers expect just the drop-last variant.
         int from = requireQuantifierLast ? conjuncts.Count - 1 : 0;
