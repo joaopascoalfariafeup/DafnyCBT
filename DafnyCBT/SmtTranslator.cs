@@ -2316,14 +2316,19 @@ static class SmtTranslator
             {
                 if (boundVars.Count == 1)
                 {
-                    var bv0 = boundVars[0];
+                    // Use the SMT emit name (alpha-renamed on shadow collision)
+                    // so the regex match against bodySmt finds the bound-var
+                    // references. Using bv.Name (source name) would miss the
+                    // renamed occurrences in the body and leak the renamed
+                    // name as a free SMT variable.
+                    var bvSmtName = smtNames[0];
 
                     // First check: if bound var is a VALUE (appears in set select AND compared to seq.nth)
                     // then skip ALL finite expansions â€” keep as real forall/exists.
                     // Example: "forall x :: x in result ==> x in a[..]" â€” x ranges over all values,
                     // not just array indices. Finite expansion would miss values outside arrays.
                     {
-                        var bvPatEarly = Regex.Escape(bv0.Name);
+                        var bvPatEarly = Regex.Escape(bvSmtName);
                         bool bvInSelectEarly = Regex.IsMatch(bodySmt, @"\(select \S+ " + bvPatEarly + @"\b");
                         bool bvComparedEarly = Regex.IsMatch(bodySmt,
                             @"\(= " + bvPatEarly + @" \(seq\.nth ") ||
@@ -2337,10 +2342,10 @@ static class SmtTranslator
                     // (seq.nth outerSeq k) for each k instead of an integer index.
                     // After post-processing, (seq.nth outerSeq k) â†’ outerSeq_k (flat encoding).
                     var seqNameMatch = Regex.Match(bodySmt,
-                        @"\(= " + Regex.Escape(bv0.Name) + @" \(seq\.nth (\S+) \d+\)\)");
+                        @"\(= " + Regex.Escape(bvSmtName) + @" \(seq\.nth (\S+) \d+\)\)");
                     if (!seqNameMatch.Success)
                         seqNameMatch = Regex.Match(bodySmt,
-                            @"\(= \(seq\.nth (\S+) \d+\) " + Regex.Escape(bv0.Name) + @"\)");
+                            @"\(= \(seq\.nth (\S+) \d+\) " + Regex.Escape(bvSmtName) + @"\)");
                     if (seqNameMatch.Success)
                     {
                         var outerSeqSmt = seqNameMatch.Groups[1].Value;
@@ -2349,7 +2354,7 @@ static class SmtTranslator
                         {
                             var elem = $"(seq.nth {outerSeqSmt} {k})";
                             var instance = Regex.Replace(bodySmt,
-                                @"(?<![a-zA-Z_])" + Regex.Escape(bv0.Name) + @"(?![a-zA-Z_0-9])",
+                                @"(?<![a-zA-Z_])" + Regex.Escape(bvSmtName) + @"(?![a-zA-Z_0-9])",
                                 elem);
                             // Guard: only consider when k is a valid index in the outer seq.
                             // For forall: (=> guard body) â€” vacuously true for out-of-bounds (correct).
@@ -2367,19 +2372,18 @@ static class SmtTranslator
 
                     // Check if bound var is a value (appears in set select AND compared to seq.nth)
                     // â€” if so, skip finite expansion and keep as real forall
-                    var bvPat = Regex.Escape(bv0.Name);
+                    var bvPat = Regex.Escape(bvSmtName);
                     bool bvInSelect = Regex.IsMatch(bodySmt, @"\(select \S+ " + bvPat + @"\b");
                     bool bvComparedToSeqNth = Regex.IsMatch(bodySmt,
                         @"\(= " + bvPat + @" \(seq\.nth ") ||
                         Regex.IsMatch(bodySmt, @"\(= \(seq\.nth [^)]+\) " + bvPat + @"\b");
                     if (!(bvInSelect && bvComparedToSeqNth))
                     {
-                        var varName = bv0.Name;
                         var intInstances = new List<string>();
                         for (int idx = 0; idx < MAX_SEQ_LEN; idx++)
                         {
                             var instance = Regex.Replace(bodySmt,
-                                @"(?<![a-zA-Z_])" + Regex.Escape(varName) + @"(?![a-zA-Z_0-9])",
+                                @"(?<![a-zA-Z_])" + Regex.Escape(bvSmtName) + @"(?![a-zA-Z_0-9])",
                                 idx.ToString());
                             intInstances.Add(instance);
                         }
@@ -2390,8 +2394,8 @@ static class SmtTranslator
                 }
                 else // boundVars.Count == 2
                 {
-                    var var1 = boundVars[0].Name;
-                    var var2 = boundVars[1].Name;
+                    var var1 = smtNames[0];
+                    var var2 = smtNames[1];
                     var instances = new List<string>();
                     for (int i = 0; i < MAX_SEQ_LEN; i++)
                     {
@@ -2756,12 +2760,12 @@ static class SmtTranslator
             && GetOriginalName(UnwrapExpr(sc.Term)) == sc.BoundVars[0].Name)
         {
             var bv = sc.BoundVars[0];
-            _boundVars.Add(bv.Name);
+            var bvSmtName = EnterBoundVar(bv);
             var rangeSmt = ExprToSmt(sc.Range, inputs, mutableNames, isPostContext, insideOld);
-            _boundVars.Remove(bv.Name);
+            ExitBoundVar(bv);
             if (rangeSmt != null)
             {
-                var bvPat = @"(?<![a-zA-Z_0-9])" + Regex.Escape(bv.Name) + @"(?![a-zA-Z_0-9])";
+                var bvPat = @"(?<![a-zA-Z_0-9])" + Regex.Escape(bvSmtName) + @"(?![a-zA-Z_0-9])";
                 var terms = new List<string>();
                 for (int k = 0; k < MAX_SEQ_LEN; k++)
                 {
