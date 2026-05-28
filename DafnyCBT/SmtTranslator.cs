@@ -3275,51 +3275,6 @@ static class SmtTranslator
     }
 
     /// <summary>
-    /// Compact, canonical shape signature for cross-base shape dedup. Concatenates
-    /// `<name>:<len>:<rank-vector>` over every int-typed seq/array input in `values`.
-    /// Rank vector = the unique-under-monotonic-value-remap encoding (e.g. both
-    /// [1,2,1,2] and [10,20,10,20] give ranks [0,1,0,1]; [1,1,2,2] gives [0,0,1,1]
-    /// — different shape). Returns null when no applicable inputs.
-    /// </summary>
-    internal static string? BuildShapeSignature(
-        Dictionary<string, string> values,
-        List<(string Name, string Type)> inputs,
-        HashSet<string> mutableNames)
-    {
-        var parts = new List<string>();
-        foreach (var (name, type) in inputs)
-        {
-            if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type)) continue;
-            if (TypeUtils.IsSupportedNestedSeqType(type)) continue;
-            var elemType = TypeUtils.GetSeqElementType(type);
-            if (elemType != "int" && elemType != "nat") continue;
-            var prefix = mutableNames.Contains(name) ? $"{name}_pre" : name;
-            if (!values.TryGetValue(prefix + "_len", out var lenStr)) continue;
-            if (!int.TryParse(lenStr, out var len) || len < 2) continue;
-            if (!values.TryGetValue(prefix + "_elems", out var elemsStr)) continue;
-            var elemsArr = elemsStr.Split(',');
-            if (elemsArr.Length < len) continue;
-            var vals = new System.Numerics.BigInteger[len];
-            bool ok = true;
-            for (int i = 0; i < len; i++)
-            {
-                if (!System.Numerics.BigInteger.TryParse(elemsArr[i].Trim(), out vals[i]))
-                {
-                    ok = false; break;
-                }
-            }
-            if (!ok) continue;
-            // Rank vector: for each position, the index of its value in the
-            // sorted-distinct list. Captures shape exactly (invariant under
-            // any monotonic value remap).
-            var sortedDistinct = vals.Distinct().OrderBy(v => v).ToList();
-            var ranks = vals.Select(v => sortedDistinct.IndexOf(v));
-            parts.Add($"{name}:{len}:{string.Join(",", ranks)}");
-        }
-        return parts.Count == 0 ? null : string.Join("|", parts);
-    }
-
-    /// <summary>
     /// For each int-typed seq/array input in `values`, emit one SMT assertion
     /// excluding the prior witness's ordering shape. Shape = the equivalence
     /// class under monotonic value remap; uniquely captured by (sort

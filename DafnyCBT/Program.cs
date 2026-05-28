@@ -4521,19 +4521,6 @@ class Program
                         var fp = BuildInputExclusion(vals);
                         if (fp != null) seenInputs.Add(fp);
                     }
-                    // Cross-base shape dedup: collect rank-vector signatures from
-                    // all prior tests so /R rounds across DIFFERENT bases don't
-                    // collide on the same ordering pattern (e.g. multiple len=2
-                    // bases each picking shape `<` at different value pairs).
-                    var seenShapes = new HashSet<string>();
-                    if (SmtTranslator.ShapeExclusionEnabled)
-                    {
-                        foreach (var (_, vals, _) in testCases)
-                        {
-                            var sig = SmtTranslator.BuildShapeSignature(vals, inputs, mutableNames);
-                            if (sig != null) seenShapes.Add(sig);
-                        }
-                    }
 
                     var active = new List<string>(bases.Select(b => b.label));
                     while (active.Count > 0 && testCases.Count < minTests && !TimedOut())
@@ -4644,28 +4631,6 @@ class Program
                                     if (verbose) Console.WriteLine($"  {repLabel}: duplicate input — retry next round with stricter exclusion");
                                     nextActive.Add(label);
                                     continue;
-                                }
-                                // Cross-base shape dedup: even if the input is value-distinct
-                                // from priors, reject if its ordering signature matches a
-                                // shape already covered elsewhere. Push the shape exclusion
-                                // so this base is forced to a different pattern next round.
-                                if (SmtTranslator.ShapeExclusionEnabled)
-                                {
-                                    var sig = SmtTranslator.BuildShapeSignature(repValues, inputs, mutableNames);
-                                    if (sig != null && !seenShapes.Add(sig))
-                                    {
-                                        var shapeExcls = SmtTranslator.BuildShapeExclusions(repValues, inputs, mutableNames);
-                                        inputExclusions.AddRange(shapeExcls);
-                                        perBaseConsecDups[label]++;
-                                        if (perBaseConsecDups[label] >= MAX_CONSECUTIVE_DUPS)
-                                        {
-                                            if (verbose) Console.WriteLine($"  {repLabel}: dropped after {MAX_CONSECUTIVE_DUPS} consecutive duplicates (no progress)");
-                                            continue;
-                                        }
-                                        if (verbose) Console.WriteLine($"  {repLabel}: duplicate shape across bases — retry next round");
-                                        nextActive.Add(label);
-                                        continue;
-                                    }
                                 }
                                 testCases.Add((repLabel, repValues, b.literals));
                                 if (fp != null) inputExclusions.Add(fp);
