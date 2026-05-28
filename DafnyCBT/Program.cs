@@ -121,6 +121,7 @@ class Program
         var capSmallSizeRepeatsOpt = new Option<bool>("--cap-small-size-repeats", () => false, "[spike] In Phase 3 round-robin, cap repeats of the degenerate-value tiers: 0 repeats for `|x|=1` (singleton) and boundary `=0` tiers, ≤1 repeat for `|x|=2` and boundary `=1`. Repeated tiny/extremal-constant inputs rarely expose new behaviour (sort/swap/interior bugs need ≥3 elements or a non-boundary index); the freed budget is reallocated by the round-robin to larger / more diverse bases. Default off.");
         var boundedFoldOpt = new Option<bool>("--bounded-fold", () => false, "[spike] Recognise recursive additive prefix-sum folds (f(s,n) = sum of first n elements) at the AST level and emit a bounded closed form Σ_{i<MAX_SEQ_LEN} ite(i<n, s[i], 0) instead of an uninterpreted residual. Gives Z3 a real objective for `exists n :: … f(s,n) …` specs (the Sum2/min/prime/Inorder/BelowZero recursive-fold cluster) so the discriminating input is found deterministically. Default off.");
         var minSeqLenOpt = new Option<int>("--min-seq-len", () => 0, "When > 0, add `(assert-soft (>= (seq.len s) N) :weight 1)` for each seq/array input — biases Z3 toward larger collections. Useful on fold-heavy corpora (verifixer_mutants) whose killing witnesses are inherently multi-element. Soft, weight 1: loses to hard spec constraints and to the upper cap, so specs that pin `|s|=1` still get `|s|=1`. Default 0 (no extra bias — current behaviour).");
+        var shapeExclusionOpt = new Option<bool>("--shape-exclusion", () => false, "[spike] In Phase 3 round-robin repeats, exclude prior ordering shapes for int-typed seq/array inputs (not just prior values). Shape = the equivalence-class signature of pairwise comparisons (e.g. `[1,2,1,2]` has shape `a[0]=a[2]<a[1]=a[3]`). Encoded as n-1 disjuncts using the prior's sort permutation σ — same expressive power as O(n²) pairwise but much cheaper. Forces structurally distinct inputs (different sort orders / equality patterns) rather than just different element values at the same shape. Default off.");
         var trustUnknownOpt = new Option<bool>("--trust-unknown", () => false, "Trust Z3 output values when uniqueness check returns 'unknown' (default: false — safer: treat unknown as not-unique and fall back to full-postcondition expects)");
         var uniquenessRoundsOpt = new Option<int>("--uniqueness-rounds", () => 4, "Max rounds of uniqueness checking to enumerate all valid outputs (default: 4). When all valid outputs are enumerated, emit expect out == v1 || out == v2 || ...;");
         uniquenessRoundsOpt.AddAlias("-u");
@@ -180,7 +181,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, boundedFoldOpt, minSeqLenOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, boundedFoldOpt, minSeqLenOpt, shapeExclusionOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -207,6 +208,7 @@ class Program
             SmtTranslator.PermutationDomainPin = !ctx.ParseResult.GetValueForOption(noPermDomainPinOpt);
             SmtTranslator.BoundedFoldEnabled = ctx.ParseResult.GetValueForOption(boundedFoldOpt);
             SmtTranslator.MinSeqLen = ctx.ParseResult.GetValueForOption(minSeqLenOpt);
+            SmtTranslator.ShapeExclusionEnabled = ctx.ParseResult.GetValueForOption(shapeExclusionOpt);
             CapSmallSizeRepeats = ctx.ParseResult.GetValueForOption(capSmallSizeRepeatsOpt);
             DeadClausePruning = !ctx.ParseResult.GetValueForOption(noDeadClausePruningOpt);
             PrecondFill = !ctx.ParseResult.GetValueForOption(noPrecondFillOpt);
@@ -4488,6 +4490,14 @@ class Program
                         if (baseTest.values == null) continue;
                         var seedLenExcl = BuildOpenTierLengthExclusion(b.label, baseTest.values, inputs, mutableNames);
                         if (seedLenExcl != null) perBaseExclusions[b.label].Add(seedLenExcl);
+                        // Seed the base's own anchor shape so the first /R round is
+                        // forced to a different ordering pattern, not just a different
+                        // element multiset at the same shape.
+                        if (SmtTranslator.ShapeExclusionEnabled)
+                        {
+                            var seedShapeExcls = SmtTranslator.BuildShapeExclusions(baseTest.values, inputs, mutableNames);
+                            perBaseExclusions[b.label].AddRange(seedShapeExcls);
+                        }
                     }
                     var perBaseRoundIdx = bases.ToDictionary(b => b.label, b => 0);
                     var perBaseRelExhausted = bases.ToDictionary(b => b.label, b => false);
@@ -4510,6 +4520,19 @@ class Program
                     {
                         var fp = BuildInputExclusion(vals);
                         if (fp != null) seenInputs.Add(fp);
+                    }
+                    // Cross-base shape dedup: collect rank-vector signatures from
+                    // all prior tests so /R rounds across DIFFERENT bases don't
+                    // collide on the same ordering pattern (e.g. multiple len=2
+                    // bases each picking shape `<` at different value pairs).
+                    var seenShapes = new HashSet<string>();
+                    if (SmtTranslator.ShapeExclusionEnabled)
+                    {
+                        foreach (var (_, vals, _) in testCases)
+                        {
+                            var sig = SmtTranslator.BuildShapeSignature(vals, inputs, mutableNames);
+                            if (sig != null) seenShapes.Add(sig);
+                        }
                     }
 
                     var active = new List<string>(bases.Select(b => b.label));
@@ -4622,8 +4645,38 @@ class Program
                                     nextActive.Add(label);
                                     continue;
                                 }
+                                // Cross-base shape dedup: even if the input is value-distinct
+                                // from priors, reject if its ordering signature matches a
+                                // shape already covered elsewhere. Push the shape exclusion
+                                // so this base is forced to a different pattern next round.
+                                if (SmtTranslator.ShapeExclusionEnabled)
+                                {
+                                    var sig = SmtTranslator.BuildShapeSignature(repValues, inputs, mutableNames);
+                                    if (sig != null && !seenShapes.Add(sig))
+                                    {
+                                        var shapeExcls = SmtTranslator.BuildShapeExclusions(repValues, inputs, mutableNames);
+                                        inputExclusions.AddRange(shapeExcls);
+                                        perBaseConsecDups[label]++;
+                                        if (perBaseConsecDups[label] >= MAX_CONSECUTIVE_DUPS)
+                                        {
+                                            if (verbose) Console.WriteLine($"  {repLabel}: dropped after {MAX_CONSECUTIVE_DUPS} consecutive duplicates (no progress)");
+                                            continue;
+                                        }
+                                        if (verbose) Console.WriteLine($"  {repLabel}: duplicate shape across bases — retry next round");
+                                        nextActive.Add(label);
+                                        continue;
+                                    }
+                                }
                                 testCases.Add((repLabel, repValues, b.literals));
                                 if (fp != null) inputExclusions.Add(fp);
+                                // Shape exclusion (spike): also block this witness's
+                                // ordering signature so the next /R round must pick a
+                                // structurally distinct pattern, not just different values.
+                                if (SmtTranslator.ShapeExclusionEnabled)
+                                {
+                                    var shapeExcls = SmtTranslator.BuildShapeExclusions(repValues, inputs, mutableNames);
+                                    inputExclusions.AddRange(shapeExcls);
+                                }
                                 perBaseConsecDups[label] = 0;  // fresh witness — reset counter
 
                                 // Length progression: for an open-length tier base

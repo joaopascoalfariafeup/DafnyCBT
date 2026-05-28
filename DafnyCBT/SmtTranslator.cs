@@ -244,6 +244,10 @@ static class SmtTranslator
     // Soft, weight 1 — loses to hard spec constraints and to the upper cap
     // weight 2, so a spec that forces len=1 still gets len=1.
     internal static int MinSeqLen = 0;
+    // When true, Phase 3 round-robin emits ordering-shape exclusions for prior
+    // int-typed seq/array witnesses in addition to input-fingerprint exclusions.
+    // See BuildShapeExclusions. Default off ([spike] --shape-exclusion).
+    internal static bool ShapeExclusionEnabled = false;
     // When set (via --seed CLI), forces this exact seed on every SMT query,
     // overriding the per-method name hash and ignoring --no-bias / skipBias.
     // Emits the seed options unconditionally. Useful for reproducibility
@@ -3268,6 +3272,122 @@ static class SmtTranslator
             if (expr is ConcreteSyntaxExpression c && c.ResolvedExpression != null) { expr = c.ResolvedExpression; continue; }
             return expr;
         }
+    }
+
+    /// <summary>
+    /// Compact, canonical shape signature for cross-base shape dedup. Concatenates
+    /// `<name>:<len>:<rank-vector>` over every int-typed seq/array input in `values`.
+    /// Rank vector = the unique-under-monotonic-value-remap encoding (e.g. both
+    /// [1,2,1,2] and [10,20,10,20] give ranks [0,1,0,1]; [1,1,2,2] gives [0,0,1,1]
+    /// — different shape). Returns null when no applicable inputs.
+    /// </summary>
+    internal static string? BuildShapeSignature(
+        Dictionary<string, string> values,
+        List<(string Name, string Type)> inputs,
+        HashSet<string> mutableNames)
+    {
+        var parts = new List<string>();
+        foreach (var (name, type) in inputs)
+        {
+            if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type)) continue;
+            if (TypeUtils.IsSupportedNestedSeqType(type)) continue;
+            var elemType = TypeUtils.GetSeqElementType(type);
+            if (elemType != "int" && elemType != "nat") continue;
+            var prefix = mutableNames.Contains(name) ? $"{name}_pre" : name;
+            if (!values.TryGetValue(prefix + "_len", out var lenStr)) continue;
+            if (!int.TryParse(lenStr, out var len) || len < 2) continue;
+            if (!values.TryGetValue(prefix + "_elems", out var elemsStr)) continue;
+            var elemsArr = elemsStr.Split(',');
+            if (elemsArr.Length < len) continue;
+            var vals = new System.Numerics.BigInteger[len];
+            bool ok = true;
+            for (int i = 0; i < len; i++)
+            {
+                if (!System.Numerics.BigInteger.TryParse(elemsArr[i].Trim(), out vals[i]))
+                {
+                    ok = false; break;
+                }
+            }
+            if (!ok) continue;
+            // Rank vector: for each position, the index of its value in the
+            // sorted-distinct list. Captures shape exactly (invariant under
+            // any monotonic value remap).
+            var sortedDistinct = vals.Distinct().OrderBy(v => v).ToList();
+            var ranks = vals.Select(v => sortedDistinct.IndexOf(v));
+            parts.Add($"{name}:{len}:{string.Join(",", ranks)}");
+        }
+        return parts.Count == 0 ? null : string.Join("|", parts);
+    }
+
+    /// <summary>
+    /// For each int-typed seq/array input in `values`, emit one SMT assertion
+    /// excluding the prior witness's ordering shape. Shape = the equivalence
+    /// class under monotonic value remap; uniquely captured by (sort
+    /// permutation σ, chain of `<`/`=` between consecutive sorted positions).
+    /// Forces structurally distinct inputs (different sort orders / equality
+    /// patterns) rather than just different values at the same shape.
+    ///
+    /// Encoded as `n` disjuncts per array: 1 for length difference + n-1 for
+    /// flipping each chain relation under prior σ. Returns one (or) assertion
+    /// per applicable input; skips inputs that are too short (`len<2`), have
+    /// non-int element types, or whose values can't be parsed.
+    ///
+    /// The chain disjuncts implicitly catch any shape difference: same shape
+    /// requires σ to also sort s_new (chain non-decreasing) AND each
+    /// `<`/`=` to match — both conditions reduce to the n-1 chain literals.
+    /// </summary>
+    internal static List<string> BuildShapeExclusions(
+        Dictionary<string, string> values,
+        List<(string Name, string Type)> inputs,
+        HashSet<string> mutableNames)
+    {
+        var result = new List<string>();
+        foreach (var (name, type) in inputs)
+        {
+            if (!TypeUtils.IsArrayType(type) && !TypeUtils.IsSeqType(type)) continue;
+            // Skip nested seqs / non-int element types — pairwise `<`/`=` is
+            // only well-defined on totally-ordered scalars handled by Z3's
+            // built-in arithmetic comparators.
+            if (TypeUtils.IsSupportedNestedSeqType(type)) continue;
+            var elemType = TypeUtils.GetSeqElementType(type);
+            if (elemType != "int" && elemType != "nat") continue;
+            var prefix = mutableNames.Contains(name) ? $"{name}_pre" : name;
+            if (!values.TryGetValue(prefix + "_len", out var lenStr)) continue;
+            if (!int.TryParse(lenStr, out var len) || len < 2) continue;
+            if (!values.TryGetValue(prefix + "_elems", out var elemsStr)) continue;
+            var elemsArr = elemsStr.Split(',');
+            if (elemsArr.Length < len) continue;
+            var vals = new System.Numerics.BigInteger[len];
+            bool ok = true;
+            for (int i = 0; i < len; i++)
+            {
+                if (!System.Numerics.BigInteger.TryParse(elemsArr[i].Trim(), out vals[i]))
+                {
+                    ok = false; break;
+                }
+            }
+            if (!ok) continue;
+
+            // Sort indices by value (stable on ties — chain ops are tie-invariant).
+            var sigma = Enumerable.Range(0, len).ToArray();
+            Array.Sort(sigma, (a, b) => vals[a].CompareTo(vals[b]));
+
+            var smtSeq = TypeUtils.SeqSmtName(prefix, type);
+            var smtLen = TypeUtils.IsArrayType(type) ? $"{prefix}_len" : $"(seq.len {smtSeq})";
+            var disjuncts = new List<string>();
+            // Length-differs disjunct: a different-length array is automatically a different shape.
+            disjuncts.Add($"(not (= {smtLen} {len}))");
+            // n-1 chain disjuncts: flip prior's `<` or `=` at each consecutive sorted pair.
+            for (int i = 0; i < len - 1; i++)
+            {
+                int a = sigma[i];
+                int b = sigma[i + 1];
+                string op = vals[a] == vals[b] ? "=" : "<";
+                disjuncts.Add($"(not ({op} (seq.nth {smtSeq} {a}) (seq.nth {smtSeq} {b})))");
+            }
+            result.Add($"(or {string.Join(" ", disjuncts)})");
+        }
+        return result;
     }
 
     /// <summary>
