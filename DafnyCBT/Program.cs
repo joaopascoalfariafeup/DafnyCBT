@@ -3552,6 +3552,49 @@ class Program
             return false;
         }
 
+        // Shape-pinned subsumption for Phase 3 (--shape-exclusion). After a
+        // candidate's SAT witness is found, before adding it as a new test
+        // case, check whether any *prior* test of the SAME ordering shape
+        // would also satisfy the candidate's clause literals + tier extras.
+        // If so, the candidate is structurally redundant — its only novelty
+        // would be different scalar values in an already-covered shape +
+        // region. Skip and push a shape exclusion so the next round picks
+        // a different shape.
+        //
+        // The probe reuses value-pinned subsumption (IsAlreadyCovered's
+        // mechanism) but pre-filters priors by shape signature, so the
+        // expensive Z3 query only fires for genuine shape collisions. For
+        // task_id_755 (multiple bases legitimately need shape `<` at len=2
+        // in different tier regions), the value-pin probe returns UNSAT —
+        // candidate kept. For BubbleSort (`/O|a|=2` anchor `[-2,-2]` and
+        // `/Rel/R9` candidate `[-1,-1]` share shape `=` and the relevance
+        // shadow's region overlaps the size-tier's region), the probe
+        // returns SAT — candidate skipped.
+        async Task<bool> IsAlreadyCoveredBySameShapePrior(
+            List<Expression> lits, List<Expression> preLits, List<Expression> excl,
+            List<string> tierExtra,
+            Dictionary<string, string> candidateValues,
+            List<(string label, Dictionary<string, string> values, List<Expression> literals)> results)
+        {
+            var candidateSig = SmtTranslator.BuildShapeSignature(candidateValues, inputs, mutableNames);
+            if (candidateSig == null) return false;
+            int start = Math.Max(0, results.Count - MAX_SUBSUME_PRIOR);
+            for (int i = results.Count - 1; i >= start; i--)
+            {
+                if (TimedOut()) return false;
+                var priorSig = SmtTranslator.BuildShapeSignature(results[i].values, inputs, mutableNames);
+                if (priorSig != candidateSig) continue;  // shape mismatch → not a shape-pinned subsumption target
+                var pin = BuildModelPin(results[i].values);
+                if (pin == null) continue;
+                var extraWithPin = new List<string>(tierExtra) { pin };
+                var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, false, excl, extraWithPin, preLits, mutableNames);
+                var result = await Z3Runner.RunZ3(z3Path, smt);
+                if (result.Split('\n').Select(l => l.Trim()).Any(l => l == "sat"))
+                    return true;
+            }
+            return false;
+        }
+
         // Helper: build string key for a schedule entry (for dedup and input exclusion tracking)
         static string ScheduleKey(List<Expression> literals, List<Expression> exclusions, List<Expression> preLits) =>
             string.Join("|", literals.Select(EKey)) + "||" + string.Join("|", exclusions.Select(EKey)) + "||" + string.Join("|", preLits.Select(EKey));
@@ -4629,6 +4672,28 @@ class Program
                                         continue;
                                     }
                                     if (verbose) Console.WriteLine($"  {repLabel}: duplicate input — retry next round with stricter exclusion");
+                                    nextActive.Add(label);
+                                    continue;
+                                }
+                                // Shape-pinned subsumption (--shape-exclusion): if any prior
+                                // test of the same ordering shape already satisfies this
+                                // candidate's tier objective, skip — same shape + overlapping
+                                // tier region = no new coverage. Per-base shape exclusion
+                                // already handles within-base; this catches cross-base
+                                // redundancies (e.g. /O|a|=2 anchor vs /Rel/R9 repeat both
+                                // landing at shape `=` len=2 in overlapping regions).
+                                if (SmtTranslator.ShapeExclusionEnabled
+                                    && await IsAlreadyCoveredBySameShapePrior(b.literals, b.preLits, b.exclusions, b.extras, repValues, testCases))
+                                {
+                                    var shapeExcls = SmtTranslator.BuildShapeExclusions(repValues, inputs, mutableNames);
+                                    inputExclusions.AddRange(shapeExcls);
+                                    perBaseConsecDups[label]++;
+                                    if (perBaseConsecDups[label] >= MAX_CONSECUTIVE_DUPS)
+                                    {
+                                        if (verbose) Console.WriteLine($"  {repLabel}: dropped after {MAX_CONSECUTIVE_DUPS} consecutive duplicates (no progress)");
+                                        continue;
+                                    }
+                                    if (verbose) Console.WriteLine($"  {repLabel}: shape subsumed by prior (same shape, overlapping region) — retry next round");
                                     nextActive.Add(label);
                                     continue;
                                 }
