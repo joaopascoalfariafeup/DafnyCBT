@@ -3308,20 +3308,33 @@ static class SmtTranslator
             if (elemType != "int" && elemType != "nat") continue;
             var prefix = mutableNames.Contains(name) ? $"{name}_pre" : name;
             if (!values.TryGetValue(prefix + "_len", out var lenStr)) continue;
-            if (!int.TryParse(lenStr, out var len) || len < 2) continue;
-            if (!values.TryGetValue(prefix + "_elems", out var elemsStr)) continue;
-            var elemsArr = elemsStr.Split(',');
-            if (elemsArr.Length < len) continue;
+            if (!int.TryParse(lenStr, out var len) || len < 1) continue;
+            // For len==1, only the length-differs disjunct is emitted — no
+            // chain links exist, but the exclusion still forbids same-base
+            // len=1 repeats (which would re-exercise the same code path with
+            // a different scalar; that's better served by scalar-level
+            // boundary tiers on the element type, not array repetition).
+            // The length-differs disjunct composes with hard tier constraints:
+            // a base whose tier pins len=1 (e.g. /BL:a.Length>0=+1) becomes
+            // UNSAT on its next round and drops naturally.
             var vals = new System.Numerics.BigInteger[len];
-            bool ok = true;
-            for (int i = 0; i < len; i++)
+            if (len >= 2)
             {
-                if (!System.Numerics.BigInteger.TryParse(elemsArr[i].Trim(), out vals[i]))
+                if (!values.TryGetValue(prefix + "_elems", out var elemsStr)) continue;
+                var elemsArr = elemsStr.Split(',');
+                if (elemsArr.Length < len) continue;
+                bool ok = true;
+                for (int i = 0; i < len; i++)
                 {
-                    ok = false; break;
+                    if (!System.Numerics.BigInteger.TryParse(elemsArr[i].Trim(), out vals[i]))
+                    {
+                        ok = false; break;
+                    }
                 }
+                if (!ok) continue;
             }
-            if (!ok) continue;
+            // len==1: vals stays at the default (all zero), never read by the
+            // chain loop below since `i < len - 1` is `i < 0` → 0 iterations.
 
             // Sort indices by value (stable on ties — chain ops are tie-invariant).
             var sigma = Enumerable.Range(0, len).ToArray();
