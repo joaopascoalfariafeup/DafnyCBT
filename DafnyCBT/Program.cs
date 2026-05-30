@@ -2900,6 +2900,72 @@ class Program
                             }
                         }
 
+                        // Set-cardinality conjunct-drop tiers (`/BScd<n>=neg<k>`).
+                        // For each post literal of the form `LHS op |set i :: range ∧ c1 ∧ … ∧ cn|`,
+                        // emit n Phase 2 entries — one per non-range body conjunct ck — with extra
+                        //   (exists ((i Int)) (and range_smt (∧_{j≠k} c_j_smt) (not c_k_smt)))
+                        // forcing some position where ck is the *differentiator* (false there, all
+                        // other body conjuncts true). Drives VER/ROR mutations on a single conjunct
+                        // inside a counting predicate (e.g. CountIdenticalPositions's
+                        // `b[i]==c[i]` replaced by `c[i]==c[i]`) — without the tier the kill depends
+                        // on Z3 incidentally picking a values pattern that overlaps the differentiator
+                        // position, which is non-deterministic across runs.
+                        // Re-uses DecomposeBodyCases (the same drop-each-and-flip helper that
+                        // powers Phase 1r assertExistsStripped near-witness strengthening).
+                        int scdLitIdx = 0;
+                        foreach (var lit in clause)
+                        {
+                            var litInner = Unwrap(lit);
+                            // Look for the first cardinality+set-comprehension shape anywhere in
+                            // the literal (top-level `count == |set …|`, but also one side of a
+                            // `>=` or similar — any context where the comprehension's predicate
+                            // is observable via the literal's truth).
+                            SetComprehension? sc = null;
+                            void FindSc(Expression e)
+                            {
+                                if (sc != null) return;
+                                var u = Unwrap(e);
+                                if (u is UnaryOpExpr uop && uop.Op == UnaryOpExpr.Opcode.Cardinality
+                                    && Unwrap(uop.E) is SetComprehension scInner) { sc = scInner; return; }
+                                foreach (var sub in u.SubExpressions) FindSc(sub);
+                            }
+                            FindSc(litInner);
+                            if (sc == null || sc.BoundVars.Count != 1 || sc.Range == null) continue;
+                            // Only handle the simple `set i | P(i)` shape — the body must be
+                            // the bound var itself, matching the existing cardinality-sum
+                            // handler in SmtTranslator.ExprToSmt.
+                            var termU = Unwrap(sc.Term);
+                            if (!(termU is IdentifierExpr termId && termId.Name == sc.BoundVars[0].Name)) continue;
+                            scdLitIdx++;
+                            var bv = sc.BoundVars[0];
+                            var boundVarSet = new HashSet<string> { bv.Name };
+                            var cases = SmtTranslator.DecomposeBodyCases(sc.Range, boundVarSet, flipDropped: true);
+                            if (cases.Count == 0) continue;
+                            var bvType = TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int");
+                            for (int ki = 0; ki < cases.Count; ki++)
+                            {
+                                var caseConjuncts = cases[ki];
+                                var bvSmtName = SmtTranslator.EnterBoundVar(bv);
+                                var parts = new List<string>();
+                                bool ok = true;
+                                foreach (var c in caseConjuncts)
+                                {
+                                    SmtTranslator.ResetExprToSmtBudget();
+                                    var s = SmtTranslator.ExprToSmt(c, allInputs, mutableNames, isPostContext: true);
+                                    if (s == null) { ok = false; break; }
+                                    parts.Add(s);
+                                }
+                                SmtTranslator.ExitBoundVar(bv);
+                                if (!ok || parts.Count == 0) continue;
+                                var bodySmt = parts.Count == 1 ? parts[0] : "(and " + string.Join(" ", parts) + ")";
+                                var extra = $"(exists (({bvSmtName} {bvType})) {bodySmt})";
+                                var label = $"Scd{scdLitIdx}=neg{ki + 1}";
+                                schedule.Add(($"{clauseLabel}/B{label}",
+                                    clause, fullPreLits, new List<Expression>(), new List<string> { extra }, simpleMask, pi));
+                                emitted.Add($"{pi}|{ci}|{label}");
+                            }
+                        }
+
                         // Spec-coverage all-flipped tier for `!exists ∧ AND` literals.
                         // For `!exists vars :: range ∧ c1 ∧ … ∧ cn` (n ≥ 2 body conjuncts),
                         // emit ONE Phase 2 entry with extra-constraint
