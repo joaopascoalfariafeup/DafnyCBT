@@ -226,7 +226,7 @@ static class SmtTranslator
     // bounded closed form Σ_{i<MAX_SEQ_LEN} ite(i < depth, seq[i], 0) instead
     // of an uninterpreted residual — giving Z3 a real objective for
     // `exists n :: … f(s, n) …` specs (Sum2/min/prime/Inorder/BelowZero).
-    internal static bool BoundedFoldEnabled = false;
+    internal static bool BoundedFoldEnabled = true;
     internal static Dictionary<string, FoldInfo> RecognizedFolds = new();
     // When true, EmitAntiTrivialBias emits only the magnitude / length bounds
     // (weight-3 caps that keep integers in [-BIAS_MAX, BIAS_MAX] and seq lengths
@@ -245,9 +245,11 @@ static class SmtTranslator
     // weight 2, so a spec that forces len=1 still gets len=1.
     internal static int MinSeqLen = 0;
     // When true, Phase 3 round-robin emits ordering-shape exclusions for prior
-    // int-typed seq/array witnesses in addition to input-fingerprint exclusions.
-    // See BuildShapeExclusions. Default off ([spike] --shape-exclusion).
-    internal static bool ShapeExclusionEnabled = false;
+    // int-typed seq/array witnesses in addition to input-fingerprint exclusions,
+    // and performs shape-pinned subsumption against priors of matching shape.
+    // See BuildShapeExclusions / BuildShapeSignature. Default ON; opt out via
+    // --no-shape-exclusion.
+    internal static bool ShapeExclusionEnabled = true;
     // When set (via --seed CLI), forces this exact seed on every SMT query,
     // overriding the per-method name hash and ignoring --no-bias / skipBias.
     // Emits the seed options unconditionally. Useful for reproducibility
