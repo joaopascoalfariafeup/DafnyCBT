@@ -2900,18 +2900,19 @@ class Program
                             }
                         }
 
-                        // Set-cardinality conjunct-drop tiers (`/BScd<n>=neg<k>`).
+                        // Set-cardinality conjunct-drop multi-witness tier (`/BScdAll<n>`).
                         // For each post literal of the form `LHS op |set i :: range ∧ c1 ∧ … ∧ cn|`,
-                        // emit n Phase 2 entries — one per non-range body conjunct ck — with extra
-                        //   (exists ((i Int)) (and range_smt (∧_{j≠k} c_j_smt) (not c_k_smt)))
-                        // forcing some position where ck is the *differentiator* (false there, all
-                        // other body conjuncts true). Drives VER/ROR mutations on a single conjunct
-                        // inside a counting predicate (e.g. CountIdenticalPositions's
-                        // `b[i]==c[i]` replaced by `c[i]==c[i]`) — without the tier the kill depends
-                        // on Z3 incidentally picking a values pattern that overlaps the differentiator
-                        // position, which is non-deterministic across runs.
-                        // Re-uses DecomposeBodyCases (the same drop-each-and-flip helper that
-                        // powers Phase 1r assertExistsStripped near-witness strengthening).
+                        // emit ONE Phase 2 entry asserting n distinct positions i1, …, in such that
+                        // position i_k satisfies `range ∧ (∧_{j≠k} c_j) ∧ ¬c_k` — i.e., at position
+                        // i_k, conjunct c_k is the *differentiator* (false there, all others true).
+                        // Single query, deterministic dual/multi-position kill pattern. Drives
+                        // VER/ROR mutations on any single body conjunct (e.g. CountIdenticalPositions
+                        // VER_c: `b[i]==c[i]` replaced by `c[i]==c[i]` — kill needs a position with
+                        // a==b ∧ b≠c, which becomes the i2 position of the multi-witness model).
+                        // Re-uses DecomposeBodyCases for the per-conjunct drop-and-flip variants;
+                        // each variant is instantiated under a fresh bound-var name (i_pos1,
+                        // i_pos2, …) and the bodies are AND-joined with a distinctness constraint
+                        // across the position variables.
                         int scdLitIdx = 0;
                         foreach (var lit in clause)
                         {
@@ -2942,6 +2943,14 @@ class Program
                             var cases = SmtTranslator.DecomposeBodyCases(sc.Range, boundVarSet, flipDropped: true);
                             if (cases.Count == 0) continue;
                             var bvType = TypeUtils.DafnyTypeToSmt(bv.Type?.ToString() ?? "int");
+                            // For each case, translate the conjuncts under the bound var, then
+                            // string-rename the bound-var occurrences to a position-specific name
+                            // (i_pos1, i_pos2, ...). Each case becomes one (and …) part wrapped
+                            // around its rewritten body; all parts are AND-joined with a
+                            // distinctness constraint across the position variables.
+                            var positionBodies = new List<string>();
+                            var positionVarNames = new List<string>();
+                            bool allOk = true;
                             for (int ki = 0; ki < cases.Count; ki++)
                             {
                                 var caseConjuncts = cases[ki];
@@ -2956,14 +2965,27 @@ class Program
                                     parts.Add(s);
                                 }
                                 SmtTranslator.ExitBoundVar(bv);
-                                if (!ok || parts.Count == 0) continue;
-                                var bodySmt = parts.Count == 1 ? parts[0] : "(and " + string.Join(" ", parts) + ")";
-                                var extra = $"(exists (({bvSmtName} {bvType})) {bodySmt})";
-                                var label = $"Scd{scdLitIdx}=neg{ki + 1}";
-                                schedule.Add(($"{clauseLabel}/B{label}",
-                                    clause, fullPreLits, new List<Expression>(), new List<string> { extra }, simpleMask, pi));
-                                emitted.Add($"{pi}|{ci}|{label}");
+                                if (!ok || parts.Count == 0) { allOk = false; break; }
+                                // Rename bv.Name occurrences in each part to the position-specific name.
+                                var posVarName = $"{bv.Name}_pos{ki + 1}";
+                                positionVarNames.Add(posVarName);
+                                var bvNamePat = @"(?<![a-zA-Z_0-9])" + Regex.Escape(bvSmtName) + @"(?![a-zA-Z_0-9])";
+                                var renamed = parts.Select(p => Regex.Replace(p, bvNamePat, posVarName)).ToList();
+                                var bodySmt = renamed.Count == 1 ? renamed[0] : "(and " + string.Join(" ", renamed) + ")";
+                                positionBodies.Add(bodySmt);
                             }
+                            if (!allOk || positionBodies.Count == 0) continue;
+                            // Build the combined multi-witness existential.
+                            var binders = string.Join(" ", positionVarNames.Select(n => $"({n} {bvType})"));
+                            var distinctness = positionVarNames.Count >= 2
+                                ? $" (distinct {string.Join(" ", positionVarNames)})"
+                                : "";
+                            var combinedBody = $"(and{distinctness} {string.Join(" ", positionBodies)})";
+                            var extra = $"(exists ({binders}) {combinedBody})";
+                            var label = $"ScdAll{scdLitIdx}";
+                            schedule.Add(($"{clauseLabel}/B{label}",
+                                clause, fullPreLits, new List<Expression>(), new List<string> { extra }, simpleMask, pi));
+                            emitted.Add($"{pi}|{ci}|{label}");
                         }
 
                         // Spec-coverage all-flipped tier for `!exists ∧ AND` literals.
@@ -3675,6 +3697,10 @@ class Program
         // scope) so a dead clause discovered in one phase is not re-solved per
         // tier in the next. (preIdx, postMask) identity is phase-stable.
         var persistentBaseUnsatMasks = new HashSet<(int preIdx, int mask)>();
+        // Subsumed Phase 1/2 candidates that should still participate as Phase 3 bases.
+        // Declared before SolveRange so the local function can capture it; populated by
+        // the subsumption branch when a candidate's tier objective is already covered.
+        var subsumedBases = new List<(string label, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, List<string> extras)>();
         async Task<int> SolveRange(
             List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule,
             int from, int to, int displayTotal,
@@ -3763,7 +3789,15 @@ class Program
 
                 // --- Optimization 3: subsumption pruning ---
                 // If a previously generated test case already witnesses this candidate's
-                // literals under its tier constraints, skip the redundant Z3 call.
+                // literals under its tier constraints, skip the redundant Phase 2 emission
+                // — but REGISTER the candidate as a Phase 3 base so the round-robin can
+                // still attempt distinct-input variants on it. Phase 3 accumulates input
+                // exclusions across all prior tests via `seenInputs`, so a /R round on a
+                // subsumed-but-registered base either finds a structurally distinct input
+                // (genuine new test) or returns UNSAT (the base drops naturally — same
+                // effective behaviour as today). Without registration, subsumption
+                // permanently coalesces N tier candidates into one base; with it, the
+                // base survives and contributes to Phase 3 diversification.
                 if (enableSubsumption && results.Count > 0)
                 {
                     var tierExtra = new List<string>(globalExtraConstraints);
@@ -3772,6 +3806,7 @@ class Program
                     {
                         if (verbose) Console.WriteLine($"  Combination {label}: skipped (subsumed by prior test case)");
                         subsumedCount++;
+                        subsumedBases.Add((label, literals, preLits, exclusions, new List<string>(extraConstraints)));
                         continue;
                     }
                 }
@@ -3804,6 +3839,7 @@ class Program
         // Build test schedule and solve in phases
         var testSchedule = new List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)>();
         var testCases = new List<(string label, Dictionary<string, string> values, List<Expression> literals)>();
+        // (subsumedBases declared above, before SolveRange, so the local function can capture it.)
         var baseConditionExclusions = new Dictionary<string, List<string>>();
         var knownUnsatLiteralMasks = new Dictionary<int, List<int>>(); // per preIdx, masks whose literals are contradictory
         // Relevance context per clause (keyed by baseConditionExclusions key) — populated when
@@ -4572,6 +4608,18 @@ class Program
                     var baseKey = ScheduleKey(ectx.clause, new List<Expression>(), ectx.preLits);
                     bases.Add((lbl, ectx.clause, ectx.preLits, new List<Expression>(),
                         new List<string> { ectx.extra }, baseKey));
+                }
+                // Subsumed Phase 1/2 candidates: register their tier objectives as Phase
+                // 3 bases too, so the round-robin gets a chance to find a structurally
+                // distinct input under the accumulating cross-base exclusions. Each base
+                // carries the candidate's original tier `extras`; Phase 3's existing
+                // input-exclusion / shape-exclusion / fingerprint mechanisms take care of
+                // ensuring the /R rounds don't re-pick the subsuming prior's input.
+                foreach (var (sLabel, sLits, sPreLits, sExcls, sExtras) in subsumedBases)
+                {
+                    if (!seenBaseLabels.Add(sLabel)) continue;
+                    var baseKey = ScheduleKey(sLits, sExcls, sPreLits);
+                    bases.Add((sLabel, sLits, sPreLits, sExcls, sExtras, baseKey));
                 }
 
                 if (bases.Count == 0)
