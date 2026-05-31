@@ -48,6 +48,18 @@ class Program
     // bases. Set from --cap-small-size-repeats. Default off.
     public static bool CapSmallSizeRepeats = false;
 
+    // Skolemize positive existential postconditions (per DNF clause): lift the
+    // existential witnesses to GHOST outputs and replace `exists vars :: body`
+    // with `body`, so DNF/relevance/BVA treat the inner conjuncts/disjuncts as
+    // first-class literals (the witness becomes a Skolem function of the input,
+    // solved on the generation side). Ghost outputs are excluded from the method
+    // call and the runtime oracle, which keeps the original `exists` via the
+    // full-postcondition expect. Unifies exists::AND / exists::OR (and the
+    // cond&&/==>/<==> exists shapes) into the ordinary DNF pipeline, superseding
+    // the bespoke existential-boundary (/Eb) and stripped-existential machinery
+    // for Skolemized clauses. Default ON; --no-skolemize-exists to opt out (A/B).
+    public static bool SkolemizeExists = true;
+
     // True when `label`'s most-specific tier PINS a value/length to a single
     // point (strict equality), as opposed to an open/range tier that can sweep
     // many distinct inputs. Strict pins have near-zero productive capacity in
@@ -150,6 +162,7 @@ class Program
         var noBoundedFoldOpt = new Option<bool>("--no-bounded-fold", () => false, "Disable bounded-fold. By default ON: recursive additive prefix-sum folds (f(s,n) = sum of first n elements) are recognised at the AST level and emitted as a bounded closed form Σ_{i<MAX_SEQ_LEN} ite(i<n, s[i], 0) instead of an uninterpreted residual. Gives Z3 a real objective for `exists n :: … f(s,n) …` specs (the Sum2/min/prime/Inorder/BelowZero recursive-fold cluster) so the discriminating input is found deterministically. This flag disables the AST-level fold detection (the residual then stays uninterpreted, recovering pre-spike behaviour for A/B measurement).");
         var minSeqLenOpt = new Option<int>("--min-seq-len", () => 0, "When > 0, add `(assert-soft (>= (seq.len s) N) :weight 1)` for each seq/array input — biases Z3 toward larger collections. Useful on fold-heavy corpora (verifixer_mutants) whose killing witnesses are inherently multi-element. Soft, weight 1: loses to hard spec constraints and to the upper cap, so specs that pin `|s|=1` still get `|s|=1`. Default 0 (no extra bias — current behaviour).");
         var noShapeExclusionOpt = new Option<bool>("--no-shape-exclusion", () => false, "Disable ordering-shape exclusion. By default ON: Phase 3 round-robin repeats exclude prior ordering shapes for int-typed seq/array inputs (not just prior values). Shape = the rank-vector equivalence class under monotonic value remap (e.g. `[1,2,1,2]`, `[10,20,10,20]` share shape `[0,1,0,1]`; `[1,1,2,2]` has shape `[0,0,1,1]`). Encoded as n disjuncts using the prior's sort permutation σ. Combined with shape-pinned subsumption: if any prior test of the same shape already satisfies the candidate's tier objective under value pin, the candidate is skipped (catches cross-base redundancy without the over-restriction of pure shape-hash dedup). Forces structurally distinct inputs (different sort orders / equality patterns / lengths) rather than just different element values at the same shape. This flag disables the whole shape mechanism (per-base seeding + shape-pinned subsumption probe).");
+        var noSkolemizeOpt = new Option<bool>("--no-skolemize-exists", () => false, "Disable Skolemization of positive top-level existential postconditions. By default ON: `ensures exists vars :: body` lifts `vars` to GHOST outputs and replaces the literal with `body`, so the inner conjuncts/disjuncts become first-class DNF literals handled by the normal relevance/BVA pipeline (the witness is a Skolem function of the input, solved on the generation side; ghost outputs are excluded from the method call and runtime oracle, which keeps the original `exists` via the full-postcondition expect). Unifies exists::AND and exists::OR into ordinary DNF. This flag restores the legacy atomic-exists handling for A/B measurement.");
         var trustUnknownOpt = new Option<bool>("--trust-unknown", () => false, "Trust Z3 output values when uniqueness check returns 'unknown' (default: false — safer: treat unknown as not-unique and fall back to full-postcondition expects)");
         var uniquenessRoundsOpt = new Option<int>("--uniqueness-rounds", () => 4, "Max rounds of uniqueness checking to enumerate all valid outputs (default: 4). When all valid outputs are enumerated, emit expect out == v1 || out == v2 || ...;");
         uniquenessRoundsOpt.AddAlias("-u");
@@ -209,7 +222,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noShapeExclusionOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noShapeExclusionOpt, noSkolemizeOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -237,6 +250,7 @@ class Program
             SmtTranslator.BoundedFoldEnabled = !ctx.ParseResult.GetValueForOption(noBoundedFoldOpt);
             SmtTranslator.MinSeqLen = ctx.ParseResult.GetValueForOption(minSeqLenOpt);
             SmtTranslator.ShapeExclusionEnabled = !ctx.ParseResult.GetValueForOption(noShapeExclusionOpt);
+            SkolemizeExists = !ctx.ParseResult.GetValueForOption(noSkolemizeOpt);
             CapSmallSizeRepeats = ctx.ParseResult.GetValueForOption(capSmallSizeRepeatsOpt);
             DeadClausePruning = !ctx.ParseResult.GetValueForOption(noDeadClausePruningOpt);
             PrecondFill = !ctx.ParseResult.GetValueForOption(noPrecondFillOpt);
@@ -1520,6 +1534,13 @@ class Program
             }
         }
 
+        // Skolemization state (the per-DNF-clause lift runs after decomposition,
+        // below — see "Skolemization (per-DNF-clause)"). Declared here so they're
+        // visible to the `outputs` append and the expect-fallback further down.
+        var ghostOutputs = new List<(string Name, string Type)>();
+        var ghostOutputNames = new HashSet<string>();
+        bool skolemizedAny = false;
+
         // Detect uninterpreted constructs reachable from postcondition. Set/map/seq
         // comprehensions (e.g. AsSet body `set k | ... :: a[k]`) leave Z3 free to pick
         // arbitrary output model values. Outputs pinned on such arbitrary values break
@@ -1773,6 +1794,67 @@ class Program
                 Console.WriteLine($"  Pre-post pruning: {before} -> {dnfExprs.Count} FDNF clauses");
         }
 
+        // --- Skolemization (per-DNF-clause) ---
+        // For each DNF clause, lift any POSITIVE existential literal's witnesses to
+        // ghost outputs and splice in its body, then re-DNF the clause (so a
+        // disjunctive body `∃::(P1∨P2)` splits into per-disjunct clauses). DNF has
+        // already pushed `&&` / `==>` / `<==>` into clause structure, so the exists
+        // lands in a definite polarity per clause: positive occurrences (`cond ∧ ∃`,
+        // the `result ∧ ∃` branch of an iff) are Skolemized; negated ones (`¬∃` = `∀`)
+        // are left for the forall machinery. The witness becomes a Skolem function of
+        // the input solved on the generation side; ghost outputs join the generation
+        // `outputs` list but not `method.Outs`, and Skolemized clauses route their
+        // expect to the full original postcondition (forced further below).
+        if (SkolemizeExists && dnfExprs.Count > 0)
+        {
+            static Expression SkUnwrap(Expression e)
+            {
+                while (true)
+                {
+                    if (e is ParensExpression p) { e = p.E; continue; }
+                    if (e is ConcreteSyntaxExpression c && c.ResolvedExpression != null) { e = c.ResolvedExpression; continue; }
+                    return e;
+                }
+            }
+            var skClauses = new List<List<Expression>>();
+            foreach (var clause in dnfExprs)
+            {
+                if (!clause.Any(l => SkUnwrap(l) is ExistsExpr ex0 && ex0.BoundVars.Count > 0))
+                {
+                    skClauses.Add(clause);
+                    continue;
+                }
+                var parts = new List<Expression>();
+                foreach (var l in clause)
+                {
+                    if (SkUnwrap(l) is ExistsExpr ex && ex.BoundVars.Count > 0)
+                    {
+                        foreach (var bv in ex.BoundVars)
+                            if (ghostOutputNames.Add(bv.Name))
+                                ghostOutputs.Add((bv.Name, bv.Type?.ToString() ?? "int"));
+                        // `exists v | R :: B` ≡ `exists v :: R ∧ B`; conjoin the range guard.
+                        parts.Add(ex.Range != null
+                            ? new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.And, ex.Range, ex.Term)
+                            : ex.Term);
+                    }
+                    else parts.Add(l);
+                }
+                // Re-DNF the conjunction of kept literals + spliced bodies — distributes
+                // a disjunctive exists body into separate clauses.
+                Expression conj = parts[0];
+                for (int k = 1; k < parts.Count; k++)
+                    conj = new BinaryExpr(Token.NoToken, BinaryExpr.Opcode.And, conj, parts[k]);
+                skClauses.AddRange(DnfEngine.ExprToDnf(conj));
+                skolemizedAny = true;
+            }
+            if (skolemizedAny)
+            {
+                dnfExprs = skClauses;
+                if (verbose)
+                    Console.WriteLine($"  Skolemize: lifted {ghostOutputNames.Count} witness(es) [{string.Join(",", ghostOutputNames)}]; {dnfExprs.Count} clause(s) after re-DNF");
+            }
+        }
+
         // Check for unsolvable patterns after predicate inlining.
         // Strip function-call args first: patterns inside uninterpreted-function calls
         // are opaque to Z3, so don't trigger the fallback. Repeatedly elide innermost `(...)`
@@ -1869,6 +1951,10 @@ class Program
         // Collect input/output variable info
         var inputs = method.Ins.Select(f => (f.Name, Type: f.Type.ToString())).ToList();
         var outputs = method.Outs.Select(f => (f.Name, Type: f.Type.ToString())).ToList();
+        // Skolemized existential witnesses join the generation-side outputs (so DNF
+        // literals over them are solvable and relevance-checkable) but NOT method.Outs
+        // (so the call / value-decls / oracle stay on the real returns).
+        outputs.AddRange(ghostOutputs);  // ghostOutputNames already populated by the per-clause lift
 
         // Detect class context for simple class methods (passed from caller)
         // classInfo is set when method is inside a simple class
@@ -5135,7 +5221,10 @@ class Program
             // that DNF expanded into extra literals). Per-literal back-mapping is
             // position-based and would mis-label literals across the count change.
             bool inliningChangedStructure = clausesWithStructuralInlining.Count > 0;
-            if (hasNonInlinableFuncs || !tcUnique || inliningChangedStructure)
+            // Skolemized clauses reference ghost witnesses (i,j) that aren't real
+            // outputs — their per-clause literals can't be emitted as runtime expects.
+            // Route them to the full original postcondition (the un-rewritten `exists`).
+            if (hasNonInlinableFuncs || !tcUnique || inliningChangedStructure || skolemizedAny)
             {
                 litStrings = fullPostconditionStrings;
             }
