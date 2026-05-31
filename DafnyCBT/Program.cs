@@ -47,6 +47,34 @@ class Program
     // repeats, |x|=2 → ≤1). Reallocates round-robin budget to larger/diverse
     // bases. Set from --cap-small-size-repeats. Default off.
     public static bool CapSmallSizeRepeats = false;
+
+    // True when `label`'s most-specific tier PINS a value/length to a single
+    // point (strict equality), as opposed to an open/range tier that can sweep
+    // many distinct inputs. Strict pins have near-zero productive capacity in
+    // Phase 3 round-robin — a repeat can only vary the *unpinned* inputs — so
+    // (a) subsumed strict-pin candidates are NOT registered as Phase 3 bases,
+    // and (b) under --cap-small-size-repeats, non-subsumed strict pins get
+    // ≤1 Phase 3 repeat. Loose tiers (>=N, >N, mid, /Rel, /Eb=lo/hi which pin
+    // only the witness position with contents free, frame =old) return false.
+    //
+    // Matched strict forms (anchored at the end of the base label, before any
+    // /R or /Rel Phase-3 suffix is appended):
+    //   /O|x|=N         collection size pinned exactly
+    //   /Ox=N           scalar output/value pinned to a constant (not =old)
+    //   /Bvar=N         variable-centric boundary constant
+    //   /BL:<lit>=[±N]  literal-centric boundary (E1 = bound); companion
+    //                   (/BL:<lit>> or <) is loose and does NOT match
+    //   /…/=lo /=hi     chain endpoint pins (±1 neighbor variants included)
+    internal static bool IsStrictPinLabel(string label)
+    {
+        if (string.IsNullOrEmpty(label)) return false;
+        return
+            System.Text.RegularExpressions.Regex.IsMatch(label, @"/O\|[^|]*\|=\d+$")          // size |x|=N
+            || System.Text.RegularExpressions.Regex.IsMatch(label, @"/O[A-Za-z_][\w']*=-?\d+$") // scalar Ox=N
+            || System.Text.RegularExpressions.Regex.IsMatch(label, @"/B[A-Za-z_][\w']*=-?\d+$")  // var boundary /Bvar=N
+            || System.Text.RegularExpressions.Regex.IsMatch(label, @"/BL:.*=(?:[+-]\d+)?$")       // literal-centric boundary
+            || System.Text.RegularExpressions.Regex.IsMatch(label, @"/=(?:lo|hi)(?:[+-]\d+)?$");  // chain endpoint
+    }
     // Dead-clause pruning: once a clause's plain (no-tier) combination is
     // definitively Z3-UNSAT, every tier sub-combination of that same clause is
     // also UNSAT (tiers only ADD constraints). Persist that fact across the
@@ -4635,6 +4663,14 @@ class Program
                 foreach (var (sLabel, sLits, sPreLits, sExcls, sExtras, sSeedExclusions) in subsumedBases)
                 {
                     if (!seenBaseLabels.Add(sLabel)) continue;
+                    // Strict-pin subsumed candidates have ~zero productive Phase 3
+                    // capacity (they couldn't even produce a distinct Phase 2 test, and
+                    // their tier pins a single point). Registering them gives them equal
+                    // round-robin footing with loose bases, diluting the budget and
+                    // pushing genuine kills to higher k (observed: Square_root ROR_Lt
+                    // k=1→5 in v9). Skip them — keep only loose subsumed bases (>=N, >N,
+                    // mid, /Rel, open) where Phase 3 can genuinely find distinct inputs.
+                    if (IsStrictPinLabel(sLabel)) continue;
                     var baseKey = ScheduleKey(sLits, sExcls, sPreLits);
                     bases.Add((sLabel, sLits, sPreLits, sExcls, sExtras, baseKey));
                     subsumedSeeds[sLabel] = sSeedExclusions;
@@ -4725,13 +4761,20 @@ class Program
                                 // Degenerate-value tiers (0 repeats): empty/singleton
                                 // collection `|x|=1`, boundary constant `=0`.
                                 // Near-degenerate (≤1 repeat): `|x|=2`, boundary `=1`.
-                                // The Phase-2b/literal-BVA base test is already
-                                // emitted; only its round-robin /R repeats are capped.
+                                // ANY OTHER strict pin (size=N≥3, scalar=N, literal-
+                                // centric boundary, chain endpoint) → ≤1 repeat: a
+                                // strict pin can only vary the *unpinned* inputs across
+                                // repeats, so one diversification is enough; beyond that,
+                                // the round-robin budget is better spent on loose tiers
+                                // (>=N, >N, mid, /Rel) that sweep the pinned dimension.
+                                // The Phase-2/2b base test is already emitted; only the
+                                // /R repeats are capped.
                                 int ssCap =
                                     Regex.IsMatch(label, @"/O\|[^|]+\|=1(?:$|/)") ? 0 :  // size |x|=1
                                     Regex.IsMatch(label, @"/B[\w']+=0(?:$|/)")    ? 0 :  // boundary =0
                                     Regex.IsMatch(label, @"/O\|[^|]+\|=2(?:$|/)") ? 1 :  // size |x|=2
                                     Regex.IsMatch(label, @"/B[\w']+=1(?:$|/)")    ? 1 :  // boundary =1
+                                    IsStrictPinLabel(label)                       ? 1 :  // any other strict pin
                                     int.MaxValue;
                                 if (perBaseRoundIdx[label] >= ssCap) continue;
                             }
