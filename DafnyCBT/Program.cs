@@ -3620,7 +3620,12 @@ class Program
         // MAX_SUBSUME_PRIOR most-recent results. Conservative on translator failures:
         // if pinning yields no eqParts, we don't treat as covered.
         const int MAX_SUBSUME_PRIOR = 20;
-        async Task<bool> IsAlreadyCovered(
+        // Returns the subsuming prior's values (the prior whose value-pin satisfies the
+        // candidate's tier objective), or null if no prior covers the candidate. Callers
+        // that only need a bool can compare to null; callers that want to seed the new
+        // Phase 3 base's exclusion list with the subsuming prior's fingerprint use the
+        // returned values directly.
+        async Task<Dictionary<string, string>?> IsAlreadyCovered(
             List<Expression> lits, List<Expression> preLits, List<Expression> excl,
             List<string> tierExtra,
             List<(string label, Dictionary<string, string> values, List<Expression> literals)> results)
@@ -3628,16 +3633,16 @@ class Program
             int start = Math.Max(0, results.Count - MAX_SUBSUME_PRIOR);
             for (int i = results.Count - 1; i >= start; i--)
             {
-                if (TimedOut()) return false;
+                if (TimedOut()) return null;
                 var pin = BuildModelPin(results[i].values);
                 if (pin == null) continue;
                 var extraWithPin = new List<string>(tierExtra) { pin };
                 var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, false, excl, extraWithPin, preLits, mutableNames);
                 var result = await Z3Runner.RunZ3(z3Path, smt);
                 if (result.Split('\n').Select(l => l.Trim()).Any(l => l == "sat"))
-                    return true;
+                    return results[i].values;
             }
-            return false;
+            return null;
         }
 
         // Shape-pinned subsumption for Phase 3 (--shape-exclusion). After a
@@ -3700,7 +3705,9 @@ class Program
         // Subsumed Phase 1/2 candidates that should still participate as Phase 3 bases.
         // Declared before SolveRange so the local function can capture it; populated by
         // the subsumption branch when a candidate's tier objective is already covered.
-        var subsumedBases = new List<(string label, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, List<string> extras)>();
+        // The `seedExclusions` list holds the subsuming prior's input fingerprint so the
+        // first Phase 3 /R round on this base immediately seeks a distinct input.
+        var subsumedBases = new List<(string label, List<Expression> literals, List<Expression> preLits, List<Expression> exclusions, List<string> extras, List<string> seedExclusions)>();
         async Task<int> SolveRange(
             List<(string label, List<Expression> literals, List<Expression> preLiterals, List<Expression> exclusions, List<string> extraConstraints, int postMask, int preIdx)> schedule,
             int from, int to, int displayTotal,
@@ -3791,22 +3798,27 @@ class Program
                 // If a previously generated test case already witnesses this candidate's
                 // literals under its tier constraints, skip the redundant Phase 2 emission
                 // — but REGISTER the candidate as a Phase 3 base so the round-robin can
-                // still attempt distinct-input variants on it. Phase 3 accumulates input
-                // exclusions across all prior tests via `seenInputs`, so a /R round on a
-                // subsumed-but-registered base either finds a structurally distinct input
-                // (genuine new test) or returns UNSAT (the base drops naturally — same
-                // effective behaviour as today). Without registration, subsumption
-                // permanently coalesces N tier candidates into one base; with it, the
-                // base survives and contributes to Phase 3 diversification.
+                // still attempt distinct-input variants on it. The subsuming prior's
+                // input fingerprint is recorded as a SEED exclusion: Phase 3's first /R
+                // round on this base solves with the prior already excluded, so we
+                // immediately get a structurally distinct input rather than re-deriving
+                // the prior and getting fingerprint-rejected (which would waste 1-3 Z3
+                // calls before the base drops via MAX_CONSECUTIVE_DUPS). Without
+                // registration, subsumption permanently coalesces N tier candidates into
+                // one base; with seeded registration, the base immediately contributes a
+                // distinct test to Phase 3 diversification.
                 if (enableSubsumption && results.Count > 0)
                 {
                     var tierExtra = new List<string>(globalExtraConstraints);
                     tierExtra.AddRange(extraConstraints);
-                    if (await IsAlreadyCovered(literals, preLits, exclusions, tierExtra, results))
+                    var subsumingValues = await IsAlreadyCovered(literals, preLits, exclusions, tierExtra, results);
+                    if (subsumingValues != null)
                     {
                         if (verbose) Console.WriteLine($"  Combination {label}: skipped (subsumed by prior test case)");
                         subsumedCount++;
-                        subsumedBases.Add((label, literals, preLits, exclusions, new List<string>(extraConstraints)));
+                        var seedExcl = BuildInputExclusion(subsumingValues);
+                        var seedList = seedExcl != null ? new List<string> { seedExcl } : new List<string>();
+                        subsumedBases.Add((label, literals, preLits, exclusions, new List<string>(extraConstraints), seedList));
                         continue;
                     }
                 }
@@ -3894,7 +3906,7 @@ class Program
                         }
                         var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}/Rel";
                         if (testCases.Count > 0 &&
-                            await IsAlreadyCovered(clause, fullPreLits, new List<Expression>(), new List<string>(), testCases))
+                            await IsAlreadyCovered(clause, fullPreLits, new List<Expression>(), new List<string>(), testCases) != null)
                         {
                             coveredByRelevance.Add((pi, ci));
                             relSkipped++;
@@ -4611,15 +4623,21 @@ class Program
                 }
                 // Subsumed Phase 1/2 candidates: register their tier objectives as Phase
                 // 3 bases too, so the round-robin gets a chance to find a structurally
-                // distinct input under the accumulating cross-base exclusions. Each base
-                // carries the candidate's original tier `extras`; Phase 3's existing
-                // input-exclusion / shape-exclusion / fingerprint mechanisms take care of
-                // ensuring the /R rounds don't re-pick the subsuming prior's input.
-                foreach (var (sLabel, sLits, sPreLits, sExcls, sExtras) in subsumedBases)
+                // distinct input. Each carries its candidate's original tier `extras` and
+                // a `seedExclusions` list (the subsuming prior's input fingerprint).
+                // The seed feeds the perBaseExclusions table below, so round 1 on this
+                // base already has the subsuming prior excluded — Z3 must find a distinct
+                // input or return UNSAT (in which case the base drops naturally on round 1).
+                // Without the seed, round 1 would re-derive the subsuming prior, then
+                // get fingerprint-rejected and burn MAX_CONSECUTIVE_DUPS rounds before
+                // dropping.
+                var subsumedSeeds = new Dictionary<string, List<string>>();
+                foreach (var (sLabel, sLits, sPreLits, sExcls, sExtras, sSeedExclusions) in subsumedBases)
                 {
                     if (!seenBaseLabels.Add(sLabel)) continue;
                     var baseKey = ScheduleKey(sLits, sExcls, sPreLits);
                     bases.Add((sLabel, sLits, sPreLits, sExcls, sExtras, baseKey));
+                    subsumedSeeds[sLabel] = sSeedExclusions;
                 }
 
                 if (bases.Count == 0)
@@ -4631,6 +4649,13 @@ class Program
                     // Per-base mutable state.
                     var perBaseExclusions = bases.ToDictionary(b => b.label, b => new List<string>(
                         baseConditionExclusions.TryGetValue(b.baseKey, out var prior) ? prior : Enumerable.Empty<string>()));
+                    // Layer the subsumed bases' seed exclusions on top — the subsuming
+                    // prior's fingerprint is added so /R round 1 already has it excluded.
+                    foreach (var kv in subsumedSeeds)
+                    {
+                        if (perBaseExclusions.TryGetValue(kv.Key, out var list))
+                            list.AddRange(kv.Value);
+                    }
                     // Seed open-tier (`/O|<var>|>=K`) bases with a length exclusion
                     // derived from their own Phase 2 witness, so the first Phase 3
                     // round is forced to pick a length strictly greater than the
