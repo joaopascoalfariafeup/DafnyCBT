@@ -60,6 +60,12 @@ class Program
     // for Skolemized clauses. Default ON; --no-skolemize-exists to opt out (A/B).
     public static bool SkolemizeExists = true;
 
+    // Carve-out: by default we do NOT Skolemize an exists whose body's LAST conjunct
+    // is a quantifier (a maximality/uniqueness tail, e.g. FindFirstRepeatedChar), since
+    // the legacy atomic-exists path drives that shape deterministically. Set false via
+    // --no-skolemize-carveout to Skolemize those too (A/B for the maximality coverage gap).
+    public static bool SkolemizeCarveOut = true;
+
     // True when `label`'s most-specific tier PINS a value/length to a single
     // point (strict equality), as opposed to an open/range tier that can sweep
     // many distinct inputs. Strict pins have near-zero productive capacity in
@@ -163,6 +169,7 @@ class Program
         var minSeqLenOpt = new Option<int>("--min-seq-len", () => 0, "When > 0, add `(assert-soft (>= (seq.len s) N) :weight 1)` for each seq/array input — biases Z3 toward larger collections. Useful on fold-heavy corpora (verifixer_mutants) whose killing witnesses are inherently multi-element. Soft, weight 1: loses to hard spec constraints and to the upper cap, so specs that pin `|s|=1` still get `|s|=1`. Default 0 (no extra bias — current behaviour).");
         var noShapeExclusionOpt = new Option<bool>("--no-shape-exclusion", () => false, "Disable ordering-shape exclusion. By default ON: Phase 3 round-robin repeats exclude prior ordering shapes for int-typed seq/array inputs (not just prior values). Shape = the rank-vector equivalence class under monotonic value remap (e.g. `[1,2,1,2]`, `[10,20,10,20]` share shape `[0,1,0,1]`; `[1,1,2,2]` has shape `[0,0,1,1]`). Encoded as n disjuncts using the prior's sort permutation σ. Combined with shape-pinned subsumption: if any prior test of the same shape already satisfies the candidate's tier objective under value pin, the candidate is skipped (catches cross-base redundancy without the over-restriction of pure shape-hash dedup). Forces structurally distinct inputs (different sort orders / equality patterns / lengths) rather than just different element values at the same shape. This flag disables the whole shape mechanism (per-base seeding + shape-pinned subsumption probe).");
         var noSkolemizeOpt = new Option<bool>("--no-skolemize-exists", () => false, "Disable Skolemization of positive top-level existential postconditions. By default ON: `ensures exists vars :: body` lifts `vars` to GHOST outputs and replaces the literal with `body`, so the inner conjuncts/disjuncts become first-class DNF literals handled by the normal relevance/BVA pipeline (the witness is a Skolem function of the input, solved on the generation side; ghost outputs are excluded from the method call and runtime oracle, which keeps the original `exists` via the full-postcondition expect). Unifies exists::AND and exists::OR into ordinary DNF. This flag restores the legacy atomic-exists handling for A/B measurement.");
+        var noSkolemizeCarveOutOpt = new Option<bool>("--no-skolemize-carveout", () => false, "Disable the quantifier-last carve-out in Skolemization. By default the carve-out is ON: an `exists vars :: body` whose body's LAST conjunct is itself a quantifier (a maximality/uniqueness tail, e.g. FindFirstRepeatedChar's `exists i,j :: … ∧ forall k,l :: … ⟹ k>=i`) is NOT Skolemized — it stays atomic and is driven by the legacy stripped-existential + output-boundary path, which deterministically constructs the discriminating input (two distinct repeated chars). This flag turns the carve-out OFF so those existentials are Skolemized like the rest (the maximality forall becomes a first-class finite-expanded literal over the ghost witnesses), for A/B measurement of the maximality coverage gap.");
         var trustUnknownOpt = new Option<bool>("--trust-unknown", () => false, "Trust Z3 output values when uniqueness check returns 'unknown' (default: false — safer: treat unknown as not-unique and fall back to full-postcondition expects)");
         var uniquenessRoundsOpt = new Option<int>("--uniqueness-rounds", () => 4, "Max rounds of uniqueness checking to enumerate all valid outputs (default: 4). When all valid outputs are enumerated, emit expect out == v1 || out == v2 || ...;");
         uniquenessRoundsOpt.AddAlias("-u");
@@ -222,7 +229,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noShapeExclusionOpt, noSkolemizeOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noShapeExclusionOpt, noSkolemizeOpt, noSkolemizeCarveOutOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -251,6 +258,7 @@ class Program
             SmtTranslator.MinSeqLen = ctx.ParseResult.GetValueForOption(minSeqLenOpt);
             SmtTranslator.ShapeExclusionEnabled = !ctx.ParseResult.GetValueForOption(noShapeExclusionOpt);
             SkolemizeExists = !ctx.ParseResult.GetValueForOption(noSkolemizeOpt);
+            SkolemizeCarveOut = !ctx.ParseResult.GetValueForOption(noSkolemizeCarveOutOpt);
             CapSmallSizeRepeats = ctx.ParseResult.GetValueForOption(capSmallSizeRepeatsOpt);
             DeadClausePruning = !ctx.ParseResult.GetValueForOption(noDeadClausePruningOpt);
             PrecondFill = !ctx.ParseResult.GetValueForOption(noPrecondFillOpt);
@@ -1816,10 +1824,53 @@ class Program
                     return e;
                 }
             }
+            // Skolemize an exists only when its LAST body conjunct is NOT a quantifier.
+            // The quantifier-last-conjunct family carries a *maximality/uniqueness* sub-
+            // quantifier (e.g. FindFirstRepeatedChar's `exists i,j :: … ∧ forall k,l :: …
+            // ⟹ k>=i`, "i is the smallest repeat index"). Skolemizing it REGRESSES, and the
+            // root cause is RELEVANCE, not generation:
+            //
+            // Relevance asks "is literal L load-bearing for the output?" via the proxy
+            // "flip L → can the output differ?" (`∃ O via full clause, ∃ O' via clause−L∧¬L,
+            // O≠O'`). That proxy is correct for witness-free literals, but for an existential
+            // literal it is FOOLED whenever the spec admits multiple outputs through DIFFERENT
+            // witnesses: the same output char is reachable on BOTH sides of the flip, so "can
+            // differ" is satisfied by spec AMBIGUITY rather than by L. The correct criterion
+            // is "does L EXCLUDE an otherwise-achievable output?" = `¬∃witness: FullClause(s,O')`
+            // — a negated existential, i.e. ∀-over-witnesses. That requires the witness to stay
+            // BOUND inside the literal: keeping the exists atomic makes ¬Q exactly that ∀, and
+            // the stripped-existential strengthening encodes "O' achievable without maximality
+            // but not with" (the genuine set-difference). Skolemizing FREES i,j to ghost outputs,
+            // collapsing ¬maximality to a per-fixed-witness toggle — the weak proxy — so the
+            // path emits ambiguous non-killers (e.g. "dnnmncdd", where the spec admits both 'd'
+            // and 'n' because the maximality's `l<j` window lets a short witness escape it).
+            //
+            // Worked example — input "dnnmncdd" = ['d','n','n','m','n','c','d','d']:
+            //   achievable c with maximality = {d,n}; without maximality = {d,n}  → UNCHANGED,
+            //   so the maximality is genuinely irrelevant here and the input can't kill (the
+            //   mutant's wrong output is itself spec-valid — loose-spec kill ceiling). The atomic
+            //   stripped-strengthen correctly goes UNSAT on it (no repeated char is maximality-
+            //   EXCLUDED) and instead emits "~~MM"/[a,a,b,b], where 'b' IS excluded → kills.
+            //
+            // So the carveout is a relevance fix, not a generation trick: it keeps the witness
+            // bound exactly where Skolemization would degrade the relevance criterion. A general
+            // alternative (deferred) re-existentializes the ghost witness inside the relevance
+            // query and asserts each alt output is unachievable by the full clause — same effect,
+            // more machinery — gated on the engine's output-uniqueness signal. See methodology.md
+            // and --no-skolemize-carveout for A/B.
+            // So defer the quantifier-last family to the legacy atomic-exists path.
+            static bool SkSkolemizable(ExistsExpr ex)
+            {
+                if (ex.BoundVars.Count == 0) return false;
+                if (!SkolemizeCarveOut) return true; // --no-skolemize-carveout: Skolemize the quantifier-last family too
+                var conjs = DnfEngine.FlattenConjuncts(SkUnwrap(ex.Term));
+                var last = SkUnwrap(conjs[conjs.Count - 1]);
+                return last is not (ForallExpr or ExistsExpr);
+            }
             var skClauses = new List<List<Expression>>();
             foreach (var clause in dnfExprs)
             {
-                if (!clause.Any(l => SkUnwrap(l) is ExistsExpr ex0 && ex0.BoundVars.Count > 0))
+                if (!clause.Any(l => SkUnwrap(l) is ExistsExpr ex0 && SkSkolemizable(ex0)))
                 {
                     skClauses.Add(clause);
                     continue;
@@ -1827,7 +1878,7 @@ class Program
                 var parts = new List<Expression>();
                 foreach (var l in clause)
                 {
-                    if (SkUnwrap(l) is ExistsExpr ex && ex.BoundVars.Count > 0)
+                    if (SkUnwrap(l) is ExistsExpr ex && SkSkolemizable(ex))
                     {
                         foreach (var bv in ex.BoundVars)
                             if (ghostOutputNames.Add(bv.Name))
@@ -1955,6 +2006,11 @@ class Program
         // literals over them are solvable and relevance-checkable) but NOT method.Outs
         // (so the call / value-decls / oracle stay on the real returns).
         outputs.AddRange(ghostOutputs);  // ghostOutputNames already populated by the per-clause lift
+        // Exclude ghost witnesses from the relevance `outs ≠ outs_alt` inequality and
+        // uniqueness checks — anchor those to the REAL observable outputs, else a
+        // relevance shadow is satisfied by a trivially-different witness position
+        // (move i,j, keep the real output) and never forces a discriminating input.
+        SmtTranslator.GhostOutputNames = ghostOutputNames;
 
         // Detect class context for simple class methods (passed from caller)
         // classInfo is set when method is inside a simple class

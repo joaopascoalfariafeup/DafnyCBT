@@ -244,6 +244,15 @@ static class SmtTranslator
     // Soft, weight 1 — loses to hard spec constraints and to the upper cap
     // weight 2, so a spec that forces len=1 still gets len=1.
     internal static int MinSeqLen = 0;
+    // Skolemized existential witnesses (lifted to ghost outputs in Program.cs).
+    // They are solvable generation-side outputs, but must be EXCLUDED from the
+    // relevance `outs ≠ outs_alt` inequality and the uniqueness/alt-enum checks:
+    // otherwise a relevance shadow is satisfied trivially by a *different witness
+    // position with the same real output* (move i,j, keep c), so it never forces
+    // a discriminating real-output difference. Anchoring those checks to the real
+    // observable is what makes e.g. FindFirstRepeatedChar's maximality-forall
+    // relevance force a multi-repeat input. Set per-method by Program.cs.
+    internal static HashSet<string> GhostOutputNames = new();
     // When true, Phase 3 round-robin emits ordering-shape exclusions for prior
     // int-typed seq/array witnesses in addition to input-fingerprint exclusions,
     // and performs shape-pinned subsumption against priors of matching shape.
@@ -6246,7 +6255,10 @@ static class SmtTranslator
     {
         var disjuncts = new List<string>();
         foreach (var (name, type) in outputs)
+        {
+            if (GhostOutputNames.Contains(name)) continue;  // exclude Skolemized witnesses
             CollectIneqTerms(disjuncts, name, type, isMutablePost: false, suffix);
+        }
         foreach (var (name, type) in inputs)
         {
             if (!mutableNames.Contains(name)) continue;
