@@ -48,6 +48,15 @@ class Program
     // bases. Set from --cap-small-size-repeats. Default off.
     public static bool CapSmallSizeRepeats = false;
 
+    // Recover subsumed Phase 2 candidates as Phase 3 round-robin bases: when a
+    // Phase 2 tier is subsumed by a prior test (pruned), still register it as a
+    // base seeded with the subsuming prior's fingerprint so the round-robin can
+    // find a structurally distinct variant. Default ON; --no-subsumed-bases prunes
+    // without registering (for A/B — recovery can dilute the budget and push some
+    // kills to higher k). NOT the same as --no-shape-exclusion, which only strips
+    // the shape-based seed exclusions layered on these bases, not the registration.
+    public static bool RecoverSubsumedBases = true;
+
     // Skolemize positive existential postconditions (per DNF clause): lift the
     // existential witnesses to GHOST outputs and replace `exists vars :: body`
     // with `body`, so DNF/relevance/BVA treat the inner conjuncts/disjuncts as
@@ -169,6 +178,8 @@ class Program
         var minSeqLenOpt = new Option<int>("--min-seq-len", () => 0, "When > 0, add `(assert-soft (>= (seq.len s) N) :weight 1)` for each seq/array input — biases Z3 toward larger collections. Useful on fold-heavy corpora (verifixer_mutants) whose killing witnesses are inherently multi-element. Soft, weight 1: loses to hard spec constraints and to the upper cap, so specs that pin `|s|=1` still get `|s|=1`. Default 0 (no extra bias — current behaviour).");
         var noShapeExclusionOpt = new Option<bool>("--no-shape-exclusion", () => false, "Disable ordering-shape exclusion. By default ON: Phase 3 round-robin repeats exclude prior ordering shapes for int-typed seq/array inputs (not just prior values). Shape = the rank-vector equivalence class under monotonic value remap (e.g. `[1,2,1,2]`, `[10,20,10,20]` share shape `[0,1,0,1]`; `[1,1,2,2]` has shape `[0,0,1,1]`). Encoded as n disjuncts using the prior's sort permutation σ. Combined with shape-pinned subsumption: if any prior test of the same shape already satisfies the candidate's tier objective under value pin, the candidate is skipped (catches cross-base redundancy without the over-restriction of pure shape-hash dedup). Forces structurally distinct inputs (different sort orders / equality patterns / lengths) rather than just different element values at the same shape. This flag disables the whole shape mechanism (per-base seeding + shape-pinned subsumption probe).");
         var noSkolemizeOpt = new Option<bool>("--no-skolemize-exists", () => false, "Disable Skolemization of positive top-level existential postconditions. By default ON: `ensures exists vars :: body` lifts `vars` to GHOST outputs and replaces the literal with `body`, so the inner conjuncts/disjuncts become first-class DNF literals handled by the normal relevance/BVA pipeline (the witness is a Skolem function of the input, solved on the generation side; ghost outputs are excluded from the method call and runtime oracle, which keeps the original `exists` via the full-postcondition expect). Unifies exists::AND and exists::OR into ordinary DNF. This flag restores the legacy atomic-exists handling for A/B measurement.");
+        var strictRelevanceOpt = new Option<bool>("--strict-relevance", () => false, "Use the STRICT relevance criterion (default off). The plain relevance check asks 'flip literal Q_k → can the output differ?' (`outs ≠ outs_alt`), which is fooled when the spec admits multiple outputs through different witnesses — an existential literal looks relevant via spec ambiguity rather than because it constrains the output. Strict relevance additionally asserts the alt output is UNACHIEVABLE by the full clause with the ghost witnesses RE-EXISTENTIALIZED (`¬∃ ghosts: FullClause(observable_alt, ghosts)`) — the set-difference criterion 'does Q_k EXCLUDE an otherwise-achievable output?'. No-op for witness-free clauses; on Skolemized existential clauses it makes relevance strict WITHOUT needing the quantifier-last carve-out (so it composes with --no-skolemize-carveout). A/B / overall-impact flag.");
+        var noSubsumedBasesOpt = new Option<bool>("--no-subsumed-bases", () => false, "Disable recovery of subsumed Phase 2 candidates as Phase 3 round-robin bases. By default ON: a Phase 2 tier that is subsumed by a prior test is still registered as a Phase 3 base (seeded with the subsuming prior's fingerprint) so the round-robin can find a structurally distinct variant. This flag prunes the subsumed tier WITHOUT registering it (subsumption pruning itself is unaffected — only the base recovery is dropped). For A/B: recovery can dilute the round-robin budget and push some kills to higher k. Note: distinct from --no-shape-exclusion, which only strips the shape-based seed exclusions layered on these bases, not the registration.");
         var noSkolemizeCarveOutOpt = new Option<bool>("--no-skolemize-carveout", () => false, "Disable the quantifier-last carve-out in Skolemization. By default the carve-out is ON: an `exists vars :: body` whose body's LAST conjunct is itself a quantifier (a maximality/uniqueness tail, e.g. FindFirstRepeatedChar's `exists i,j :: … ∧ forall k,l :: … ⟹ k>=i`) is NOT Skolemized — it stays atomic and is driven by the legacy stripped-existential + output-boundary path, which deterministically constructs the discriminating input (two distinct repeated chars). This flag turns the carve-out OFF so those existentials are Skolemized like the rest (the maximality forall becomes a first-class finite-expanded literal over the ghost witnesses), for A/B measurement of the maximality coverage gap.");
         var trustUnknownOpt = new Option<bool>("--trust-unknown", () => false, "Trust Z3 output values when uniqueness check returns 'unknown' (default: false — safer: treat unknown as not-unique and fall back to full-postcondition expects)");
         var uniquenessRoundsOpt = new Option<int>("--uniqueness-rounds", () => 4, "Max rounds of uniqueness checking to enumerate all valid outputs (default: 4). When all valid outputs are enumerated, emit expect out == v1 || out == v2 || ...;");
@@ -229,7 +240,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noShapeExclusionOpt, noSkolemizeOpt, noSkolemizeCarveOutOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noShapeExclusionOpt, noSubsumedBasesOpt, strictRelevanceOpt, noSkolemizeOpt, noSkolemizeCarveOutOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -257,6 +268,8 @@ class Program
             SmtTranslator.BoundedFoldEnabled = !ctx.ParseResult.GetValueForOption(noBoundedFoldOpt);
             SmtTranslator.MinSeqLen = ctx.ParseResult.GetValueForOption(minSeqLenOpt);
             SmtTranslator.ShapeExclusionEnabled = !ctx.ParseResult.GetValueForOption(noShapeExclusionOpt);
+            RecoverSubsumedBases = !ctx.ParseResult.GetValueForOption(noSubsumedBasesOpt);
+            SmtTranslator.StrictRelevance = ctx.ParseResult.GetValueForOption(strictRelevanceOpt);
             SkolemizeExists = !ctx.ParseResult.GetValueForOption(noSkolemizeOpt);
             SkolemizeCarveOut = !ctx.ParseResult.GetValueForOption(noSkolemizeCarveOutOpt);
             CapSmallSizeRepeats = ctx.ParseResult.GetValueForOption(capSmallSizeRepeatsOpt);
@@ -3986,9 +3999,12 @@ class Program
                     {
                         if (verbose) Console.WriteLine($"  Combination {label}: skipped (subsumed by prior test case)");
                         subsumedCount++;
-                        var seedExcl = BuildInputExclusion(subsumingValues);
-                        var seedList = seedExcl != null ? new List<string> { seedExcl } : new List<string>();
-                        subsumedBases.Add((label, literals, preLits, exclusions, new List<string>(extraConstraints), seedList));
+                        if (RecoverSubsumedBases)
+                        {
+                            var seedExcl = BuildInputExclusion(subsumingValues);
+                            var seedList = seedExcl != null ? new List<string> { seedExcl } : new List<string>();
+                            subsumedBases.Add((label, literals, preLits, exclusions, new List<string>(extraConstraints), seedList));
+                        }
                         continue;
                     }
                 }

@@ -253,6 +253,18 @@ static class SmtTranslator
     // observable is what makes e.g. FindFirstRepeatedChar's maximality-forall
     // relevance force a multi-repeat input. Set per-method by Program.cs.
     internal static HashSet<string> GhostOutputNames = new();
+    // Strict relevance (--strict-relevance, default off): in the relevance shadow
+    // block, additionally assert that the alt output is UNACHIEVABLE by the full
+    // clause with the ghost witnesses RE-EXISTENTIALIZED — `¬∃ ghosts:
+    // FullClause(observable_alt, ghosts)`. This is the set-difference criterion
+    // ("does Q_k EXCLUDE an otherwise-achievable output?") that the plain
+    // `outs ≠ outs_alt` proxy ("can the output differ?") misses when the spec
+    // admits multiple outputs through different witnesses (e.g. dnnmncdd, where
+    // c='n' is achievable both with and without the maximality forall). For
+    // witness-free clauses the extra assertion is trivially true (no ghosts to
+    // re-bind), so it's a no-op — it only bites on Skolemized existential clauses,
+    // where it makes the relevance strict WITHOUT the quantifier-last carve-out.
+    internal static bool StrictRelevance = false;
     // When true, Phase 3 round-robin emits ordering-shape exclusions for prior
     // int-typed seq/array witnesses in addition to input-fingerprint exclusions,
     // and performs shape-pinned subsumption against priors of matching shape.
@@ -5643,6 +5655,45 @@ static class SmtTranslator
             var ineq = BuildOutputInequalityClause(inputs, outputs, mutableNames, suffix);
             if (ineq == null) return null;
             sb.AppendLine(ineq);
+
+            // Strict relevance: assert the alt output is UNACHIEVABLE by the full
+            // clause with the ghost witnesses re-existentialized. The alt observable
+            // (found_alt, c_alt, …) is pinned via the rename map MINUS ghosts; the
+            // ghost vars (i, j) keep their bare names and are re-bound by an `exists`,
+            // so this is `¬∃ ghosts: ⋀ clause(observable_alt, ghosts)`. On Skolemized
+            // existential clauses this is the genuine set-difference relevance; on
+            // witness-free clauses there are no ghosts to bind, so it reduces to a
+            // no-op (the full clause is already false at the alt under ¬Qidx).
+            if (StrictRelevance && GhostOutputNames.Count > 0)
+            {
+                // Rename map for the alt observable, excluding ghost names (kept bare
+                // and re-existentialized below).
+                var ghostExclMap = renameMap.Where(kv => !GhostOutputNames.Contains(kv.Key))
+                                            .ToDictionary(kv => kv.Key, kv => kv.Value);
+                var conjParts = new List<string>();
+                bool strictOk = true;
+                for (int j = 0; j < postLiterals.Count; j++)
+                {
+                    var lit = postLiterals[j];
+                    if (TypeUtils.IsSpecOnlyLiteral(DnfEngine.ExprToString(lit))) continue;
+                    ResetExprToSmtBudget();
+                    var s = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true);
+                    if (s == null) { strictOk = false; break; }
+                    conjParts.Add(ApplyOutputAltRenames(s, ghostExclMap));
+                }
+                var ghosts = outputs.Where(o => GhostOutputNames.Contains(o.Name)).ToList();
+                if (strictOk && conjParts.Count > 0 && ghosts.Count > 0)
+                {
+                    var body = conjParts.Count == 1 ? conjParts[0] : "(and " + string.Join(" ", conjParts) + ")";
+                    sb.AppendLine($"; ─── Strict relevance: outs_{suffix} unachievable by full clause (ghosts re-∃) ───");
+                    // `¬∃ ghosts: FullClause(observable_alt, ghosts)`. NOTE: with seq.nth over a
+                    // quantified index Z3 can answer UNKNOWN (→ caller falls back to plain). The
+                    // finite-expansion `⋀_{i,j} ¬B[i,j]` is the robust alternative but blows up
+                    // (~2MB) when the body carries a finite-expanded maximality forall — deferred.
+                    var bindings = ghosts.Select(g => $"({g.Name} {TypeUtils.DafnyTypeToSmt(g.Type)})");
+                    sb.AppendLine($"(assert (not (exists ({string.Join(" ", bindings)}) {body})))");
+                }
+            }
         }
 
         EmitBehaviouralRelevanceConstraints(sb, inputs, outputs, postLiterals, mutableNames);
