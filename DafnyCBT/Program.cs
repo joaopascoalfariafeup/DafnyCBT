@@ -2980,12 +2980,19 @@ class Program
                                 var loCmpOp = strictLo ? "<" : "<=";
                                 var expLabel = DnfEngine.ExprToString(b1.E1);
                                 var rangeLabel = $"L:{DnfEngine.ExprToString(b1.E0)}{(strictLo ? "<" : "<=")}{expLabel}{(strictHi ? "<" : "<=")}{DnfEngine.ExprToString(b2.E1)}";
-                                // mid: strictly-inside (uses ORIGINAL bounds with strict
-                                // comparison — no shift needed because mid is the strict
-                                // interior of the literal-level bounds).
+                                // mid: strictly between the BOUNDARY VALUES (effLo/effHi), not the
+                                // raw literal bounds. For a strict bound the boundary value is
+                                // shifted by 1 (e.g. `i < a.Length` ⇒ hi boundary `a.Length-1`),
+                                // so mid must be `effLo < EXP < effHi` to exclude both the =lo and
+                                // =hi tiers. Using the raw `loSmt`/`hiSmt` let the hi boundary
+                                // (`a.Length-1`) leak into "mid" — overlapping =hi (e.g. FindMax's
+                                // `/mid` accepting `i = a.Length-1`). For real chains effLo/effHi ==
+                                // the raw bounds, giving the open interior, which is correct (no
+                                // discrete boundary value). Degenerate short ranges (length 2) now
+                                // make mid UNSAT, as they should — there is no strict interior.
                                 var midLabel = $"{rangeLabel}/mid";
                                 schedule.Add(($"{clauseLabel}/B{midLabel}",
-                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (> {expSmt} {loSmt}) (< {expSmt} {hiSmt}))" }, simpleMask, pi));
+                                    clause, fullPreLits, new List<Expression>(), new List<string> { $"(and (> {expSmt} {effLo}) (< {expSmt} {effHi}))" }, simpleMask, pi));
                                 emitted.Add($"{pi}|{ci}|{midLabel}");
                                 // =lo: EXP = effLo, with opposite-end constraint EXP op HI.
                                 // For integer strict-lo, effLo = LO+1, so this is the
