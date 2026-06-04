@@ -57,6 +57,23 @@ class Program
     // the shape-based seed exclusions layered on these bases, not the registration.
     public static bool RecoverSubsumedBases = true;
 
+    // Phase 2b ordering: deprioritize the value tiers of OPAQUE-KEY scalar inputs —
+    // scalars that appear in the spec ONLY via equality/inequality/membership
+    // (== != in !in), never magnitude (< <= > >=), arithmetic (+ - * / %), or as an
+    // index. Their categorical value tiers (=0/1/2) are low-signal (only identity
+    // matters, not magnitude), so emitting them in signature order buries the
+    // structural collection-size tier that carries the killer (e.g. LinearSearch2's
+    // `|s1|=2` not-found tier behind six redundant `Element=0/1/2` tiers → k=15).
+    // Moving opaque keys last lets size tiers come first. Magnitude/arithmetic
+    // scalars (where the value IS the discriminating axis, e.g. abs's `x` via `-x`)
+    // keep their position, so the mirror-case regression can't happen. The `=0`
+    // boundary tier of an opaque key is kept early (a common value-killer, e.g.
+    // buscar's `x=0`); only its remaining value tiers are deferred. Default ON
+    // (clean v15 A/B: buggy_progs mean k 2.05→2.00, LinearSearch 15→11 deterministic,
+    // verifixer neutral, no kills lost, no determinism-surviving regression);
+    // --no-deprioritize-opaque-keys to disable. Reorders tiers only — never drops.
+    public static bool DeprioritizeOpaqueKeys = true;
+
     // Skolemize positive existential postconditions (per DNF clause): lift the
     // existential witnesses to GHOST outputs and replace `exists vars :: body`
     // with `body`, so DNF/relevance/BVA treat the inner conjuncts/disjuncts as
@@ -178,6 +195,7 @@ class Program
         var minSeqLenOpt = new Option<int>("--min-seq-len", () => 0, "When > 0, add `(assert-soft (>= (seq.len s) N) :weight 1)` for each seq/array input — biases Z3 toward larger collections. Useful on fold-heavy corpora (verifixer_mutants) whose killing witnesses are inherently multi-element. Soft, weight 1: loses to hard spec constraints and to the upper cap, so specs that pin `|s|=1` still get `|s|=1`. Default 0 (no extra bias — current behaviour).");
         var noShapeExclusionOpt = new Option<bool>("--no-shape-exclusion", () => false, "Disable ordering-shape exclusion. By default ON: Phase 3 round-robin repeats exclude prior ordering shapes for int-typed seq/array inputs (not just prior values). Shape = the rank-vector equivalence class under monotonic value remap (e.g. `[1,2,1,2]`, `[10,20,10,20]` share shape `[0,1,0,1]`; `[1,1,2,2]` has shape `[0,0,1,1]`). Encoded as n disjuncts using the prior's sort permutation σ. Combined with shape-pinned subsumption: if any prior test of the same shape already satisfies the candidate's tier objective under value pin, the candidate is skipped (catches cross-base redundancy without the over-restriction of pure shape-hash dedup). Forces structurally distinct inputs (different sort orders / equality patterns / lengths) rather than just different element values at the same shape. This flag disables the whole shape mechanism (per-base seeding + shape-pinned subsumption probe).");
         var noSkolemizeOpt = new Option<bool>("--no-skolemize-exists", () => false, "Disable Skolemization of positive top-level existential postconditions. By default ON: `ensures exists vars :: body` lifts `vars` to GHOST outputs and replaces the literal with `body`, so the inner conjuncts/disjuncts become first-class DNF literals handled by the normal relevance/BVA pipeline (the witness is a Skolem function of the input, solved on the generation side; ghost outputs are excluded from the method call and runtime oracle, which keeps the original `exists` via the full-postcondition expect). Unifies exists::AND and exists::OR into ordinary DNF. This flag restores the legacy atomic-exists handling for A/B measurement.");
+        var noDeprioOpaqueOpt = new Option<bool>("--no-deprioritize-opaque-keys", () => false, "Disable opaque-key tier deprioritization (default ON). By default, Phase 2b moves the categorical value tiers (`/Ovar=k`, except the `=0` boundary) of OPAQUE-KEY scalar inputs to the end of the per-clause tier order, so structural tiers (collection size `/O|coll|=k`, magnitude-relevant scalars) come first. An opaque key is a scalar that appears in the spec ONLY via equality/inequality/membership (`==`,`!=`,`in`,`!in`) and never via magnitude (`<`,`<=`,`>`,`>=`), arithmetic (`+`,`-`,`*`,`/`,`%`), or as an index — e.g. LinearSearch's `Element` (only `s1[i] == Element`), whose VALUE is irrelevant to the spec. Its low-signal value tiers otherwise bury the killer-carrying size tier (LinearSearch2 VER_position: `|s1|=2` not-found killer 15→11; the `=0` boundary is kept early so value-killers like buscar's `x=0` survive). Magnitude/arithmetic scalars (e.g. abs's `x` via `-x`) are NOT opaque, keep their position, so no mirror-case regression. Reorders tiers only — never drops one. This flag restores signature-order emission for A/B.");
         var strictRelevanceOpt = new Option<bool>("--strict-relevance", () => false, "Use the STRICT relevance criterion (default off). The plain relevance check asks 'flip literal Q_k → can the output differ?' (`outs ≠ outs_alt`), which is fooled when the spec admits multiple outputs through different witnesses — an existential literal looks relevant via spec ambiguity rather than because it constrains the output. Strict relevance additionally asserts the alt output is UNACHIEVABLE by the full clause with the ghost witnesses RE-EXISTENTIALIZED (`¬∃ ghosts: FullClause(observable_alt, ghosts)`) — the set-difference criterion 'does Q_k EXCLUDE an otherwise-achievable output?'. No-op for witness-free clauses; on Skolemized existential clauses it makes relevance strict WITHOUT needing the quantifier-last carve-out (so it composes with --no-skolemize-carveout). A/B / overall-impact flag.");
         var noSubsumedBasesOpt = new Option<bool>("--no-subsumed-bases", () => false, "Disable recovery of subsumed Phase 2 candidates as Phase 3 round-robin bases. By default ON: a Phase 2 tier that is subsumed by a prior test is still registered as a Phase 3 base (seeded with the subsuming prior's fingerprint) so the round-robin can find a structurally distinct variant. This flag prunes the subsumed tier WITHOUT registering it (subsumption pruning itself is unaffected — only the base recovery is dropped). For A/B: recovery can dilute the round-robin budget and push some kills to higher k. Note: distinct from --no-shape-exclusion, which only strips the shape-based seed exclusions layered on these bases, not the registration.");
         var noSkolemizeCarveOutOpt = new Option<bool>("--no-skolemize-carveout", () => false, "Disable the quantifier-last carve-out in Skolemization. By default the carve-out is ON: an `exists vars :: body` whose body's LAST conjunct is itself a quantifier (a maximality/uniqueness tail, e.g. FindFirstRepeatedChar's `exists i,j :: … ∧ forall k,l :: … ⟹ k>=i`) is NOT Skolemized — it stays atomic and is driven by the legacy stripped-existential + output-boundary path, which deterministically constructs the discriminating input (two distinct repeated chars). This flag turns the carve-out OFF so those existentials are Skolemized like the rest (the maximality forall becomes a first-class finite-expanded literal over the ghost witnesses), for A/B measurement of the maximality coverage gap.");
@@ -240,7 +258,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noShapeExclusionOpt, noSubsumedBasesOpt, strictRelevanceOpt, noSkolemizeOpt, noSkolemizeCarveOutOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noShapeExclusionOpt, noSubsumedBasesOpt, strictRelevanceOpt, noDeprioOpaqueOpt, noSkolemizeOpt, noSkolemizeCarveOutOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -270,6 +288,7 @@ class Program
             SmtTranslator.ShapeExclusionEnabled = !ctx.ParseResult.GetValueForOption(noShapeExclusionOpt);
             RecoverSubsumedBases = !ctx.ParseResult.GetValueForOption(noSubsumedBasesOpt);
             SmtTranslator.StrictRelevance = ctx.ParseResult.GetValueForOption(strictRelevanceOpt);
+            DeprioritizeOpaqueKeys = !ctx.ParseResult.GetValueForOption(noDeprioOpaqueOpt);
             SkolemizeExists = !ctx.ParseResult.GetValueForOption(noSkolemizeOpt);
             SkolemizeCarveOut = !ctx.ParseResult.GetValueForOption(noSkolemizeCarveOutOpt);
             CapSmallSizeRepeats = ctx.ParseResult.GetValueForOption(capSmallSizeRepeatsOpt);
@@ -2517,6 +2536,31 @@ class Program
         var mutableFieldsList = classInfo?.Fields?.Where(f => mutableNames.Contains(f.Name)).ToList();
         var postLitStrings = method.Ens.Select(e => DnfEngine.ExprToString(e.E)).ToList();
 
+        // Opaque-key scalars (for --deprioritize-opaque-keys): non-collection inputs that
+        // appear in the spec (pre + post) ONLY via equality/inequality/membership
+        // (== != in !in), never magnitude (< <= > >=), arithmetic (+ - * / %), or as an
+        // index `[v]`. Their value is irrelevant to the spec — only identity matters —
+        // so their categorical value tiers are low-signal and get scheduled last.
+        var opaqueKeyScalars = new HashSet<string>();
+        if (DeprioritizeOpaqueKeys)
+        {
+            var specLits = postLitStrings.Concat(method.Req.Select(r => DnfEngine.ExprToString(r.E))).ToList();
+            bool IsCollTy(string t) => t == "string" || TypeUtils.IsSeqType(t) || TypeUtils.IsArrayType(t)
+                || TypeUtils.IsSetType(t) || TypeUtils.IsMultisetType(t) || TypeUtils.IsMapType(t) || TypeUtils.IsTupleType(t);
+            foreach (var (vname, vtype) in inputs)
+            {
+                if (IsCollTy(vtype)) continue;                       // scalars only
+                var esc = Regex.Escape(vname);
+                var mentions = specLits.Where(l => Regex.IsMatch(l, $@"\b{esc}\b")).ToList();
+                if (mentions.Count == 0) continue;                  // unused in spec → leave in place
+                bool opaque = mentions.All(l =>
+                    !Regex.IsMatch(l, $@"[<>]=?\s*{esc}\b") && !Regex.IsMatch(l, $@"\b{esc}\s*[<>]=?") &&   // magnitude
+                    !Regex.IsMatch(l, $@"[-+*/%]\s*{esc}\b") && !Regex.IsMatch(l, $@"\b{esc}\s*[-+*/%]") && // arithmetic
+                    !Regex.IsMatch(l, $@"\[\s*{esc}\b"));                                                   // index
+                if (opaque) opaqueKeyScalars.Add(vname);
+            }
+        }
+
         // Returns true if the literal (as Dafny string) matches a "guard" shape —
         // a bound/length/index-position pin that other literals typically depend
         // on for well-definedness. Negating a guard can leave subscripts etc.
@@ -3282,13 +3326,20 @@ class Program
                         return mentioned;  // mentioned everywhere only as frame; skip tiers
                     }
 
-                    void EmitCats(string vname, string vtype, BoundaryAnalysis.VarKind kind)
+                    // tierMode: "all" (default), "zeroOnly" (emit only the `=0` boundary
+                    // tier), or "nonZero" (emit all but `=0`). Used by the opaque-key
+                    // refinement to keep the `=0` value tier early (a common value-killer,
+                    // e.g. buscar's `x=0`) while deferring the rest.
+                    void EmitCats(string vname, string vtype, BoundaryAnalysis.VarKind kind, string tierMode = "all")
                     {
                         if (IsFrameOnlyInClause(vname)) return;
                         var tiers = BoundaryAnalysis.ComputeCategoricalTiers(
                             vname, vtype, classLits, mutableNames, enumDatatypes, kind, tierCount);
                         foreach (var (tlabel, tconstraints, dkey) in tiers)
                         {
+                            bool isZeroTier = tlabel.EndsWith("=0");
+                            if (tierMode == "zeroOnly" && !isZeroTier) continue;
+                            if (tierMode == "nonZero" && isZeroTier) continue;
                             var key = $"{pi}|{ci}|{tlabel}";
                             if (phase2Keys.Contains(key)) { pruned++; continue; }
                             if (dkey != null && classLits.Contains(dkey)) { pruned++; continue; }
@@ -3303,9 +3354,24 @@ class Program
                         }
                     }
 
-                    foreach (var (vname, vtype) in inputs)
+                    // Input order for tier emission. Default: signature order. With
+                    // --deprioritize-opaque-keys: opaque-key scalars (value-irrelevant
+                    // identity keys, see opaqueKeyScalars above) keep only their `=0`
+                    // boundary tier in signature order; their remaining value tiers are
+                    // deferred to the end, so structural tiers (collection size, magnitude
+                    // scalars) come first WITHOUT losing the common `=0` value-killer.
+                    if (opaqueKeyScalars.Count > 0)
                     {
-                        EmitCats(vname, vtype, BoundaryAnalysis.VarKind.Input);
+                        foreach (var (vname, vtype) in inputs)
+                            EmitCats(vname, vtype, BoundaryAnalysis.VarKind.Input,
+                                     opaqueKeyScalars.Contains(vname) ? "zeroOnly" : "all");
+                        foreach (var (vname, vtype) in inputs.Where(x => opaqueKeyScalars.Contains(x.Name)))
+                            EmitCats(vname, vtype, BoundaryAnalysis.VarKind.Input, "nonZero");
+                    }
+                    else
+                    {
+                        foreach (var (vname, vtype) in inputs)
+                            EmitCats(vname, vtype, BoundaryAnalysis.VarKind.Input);
                     }
                     foreach (var (vname, vtype) in outputs)
                         EmitCats(vname, vtype, BoundaryAnalysis.VarKind.Output);
