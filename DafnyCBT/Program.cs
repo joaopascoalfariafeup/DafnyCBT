@@ -15,6 +15,96 @@ class Program
     // to group on UNSAT — strictly dominates group since combined's SAT witness
     // is richer when available).
     static string RelevanceMode = "ladder";
+    // Prototype: insert a "leave-one-out" rung between the combined query (all safe
+    // literals at once) and the per-literal sweep (singletons). On combined UNSAT,
+    // drop one safe literal at a time and test whether the remaining n-1 are jointly
+    // relevant; the first two satisfiable (n-1)-subsets drop different literals and so
+    // jointly cover every safe literal (no set-cover needed). Reduces FirstEvenOddIndices
+    // from 4 singleton tests to 2 rich ones.
+    static bool RelevanceLoo = false;
+    // LOO partial emit: when leave-one-out yields exactly ONE satisfiable
+    // (n-1)-subset (not two), emit that single witness (it covers n-1 literals) and run
+    // the one-at-a-time sweep only on its dropped literal — instead of discarding it and
+    // re-probing all of S. Default ON (matches Algorithm 1 in the paper: every SAT
+    // LOO test is emitted and its covered literals are not re-probed; also strictly
+    // shrinks suites). Disable with --no-loo-partial-emit.
+    static bool LooPartialEmit = true;
+    // act(m) crediting: after each emitted ladder witness, run a pinned-input
+    // activeness check (SAT = active) for each not-yet-covered literal on the witness's
+    // model; credited literals skip their own one-at-a-time queries. Implements the
+    // act(m) crediting of Algorithm 1 in the paper. Default ON: A/B on the 204-killable
+    // subset gave identical kills (201) with better earliness (kill@1 120->123, mean k
+    // 1.96->1.85), RelQ tests 277->150, at 267 extra queries offset by 255 fewer
+    // one-at-a-time calls. Disable with --no-act-credit.
+    static bool ActCredit = true;
+    // Coupled-residual rung: after the one-at-a-time sweep, if some literals were
+    // individually relevant (so the clause is already covered) BUT >=2 others came back
+    // redundant (UNSAT singletons), try those residual literals collectively via the group
+    // query — catching coupled subsets the ladder otherwise reaches only when EVERY
+    // singleton is redundant. Default ON (matches Algorithm 1's collective-over-residue
+    // rung in the paper; e.g. SortSeq's equivalent sortedness pair with the multiset
+    // literal individually covered). Disable with --no-coupled-residual.
+    static bool CoupledResidual = true;
+    // Credit only literals belonging to a MINIMAL jointly-active group at the
+    // witnessing input (Def. 4.3), rather than every member of the residue.
+    static bool MinimiseGroups = true;
+    // Prototype (--test-entry-only): restrict auto-discovery to methods annotated
+    // `{:testEntry}`, mirroring Dafny's built-in generate-tests. For experiments
+    // comparing against DTest on the same entry points. Default OFF (test all
+    // testable methods).
+    static bool TestEntryOnly = false;
+    // Prototype (--distribute-forall): split a conjunctive forall postcondition
+    // `forall x :: range ==> (P && Q)` into separate forall literals
+    // `(forall x :: range ==> P)` and `(forall x :: range ==> Q)` before the
+    // relevance check, so each branch is covered (relevance forces each guard
+    // to fire). The dual `forall` over `||` (disjunct coverage) is future work.
+    static bool DistributeForall = false;
+    static bool ContainsUserCall(Expression e)
+    {
+        if (e is FunctionCallExpr || e is ApplyExpr) return true;
+        foreach (var sub in e.SubExpressions)
+            if (ContainsUserCall(sub)) return true;
+        return false;
+    }
+    static System.Collections.Generic.IEnumerable<Expression> SplitConjForall(Expression ens)
+    {
+        var u = DnfEngine.Unwrap(ens);
+        if (u is not ForallExpr fa || fa.BoundVars.Count == 0)
+            return new[] { ens };
+        var term = DnfEngine.Unwrap(fa.Term);
+        Expression? rangeGuard = null;
+        Expression body = term;
+        if (term is BinaryExpr { Op: BinaryExpr.Opcode.Imp } imp)
+        {
+            rangeGuard = imp.E0;
+            body = DnfEngine.Unwrap(imp.E1);
+        }
+        var conjs = DnfEngine.FlattenConjuncts(body);
+        if (conjs.Count <= 1) return new[] { ens };
+        // Don't split a body that calls a user-defined function/predicate. The split
+        // produces a synthetic forall node that the AST inliner leaves unchanged, so
+        // inlining falls back to the string path, whose SMT translation mis-parses some
+        // char literals (e.g. ',') and returns null — the literal is silently dropped and
+        // its relevance-driven killer inputs are lost (regressed task_id_732: 14 kills -> 0).
+        // Predicate-bodied foralls keep the working un-split relevance check; pure
+        // arithmetic/element bodies (e.g. AbsSeq) still split.
+        if (ContainsUserCall(body) || (rangeGuard != null && ContainsUserCall(rangeGuard)))
+            return new[] { ens };
+        var result = new System.Collections.Generic.List<Expression>();
+        foreach (var c in conjs)
+        {
+            Expression newTerm = rangeGuard != null
+                ? new BinaryExpr(fa.Origin, BinaryExpr.Opcode.Imp, rangeGuard, c)
+                : c;
+            // Reuse the original forall's origin and attributes (not Token.NoToken /
+            // null): a synthetic-origin node is skipped by the AST-level function
+            // inliner, which then falls back to the string inliner whose SMT path
+            // mis-parses comma char literals — making predicate-bodied foralls fail
+            // to translate. With the real origin the split node inlines like a parsed one.
+            result.Add(new ForallExpr(fa.Origin, fa.BoundVars, fa.Range, newTerm, fa.Attributes));
+        }
+        return result;
+    }
     public static bool VacuityCheckEnabled = false;
     // Phase 1e — "establish" check: for a clause whose post is a pure target-state
     // predicate (references modified state, no old(), no return-only vars), generate
@@ -86,11 +176,13 @@ class Program
     // for Skolemized clauses. Default ON; --no-skolemize-exists to opt out (A/B).
     public static bool SkolemizeExists = true;
 
-    // Carve-out: by default we do NOT Skolemize an exists whose body's LAST conjunct
-    // is a quantifier (a maximality/uniqueness tail, e.g. FindFirstRepeatedChar), since
-    // the legacy atomic-exists path drives that shape deterministically. Set false via
-    // --no-skolemize-carveout to Skolemize those too (A/B for the maximality coverage gap).
-    public static bool SkolemizeCarveOut = true;
+    // Carve-out: exempt from Skolemization an exists whose body's LAST conjunct is a
+    // quantifier (an optimality tail, e.g. FindFirstRepeatedChar), leaving it to the
+    // atomic stripped-existential path. DEFAULT OFF since 2026-08-05: the shape occurs
+    // on exactly 1 of 270 buggy_progs and 1 of 147 verifixer programs (task_id_602), and
+    // an A/B over every mutant of those produced byte-identical suites and identical
+    // kill@k, so rule 3 now applies uniformly. --skolemize-carveout restores it (A/B).
+    public static bool SkolemizeCarveOut = false;
 
     // True when `label`'s most-specific tier PINS a value/length to a single
     // point (strict equality), as opposed to an open/range tier that can sweep
@@ -147,6 +239,9 @@ class Program
     // same class as dead-clause-pruning); --no-precond-fill to disable
     // (A/B measurement / clean partition-coverage-only runs).
     public static bool PrecondFill = true;
+    // Keep class-invariant predicates opaque (see the inline site). Default ON;
+    // --no-invariant-opaque restores the old inline-and-decompose behaviour for A/B.
+    public static bool InvariantOpaque = true;
     // Per-candidate CEGIS attempt cap. Used for both isolated and plain modes.
     // With Phase A's relevance-style query baking in the isolation precondition,
     // 3 attempts is more than enough — the historical 10-attempt cap from the
@@ -187,7 +282,10 @@ class Program
         var z3QueryTimeoutOpt = new Option<int>("--z3-query-timeout", () => 2000, "Per-Z3-query timeout in milliseconds (default: 2000). Lower values give the per-method budget more headroom for hard methods; raise for slow corpora where genuine SAT/UNSAT answers need >2s.");
         var noModificationRelOpt = new Option<bool>("--no-modification-relevance", "Disable Phase 1r 'modification relevance' — by default, the relevance query asserts that some `modifies`-listed value actually changes between pre and post, filtering out witnesses where the impl could legitimately be a no-op (e.g. reverse on a length-1 array).");
         var noForallRelOpt = new Option<bool>("--no-forall-relevance", "Disable Phase 1r 'forall non-vacuity' — by default, the relevance query asserts that every clause-level `forall i :: lo <= i < hi ==> P(i)` literal has a non-empty range, filtering out witnesses where some forall is vacuously true via empty range.");
+        var noNoopRelOpt = new Option<bool>("--no-noop-relevance", "Disable Phase 1r 'no-op inadmissibility' — by default, the relevance query soft-prefers an initial state that violates the old-free postconditions (post→pre substitution), so a no-op mutant fails the oracle. Stronger than --modification-relevance alone, which only forces *some* state change and can pick a no-op-admissible input when the spec has multiple valid outputs.");
         var noPermDomainPinOpt = new Option<bool>("--no-permutation-domain-pin", "Disable permutation-domain pinning — by default, when a `multiset(X)==multiset(Y)` literal is present (sort/permutation specs), every sequence/array element is constrained into the same bounded value universe the multiset equality is encoded over, making that encoding exact. Without it, the bounded `_mset_count` is unsound for out-of-universe elements, so Z3 can satisfy multiset-preservation with pre≠post differing only outside the universe — silently defeating modification-relevance (already-sorted no-op inputs pass; reorder bugs survive).");
+        var noInvariantOpaqueOpt = new Option<bool>("--no-invariant-opaque", () => false,
+            "Inline and DNF-decompose class-invariant predicates (Valid() under {:autocontracts}, or any predicate called in BOTH requires and ensures). Default: kept ATOMIC — one literal, still translated into every SMT query (so it constrains the real output AND the shadow) and still relevance-checked like any other value literal, so ALC itself decides whether it is active or redundant. Decomposing it instead explodes one literal into ~10 mutually-implied conjuncts, multiplies clauses wherever the body has `==>`, and promotes untranslatable conjuncts like `this in Repr` into top-level literals that abort the relevance query. This flag restores the old behaviour for A/B.");
         var noPrecondFillOpt = new Option<bool>("--no-precond-fill", () => false, "Disable Phase 4 precondition-only diversity fill. By default (PURE-ADDITIVE): Phase 1/2/2b/3 run exactly as baseline; only when they genuinely exhaust their bases below the -n budget (postcondition witness space spent, e.g. SeqMaxSum's segSumaMaxima2 ~4-6/20) does Phase 4 fill the remaining EMPTY slots with precondition-only, anti-trivial-biased, input-diversified inputs, each emitted with the FULL postcondition as a runtime expect. Every baseline test is still generated bit-identical; Phase 4 only appends — monotone (only adds tests/kills, no false kills under correct-spec), recovering budget-starved survivors via robustness sampling under the executable-spec oracle. This flag disables it (e.g. for clean partition-coverage-only numbers or A/B measurement).");
         var noDeadClausePruningOpt = new Option<bool>("--no-dead-clause-pruning", () => false, "Disable dead-clause pruning. By default, once a DNF clause's plain (no-tier) combination is definitively Z3-UNSAT, all of that clause's boundary/categorical tier sub-combinations are skipped across the Phase 1/2/2b passes (a tier only ADDS constraints to an already-UNSAT formula → provably UNSAT; never prunes a SAT tier, so no test/kill is lost). Targets dead clauses like an inlined recursive base-case branch `k==i+1` made unreachable by the spec's own `k<=i` bound (~25-34 wasted Z3 solves on SeqMaxSum; ~⅓ faster). Monotone, not output-neutral: the freed solve budget lets the budget-bounded Phase 3 round-robin reach extra repeats within the same -n/timeout (tests ≥, never fewer). This flag forces every tier to be solved individually (slower; A/B / safety valve).");
         var capSmallSizeRepeatsOpt = new Option<bool>("--cap-small-size-repeats", () => false, "[spike] In Phase 3 round-robin, cap repeats of the degenerate-value tiers: 0 repeats for `|x|=1` (singleton) and boundary `=0` tiers, ≤1 repeat for `|x|=2` and boundary `=1`. Repeated tiny/extremal-constant inputs rarely expose new behaviour (sort/swap/interior bugs need ≥3 elements or a non-boundary index); the freed budget is reallocated by the round-robin to larger / more diverse bases. Default off.");
@@ -196,9 +294,12 @@ class Program
         var noShapeExclusionOpt = new Option<bool>("--no-shape-exclusion", () => false, "Disable ordering-shape exclusion. By default ON: Phase 3 round-robin repeats exclude prior ordering shapes for int-typed seq/array inputs (not just prior values). Shape = the rank-vector equivalence class under monotonic value remap (e.g. `[1,2,1,2]`, `[10,20,10,20]` share shape `[0,1,0,1]`; `[1,1,2,2]` has shape `[0,0,1,1]`). Encoded as n disjuncts using the prior's sort permutation σ. Combined with shape-pinned subsumption: if any prior test of the same shape already satisfies the candidate's tier objective under value pin, the candidate is skipped (catches cross-base redundancy without the over-restriction of pure shape-hash dedup). Forces structurally distinct inputs (different sort orders / equality patterns / lengths) rather than just different element values at the same shape. This flag disables the whole shape mechanism (per-base seeding + shape-pinned subsumption probe).");
         var noSkolemizeOpt = new Option<bool>("--no-skolemize-exists", () => false, "Disable Skolemization of positive top-level existential postconditions. By default ON: `ensures exists vars :: body` lifts `vars` to GHOST outputs and replaces the literal with `body`, so the inner conjuncts/disjuncts become first-class DNF literals handled by the normal relevance/BVA pipeline (the witness is a Skolem function of the input, solved on the generation side; ghost outputs are excluded from the method call and runtime oracle, which keeps the original `exists` via the full-postcondition expect). Unifies exists::AND and exists::OR into ordinary DNF. This flag restores the legacy atomic-exists handling for A/B measurement.");
         var noDeprioOpaqueOpt = new Option<bool>("--no-deprioritize-opaque-keys", () => false, "Disable opaque-key tier deprioritization (default ON). By default, Phase 2b moves the categorical value tiers (`/Ovar=k`, except the `=0` boundary) of OPAQUE-KEY scalar inputs to the end of the per-clause tier order, so structural tiers (collection size `/O|coll|=k`, magnitude-relevant scalars) come first. An opaque key is a scalar that appears in the spec ONLY via equality/inequality/membership (`==`,`!=`,`in`,`!in`) and never via magnitude (`<`,`<=`,`>`,`>=`), arithmetic (`+`,`-`,`*`,`/`,`%`), or as an index — e.g. LinearSearch's `Element` (only `s1[i] == Element`), whose VALUE is irrelevant to the spec. Its low-signal value tiers otherwise bury the killer-carrying size tier (LinearSearch2 VER_position: `|s1|=2` not-found killer 15→11; the `=0` boundary is kept early so value-killers like buscar's `x=0` survive). Magnitude/arithmetic scalars (e.g. abs's `x` via `-x`) are NOT opaque, keep their position, so no mirror-case regression. Reorders tiers only — never drops one. This flag restores signature-order emission for A/B.");
-        var strictRelevanceOpt = new Option<bool>("--strict-relevance", () => false, "Use the STRICT relevance criterion (default off). The plain relevance check asks 'flip literal Q_k → can the output differ?' (`outs ≠ outs_alt`), which is fooled when the spec admits multiple outputs through different witnesses — an existential literal looks relevant via spec ambiguity rather than because it constrains the output. Strict relevance additionally asserts the alt output is UNACHIEVABLE by the full clause with the ghost witnesses RE-EXISTENTIALIZED (`¬∃ ghosts: FullClause(observable_alt, ghosts)`) — the set-difference criterion 'does Q_k EXCLUDE an otherwise-achievable output?'. No-op for witness-free clauses; on Skolemized existential clauses it makes relevance strict WITHOUT needing the quantifier-last carve-out (so it composes with --no-skolemize-carveout). A/B / overall-impact flag.");
+        var strictRelevanceOpt = new Option<bool>("--strict-relevance", () => false, "Use the STRICT relevance criterion (default off). The plain relevance check asks 'flip literal Q_k → can the output differ?' (`outs ≠ outs_alt`), which is fooled when the spec admits multiple outputs through different witnesses — an existential literal looks relevant via spec ambiguity rather than because it constrains the output. Strict relevance additionally asserts the alt output is UNACHIEVABLE by the full clause with the ghost witnesses RE-EXISTENTIALIZED (`¬∃ ghosts: FullClause(observable_alt, ghosts)`) — the set-difference criterion 'does Q_k EXCLUDE an otherwise-achievable output?'. No-op for witness-free clauses; on Skolemized existential clauses it makes relevance strict WITHOUT needing the quantifier-last carve-out (which is why the carve-out could be retired; see --skolemize-carveout). A/B / overall-impact flag.");
+        var noStrictRelevanceOpt = new Option<bool>("--no-strict-relevance", () => false, "Disable the STRICT relevance criterion (default ON since 2026-08-09). Strict relevance asserts the alt output is UNACHIEVABLE by the full clause with the ghost witnesses RE-EXISTENTIALIZED (`¬∃ ghosts: FullClause(observable_alt, ghosts)`) — the set-difference criterion 'does Q_k EXCLUDE an otherwise-achievable observable output?'. Without it, the plain check asks only 'flip Q_k → can the output differ?', which is fooled when the spec admits the same observable through several witnesses: an existential literal looks relevant via witness ambiguity rather than because it constrains the output. No-op for witness-free clauses. Strict is what takes Dataset A to 147/147; this flag restores the legacy behaviour for A/B.");
+        var strictPerLiteralOpt = new Option<bool>("--strict-per-literal", () => false, "DEPRECATED no-op: per-literal gating is now the default (see --no-strict-per-literal). Retained so existing campaign scripts keep parsing. With --strict-relevance, emit the `¬∃ ghosts: FullClause(observable_alt, ghosts)` conjunct ONLY for checked literals that mention a ghost output (default off = emit for every checked literal of a ghost-bearing clause). For a ghost-free Qk the conjunct is LOGICALLY REDUNDANT: the query already asserts ¬Qk at the shadow, Qk does not mention the ghosts, and the clause is a conjunction containing Qk, so no ghost assignment can satisfy it. Restricting is therefore sound and loses no certification in principle — but it is not a no-op in practice, because the extra quantified assertion can drive Z3 to UNKNOWN (treated as UNSAT by the ladder), withdrawing a certification plain relevance would have granted. A/B flag: measures how much of strict relevance's reported cost is a solver artefact on ghost-free literals rather than a genuine precision gain. Measured on Dataset~A: identical kills (147), kill@1 (108), k-bar (1.48) and certifications (365/24/101), at 15% less generation time.");
+        var noStrictPerLiteralOpt = new Option<bool>("--no-strict-per-literal", () => false, "Emit the strict `¬∃ ghosts` conjunct for EVERY checked literal of a ghost-bearing clause, rather than only for literals that mention a ghost output (default: per-literal, ON). For a ghost-free Q_k the conjunct is logically redundant — the query already asserts ¬Q_k at the shadow, Q_k does not mention the ghosts, and the clause is a conjunction containing Q_k, so no ghost assignment satisfies it — but it still costs solver time and can drive Z3 to UNKNOWN. This flag restores the blanket form for A/B.");
         var noSubsumedBasesOpt = new Option<bool>("--no-subsumed-bases", () => false, "Disable recovery of subsumed Phase 2 candidates as Phase 3 round-robin bases. By default ON: a Phase 2 tier that is subsumed by a prior test is still registered as a Phase 3 base (seeded with the subsuming prior's fingerprint) so the round-robin can find a structurally distinct variant. This flag prunes the subsumed tier WITHOUT registering it (subsumption pruning itself is unaffected — only the base recovery is dropped). For A/B: recovery can dilute the round-robin budget and push some kills to higher k. Note: distinct from --no-shape-exclusion, which only strips the shape-based seed exclusions layered on these bases, not the registration.");
-        var noSkolemizeCarveOutOpt = new Option<bool>("--no-skolemize-carveout", () => false, "Disable the quantifier-last carve-out in Skolemization. By default the carve-out is ON: an `exists vars :: body` whose body's LAST conjunct is itself a quantifier (a maximality/uniqueness tail, e.g. FindFirstRepeatedChar's `exists i,j :: … ∧ forall k,l :: … ⟹ k>=i`) is NOT Skolemized — it stays atomic and is driven by the legacy stripped-existential + output-boundary path, which deterministically constructs the discriminating input (two distinct repeated chars). This flag turns the carve-out OFF so those existentials are Skolemized like the rest (the maximality forall becomes a first-class finite-expanded literal over the ghost witnesses), for A/B measurement of the maximality coverage gap.");
+        var skolemizeCarveOutOpt = new Option<bool>("--skolemize-carveout", () => false, "Re-enable the quantifier-last carve-out in Skolemization (DEFAULT OFF since 2026-08-05). With the carve-out ON, an `exists vars :: body` whose body's LAST conjunct is itself a quantifier (an optimality tail, e.g. FindFirstRepeatedChar's `exists i,j :: … ∧ forall k,l :: … ⟹ k>=i`) is NOT Skolemized — it stays atomic and is driven by the stripped-existential + output-boundary path. The carve-out was retired because the shape occurs on exactly 1 of 270 buggy_progs and 1 of 147 verifixer programs (both task_id_602), and an A/B over every mutant of those produced byte-identical suites and identical kill@k, so rule 3 now applies uniformly. This flag restores it for A/B measurement.");
         var trustUnknownOpt = new Option<bool>("--trust-unknown", () => false, "Trust Z3 output values when uniqueness check returns 'unknown' (default: false — safer: treat unknown as not-unique and fall back to full-postcondition expects)");
         var uniquenessRoundsOpt = new Option<int>("--uniqueness-rounds", () => 4, "Max rounds of uniqueness checking to enumerate all valid outputs (default: 4). When all valid outputs are enumerated, emit expect out == v1 || out == v2 || ...;");
         uniquenessRoundsOpt.AddAlias("-u");
@@ -208,7 +309,10 @@ class Program
         noBiasOpt.AddAlias("-nb");
         var noRelevanceOpt = new Option<bool>("--no-relevance", "Disable per-literal relevance check (Phase 1r). Default: relevance ON.");
         noRelevanceOpt.AddAlias("-nr");
-        var vacuityOpt = new Option<bool>("--vacuity", "Enable per-literal vacuity check (Phase 1v). For each safe candidate Q_k, try isolated mode first (find ins where Q_k is vacuous AND every other Q_j is non-vacuous → /Vik label) and fall back to non-isolated (Q_k vacuous but other Q_j may also be → /Vk label) when isolated is infeasible. Note: independently of this flag, every emitted test gets per-Q vacuity annotations (// VACUOUSLY TRUE) via a post-phase scan. Default: OFF.");
+        var noMinimiseGroupsOpt = new Option<bool>("--no-minimise-groups", "Credit EVERY member of a jointly-active residue at group level, instead of only those belonging to a minimal jointly-active group at the witnessing input (Def. 4.3). The collective rung proves the residue prunes jointly, not that it is minimal, so the default (minimisation ON) is what the criterion asks for; this flag restores the over-reporting behaviour for A/B. Minimality is decided exactly for residues of up to 4 literals and greedily above that. Does not change which tests are emitted - only which literals are certified.");
+        var logUncertifiedOpt = new Option<bool>("--log-uncertified", "Emit one line per relevance-checked value literal the ladder did not certify, tagged UNSAT (an individual query proved it redundant over the encoded contract), UNKNOWN (the solver gave no verdict and Alg. 1 read it as UNSAT), or NOT-QUERIED (no individual query targeted it). Diagnostic only; generation is unchanged. Use with --rung-stats to reconcile against the contract census. Default: OFF.");
+        var rungStatsOpt = new Option<bool>("--rung-stats", "Report per-rung Z3 query outcome counts (queries / SAT / UNSAT / UNKNOWN) at the end of the run. Rungs: combined, leave-one-out, one-at-a-time, group, plus uniqueness and base/schedule queries. Default: OFF.");
+        var vacuityOpt = new Option<bool>("--vacuity", "Enable per-literal vacuity check (Phase 1v). For each safe candidate Q_k, try isolated mode first (find ins where Q_k is vacuous AND every other Q_j is non-vacuous → /Vik label) and fall back to non-isolated (Q_k vacuous but other Q_j may also be → /Vk label) when isolated is infeasible. Note: independently of this flag, every emitted test gets per-Q vacuity annotations (// individually vacuous on these inputs) via a post-phase scan. The annotation is informational only - the expect is still asserted, since the per-literal verdicts must not be applied as a set (every member of a COUPLED cluster is individually vacuous, so dropping them all would remove their joint content from the oracle). Default: OFF.");
         vacuityOpt.AddAlias("-v1v");
         var noEstablishOpt = new Option<bool>("--no-establish", "Disable Phase 1e establish-check. By default, for clauses whose post is a pure target-state predicate (references modified state; no old(); no return-only vars), DafnyCBT generates one input where the clause is FALSE on the pre-state — forcing the method to actively establish it (kills mutants that only pass when the input was already in the goal state). Default: establish-check ON.");
         var preSatOpt = new Option<bool>("--presat", "Enable Phase 1e-PreSat: also generate an input where the clause is ALREADY true on the pre-state (idempotent / no-op boundary). Complements --no-establish's inverse. Default: OFF.");
@@ -241,9 +345,29 @@ class Program
         var bvaNeighborsOpt = new Option<bool>("--bva-neighbors",
             "Phase 2 literal-centric BVA: also emit the off-by-one inside-boundary neighbor tiers (`= bound ± 1` per literal, `= lo+1` / `= hi-1` per chain). Default OFF — Phase 2 emits 2 per-literal tiers (boundary + strict-companion) and 3 chain tiers (`=lo` / `=hi` / `mid`), uniform with existential boundary's 3-tier count. ON re-enables the previous behaviour: explicit just-inside-boundary witnesses driving Z3 away from the strict-companion's model-minimised default. Useful on off-by-one-heavy corpora (LVR / VER fault clusters).");
         var seedOpt = new Option<int?>("--seed",
-            "Force a fixed Z3 random seed for every SMT query, overriding the per-method name hash and bypassing the --no-bias / skipBias gating. Useful for reproducibility experiments and seed-sensitivity studies. When omitted, the usual per-method deterministic seed is used (but only when bias is on).");
+            "Force a fixed Z3 random seed for every SMT query, overriding the per-method name hash and bypassing the --no-bias / skipBias gating. Useful for reproducibility experiments and seed-sensitivity studies. When omitted the per-method seed is method.Name.GetHashCode() % 100000, and .NET randomises string hash codes PER PROCESS, so unseeded runs WITH the anti-trivial bias are NOT reproducible across invocations (verified: 3 unseeded runs of one mutant gave 3/1/4 failing tests, vs byte-identical at --seed 42). With --no-bias no seed option is emitted at all, so those runs are deterministic. Pin --seed for any A/B, and VARY it across runs to measure variance - repeating a run at a fixed seed yields zero variance.");
         var relevanceModeOpt = new Option<string>("--relevance-mode", () => "ladder",
             "Phase 1r shadow-block strategy: 'combined' (per-literal shadow blocks, strictest), 'group' (single shadow block with ¬(⋀ safe Q_k), weakest), or 'ladder' (default: combined then fall back to group on UNSAT — strictly dominates group).");
+        var distributeForallOpt = new Option<bool>("--distribute-forall",
+            "Prototype: distribute a conjunctive forall postcondition `forall x :: range ==> (P && Q)` into separate forall literals before the relevance check, so each conjunct/branch is covered independently (relevance forces each guard to fire). Default: OFF.");
+        var relevanceLooOpt = new Option<bool>("--relevance-loo",
+            "Prototype: add a leave-one-out rung to the relevance ladder. When the combined query (all safe literals jointly relevant) is UNSAT, drop one literal at a time and test whether the remaining n-1 are jointly relevant; the first two satisfiable (n-1)-subsets drop different literals and so jointly cover every safe literal, emitting two tests. Falls through to the per-literal sweep when fewer than two are satisfiable. Default: OFF.");
+        var looPartialEmitOpt = new Option<bool>("--loo-partial-emit",
+            "Deprecated no-op: LOO partial emit is now ON by default. Use --no-loo-partial-emit to disable.");
+        var actCreditOpt = new Option<bool>("--act-credit",
+            "Deprecated no-op: act(m) crediting is now ON by default. Use --no-act-credit to disable.");
+        var noActCreditOpt = new Option<bool>("--no-act-credit",
+            "Disable act(m) crediting — by default, after each emitted relevance witness a pinned-input query verifies which not-yet-covered literals are ALSO active on that witness; credited literals skip their own one-at-a-time queries and tests, shrinking Phase-1 suites and the residue passed to later rungs. Default: crediting ON.");
+        var noLooPartialEmitOpt = new Option<bool>("--no-loo-partial-emit",
+            "Disable LOO partial emit — when leave-one-out finds exactly ONE satisfiable (n-1)-subset, by default that single witness is emitted (covers n-1 literals) and the one-at-a-time sweep runs only on its dropped literal; with this flag the lone witness is discarded and all of S is re-probed. Default: partial emit ON.");
+        var coupledResidualOpt = new Option<bool>("--coupled-residual",
+            "Deprecated no-op: the coupled-residual rung is now ON by default. Use --no-coupled-residual to disable.");
+        var contractShadowsOpt = new Option<bool>("--contract-shadows",
+            "Prototype: contract-level exclusion for relevance shadows. When a clause's input projection overlaps a sibling clause's (existential SMT probe, cached per clause pair), each relevance shadow must additionally violate the overlapping sibling(s), so the activeness witness is excluded by the WHOLE contract rather than the clause alone. No-op on input-disjoint decompositions (the norm after clause merging); skipped for Skolemised clauses (ghost outputs need re-existentialisation, cf. --strict-relevance). Default: OFF.");
+        var noCoupledResidualOpt = new Option<bool>("--no-coupled-residual",
+            "Disable the coupled-residual rung — after the one-at-a-time sweep, when some literals were individually relevant but >=2 others came back redundant (UNSAT singletons), the residual literals are tried collectively via the group query (/RelGC), catching coupled subsets the ladder otherwise reaches only when EVERY singleton is redundant. Default: rung ON.");
+        var testEntryOnlyOpt = new Option<bool>("--test-entry-only",
+            "Restrict test generation to methods annotated `{:testEntry}` (mirrors Dafny's built-in generate-tests). For experiments comparing against DTest on the same entry points. Default: OFF (generate for all testable methods).");
         var commentUncompilableOpt = new Option<bool>("--comment-uncompilable",
             "In --check mode, when `dafny build` fails due to uncompilable expect expressions (unbounded quantifiers, old() in non-ghost context, …), automatically comment out the offending CheckExpect lines and retry the build. The user-visible Tests.dfy gets matching `// UNCOMPILABLE (...)` markers. Default: OFF — the check phase fails hard on build errors so the user notices them.");
         var skipOnExceptionOpt = new Option<bool>("--skip-on-exception",
@@ -258,7 +382,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noShapeExclusionOpt, noSubsumedBasesOpt, strictRelevanceOpt, noDeprioOpaqueOpt, noSkolemizeOpt, noSkolemizeCarveOutOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noDeadClausePruningOpt, vacuityOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noNoopRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noShapeExclusionOpt, noSubsumedBasesOpt, strictRelevanceOpt, strictPerLiteralOpt, noStrictRelevanceOpt, noStrictPerLiteralOpt, noDeprioOpaqueOpt, noSkolemizeOpt, skolemizeCarveOutOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noInvariantOpaqueOpt, noDeadClausePruningOpt, vacuityOpt, rungStatsOpt, logUncertifiedOpt, noMinimiseGroupsOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, relevanceLooOpt, looPartialEmitOpt, noLooPartialEmitOpt, actCreditOpt, noActCreditOpt, coupledResidualOpt, noCoupledResidualOpt, contractShadowsOpt, distributeForallOpt, testEntryOnlyOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -282,18 +406,23 @@ class Program
             Z3Runner.Z3QueryTimeoutMs = ctx.ParseResult.GetValueForOption(z3QueryTimeoutOpt);
             SmtTranslator.ModificationRelevance = !ctx.ParseResult.GetValueForOption(noModificationRelOpt);
             SmtTranslator.ForallNonVacuityRelevance = !ctx.ParseResult.GetValueForOption(noForallRelOpt);
+            SmtTranslator.NoOpInadmissibilityRelevance = !ctx.ParseResult.GetValueForOption(noNoopRelOpt);
             SmtTranslator.PermutationDomainPin = !ctx.ParseResult.GetValueForOption(noPermDomainPinOpt);
             SmtTranslator.BoundedFoldEnabled = !ctx.ParseResult.GetValueForOption(noBoundedFoldOpt);
             SmtTranslator.MinSeqLen = ctx.ParseResult.GetValueForOption(minSeqLenOpt);
             SmtTranslator.ShapeExclusionEnabled = !ctx.ParseResult.GetValueForOption(noShapeExclusionOpt);
             RecoverSubsumedBases = !ctx.ParseResult.GetValueForOption(noSubsumedBasesOpt);
-            SmtTranslator.StrictRelevance = ctx.ParseResult.GetValueForOption(strictRelevanceOpt);
+            // Both default ON; the --strict-* flags are retained as no-ops so existing
+            // campaign scripts keep parsing (passing them asks for the default).
+            SmtTranslator.StrictRelevance = !ctx.ParseResult.GetValueForOption(noStrictRelevanceOpt);
+            SmtTranslator.StrictPerLiteral = !ctx.ParseResult.GetValueForOption(noStrictPerLiteralOpt);
             DeprioritizeOpaqueKeys = !ctx.ParseResult.GetValueForOption(noDeprioOpaqueOpt);
             SkolemizeExists = !ctx.ParseResult.GetValueForOption(noSkolemizeOpt);
-            SkolemizeCarveOut = !ctx.ParseResult.GetValueForOption(noSkolemizeCarveOutOpt);
+            SkolemizeCarveOut = ctx.ParseResult.GetValueForOption(skolemizeCarveOutOpt);
             CapSmallSizeRepeats = ctx.ParseResult.GetValueForOption(capSmallSizeRepeatsOpt);
             DeadClausePruning = !ctx.ParseResult.GetValueForOption(noDeadClausePruningOpt);
             PrecondFill = !ctx.ParseResult.GetValueForOption(noPrecondFillOpt);
+            InvariantOpaque = !ctx.ParseResult.GetValueForOption(noInvariantOpaqueOpt);
             TrustUnknownUniqueness = ctx.ParseResult.GetValueForOption(trustUnknownOpt);
             SmtTranslator.DropPostWfGuards = ctx.ParseResult.GetValueForOption(dropPostWfOpt);
             TestValidator.SkipOnException = ctx.ParseResult.GetValueForOption(skipOnExceptionOpt);
@@ -314,6 +443,9 @@ class Program
             VacuityCheckEnabled = ctx.ParseResult.GetValueForOption(vacuityOpt);
             if (VacuityCheckEnabled)
                 Console.WriteLine($"[DafnyCBT] Vacuity check (Phase 1v): ON (isolated with non-isolated fallback)");
+            Z3Runner.CollectRungStats = ctx.ParseResult.GetValueForOption(rungStatsOpt);
+            Z3Runner.LogUncertified = ctx.ParseResult.GetValueForOption(logUncertifiedOpt);
+            MinimiseGroups = !ctx.ParseResult.GetValueForOption(noMinimiseGroupsOpt);
             EstablishCheckEnabled = !ctx.ParseResult.GetValueForOption(noEstablishOpt);
             if (!EstablishCheckEnabled)
                 Console.WriteLine("[DafnyCBT] Establish check (Phase 1e): OFF");
@@ -346,6 +478,25 @@ class Program
             RelevanceMode = relevanceModeCli;
             if (RelevanceMode != "ladder")
                 Console.WriteLine($"[DafnyCBT] Relevance mode: {RelevanceMode}");
+            RelevanceLoo = ctx.ParseResult.GetValueForOption(relevanceLooOpt);
+            LooPartialEmit = !ctx.ParseResult.GetValueForOption(noLooPartialEmitOpt);
+            ActCredit = !ctx.ParseResult.GetValueForOption(noActCreditOpt);
+            if (!ActCredit)
+                Console.WriteLine("[DafnyCBT] act(m) crediting: OFF");
+            if (!LooPartialEmit)
+                Console.WriteLine("[DafnyCBT] LOO partial emit: OFF");
+            CoupledResidual = !ctx.ParseResult.GetValueForOption(noCoupledResidualOpt);
+            SmtTranslator.ContractShadows = ctx.ParseResult.GetValueForOption(contractShadowsOpt);
+            if (SmtTranslator.ContractShadows)
+                Console.WriteLine("[DafnyCBT] Contract-level relevance shadows: ON");
+            if (!CoupledResidual)
+                Console.WriteLine("[DafnyCBT] Coupled-residual rung: OFF");
+            TestEntryOnly = ctx.ParseResult.GetValueForOption(testEntryOnlyOpt);
+            if (RelevanceLoo)
+                Console.WriteLine($"[DafnyCBT] Relevance leave-one-out rung: ON");
+            DistributeForall = ctx.ParseResult.GetValueForOption(distributeForallOpt);
+            if (DistributeForall)
+                Console.WriteLine($"[DafnyCBT] Conjunctive-forall distribution: ON");
 
             // Resolve Z3 path once (CLI > env var > auto-discovery > PATH)
             var z3Path = Z3Runner.FindZ3Path(z3PathCli);
@@ -398,6 +549,9 @@ class Program
 
             if (files.Count > 1)
                 Console.WriteLine($"[DafnyCBT] Processed {files.Count} files.");
+                Z3Runner.ReportSpecStats(Console.Out);
+                Z3Runner.ReportClauseDispo(Console.Out);
+                Z3Runner.ReportRungStats(Console.Out);
         });
 
         return await rootCommand.InvokeAsync(args);
@@ -778,6 +932,18 @@ class Program
             }).ToList();
             if (havocMethods.Count > 0)
                 Console.WriteLine($"[DafnyCBT] Skipping {havocMethods.Count} verifier-style method(s) using havoc (`:= *`): {string.Join(", ", havocMethods)}");
+            // --test-entry-only: keep only {:testEntry}-annotated methods (match DTest's entry points).
+            if (TestEntryOnly)
+            {
+                var before = methods.Count;
+                methods = methods.Where(m => Microsoft.Dafny.Attributes.Contains(m.Attributes, "testEntry")).ToList();
+                Console.WriteLine($"[DafnyCBT] --test-entry-only: {methods.Count}/{before} method(s) annotated {{:testEntry}}.");
+                if (!methods.Any())
+                {
+                    Console.Error.WriteLine("No {:testEntry}-annotated methods found.");
+                    return;
+                }
+            }
             Console.WriteLine($"[DafnyCBT] Auto-discovered {methods.Count} method(s): {string.Join(", ", methods.Select(m => m.Name))}");
         }
 
@@ -1463,6 +1629,8 @@ class Program
         // Get DNF clauses as AST Expressions — kept as Expressions throughout the pipeline.
         // Strings are only used for display, dedup keys, and at the TestEmitter boundary.
         var ensuresClauses = method.Ens.Select(e => e.E).ToList();
+        if (DistributeForall)
+            ensuresClauses = ensuresClauses.SelectMany(SplitConjForall).ToList();
         // Smoke-tests path: when a method has `requires` but no `ensures`, force
         // preOnlyMode so Z3 only solves for inputs satisfying the precondition.
         // No postconditions to encode means the DNF is trivially a single empty
@@ -1524,6 +1692,52 @@ class Program
         // predicate bodies gets decomposed into separate DNF clauses.
         // Skip predicates with built-in SMT handlers (e.g., IsSorted).
         var smtBuiltins = new HashSet<string> { "IsSorted" };
+
+        // Class-invariant predicates are kept OPAQUE (not inlined, not decomposed).
+        // Two ways to recognise one: it is `Valid()` under {:autocontracts}, or it is
+        // called in BOTH the requires and the ensures of this method — invariant
+        // preservation, which is the structural definition and needs no naming
+        // convention. Inlining such a predicate flattens it into its conjuncts, which
+        // (a) multiplies clause literals with mutually-implied invariant facts,
+        // (b) multiplies CLAUSES wherever the body contains `==>` (week8_12_a3's
+        //     Valid() has two, so one method yields 12 clauses), partitioning on
+        //     invariant-internal shape rather than on method behaviour, and
+        // (c) promotes untranslatable conjuncts such as `this in Repr` from a
+        //     tolerated sub-expression (dropped inside a conjunction) into a
+        //     top-level literal that aborts the whole relevance query.
+        // Kept whole, the invariant is a single literal: asserted, never checked.
+        var invariantPreds = new HashSet<string>();
+        if (InvariantOpaque && inlinablePredicates != null)
+        {
+            var reqText = string.Join(" ", method.Req.Select(r => DnfEngine.ExprToString(r.E)));
+            var ensText = string.Join(" ", method.Ens.Select(e => DnfEngine.ExprToString(e.E)));
+            foreach (var p in inlinablePredicates)
+            {
+                var pat = new Regex(@"\b" + Regex.Escape(p.name) + @"\s*\(");
+                if (pat.IsMatch(reqText) && pat.IsMatch(ensText)) invariantPreds.Add(p.name);
+            }
+            if (classInfo is { IsAutoContracts: true }) invariantPreds.Add("Valid");
+            if (invariantPreds.Count > 0 && Z3Runner.CollectRungStats)
+                Console.WriteLine($"  [rung-stats] INVARIANT kept opaque: {string.Join(", ", invariantPreds)}");
+        }
+        // The invariant is skipped only for the POSTCONDITION. In the precondition it
+        // must still be translated, or the solver may fabricate a pre-state that breaks
+        // the class invariant and the emitted test's setup violates `requires Valid()`.
+        var smtBuiltinsPre = new HashSet<string>(smtBuiltins);   // invariant still inlined here
+        smtBuiltins.UnionWith(invariantPreds);                   // opaque in ensures only
+
+        // Option A: atomic for DECOMPOSITION, expanded for TRANSLATION. The clause keeps
+        // one `Valid()` literal (never relevance-checked), while every SMT query expands
+        // it to its body, so the invariant still constrains both the real output and the
+        // shadow. Without this the encoded postcondition silently loses the invariant.
+        SmtTranslator.InvariantExpander = null;
+        if (invariantPreds.Count > 0 && inlinablePredicates != null)
+        {
+            var invPreds = inlinablePredicates.Where(p => invariantPreds.Contains(p.name)).ToList();
+            if (invPreds.Count > 0)
+                SmtTranslator.InvariantExpander = e => InlineExpr(e, invPreds);
+        }
+
         List<(string name, List<string> paramNames, string body, bool isClassMember)>? predsToInline = null;
         var dnfEnsures = new List<Expression>(ensuresClauses);
         if (inlinablePredicates != null && inlinablePredicates.Count > 0)
@@ -1814,10 +2028,12 @@ class Program
         // Remove the empty "true" elements from single-clause results
         preDnfExprs = preDnfExprs.Select(c => c.Where(e => DnfEngine.ExprToString(e).Length > 0).ToList()).ToList();
         // Inline predicates in precondition literals
-        if (predsToInline != null && predsToInline.Count > 0)
+        var predsToInlinePre = inlinablePredicates?
+            .Where(p => !smtBuiltinsPre.Contains(p.name)).ToList();
+        if (predsToInlinePre != null && predsToInlinePre.Count > 0)
         {
             preDnfExprs = preDnfExprs.Select(clause =>
-                clause.Select(lit => InlineExpr(lit, predsToInline)).ToList()
+                clause.Select(lit => InlineExpr(lit, predsToInlinePre)).ToList()
             ).ToList();
         }
         bool hasDisjunctivePre = preDnfExprs.Count > 1;
@@ -1889,12 +2105,12 @@ class Program
             // alternative (deferred) re-existentializes the ghost witness inside the relevance
             // query and asserts each alt output is unachievable by the full clause — same effect,
             // more machinery — gated on the engine's output-uniqueness signal. See methodology.md
-            // and --no-skolemize-carveout for A/B.
+            // and --skolemize-carveout for A/B (carve-out now DEFAULT OFF).
             // So defer the quantifier-last family to the legacy atomic-exists path.
             static bool SkSkolemizable(ExistsExpr ex)
             {
                 if (ex.BoundVars.Count == 0) return false;
-                if (!SkolemizeCarveOut) return true; // --no-skolemize-carveout: Skolemize the quantifier-last family too
+                if (!SkolemizeCarveOut) return true; // default: Skolemize the quantifier-last family too
                 var conjs = DnfEngine.FlattenConjuncts(SkUnwrap(ex.Term));
                 var last = SkUnwrap(conjs[conjs.Count - 1]);
                 return last is not (ForallExpr or ExistsExpr);
@@ -2237,11 +2453,11 @@ class Program
                 var q1 = SmtTranslator.BuildProjectionProbeQuery(
                     inputs, outputs, preClauses, a, b, method, mutableNames);
                 if (q1 == null) return false;
-                if (!Unsat(await Z3Runner.RunZ3(z3Path, q1))) return false;
+                if (!Unsat(await Z3Runner.RunZ3(z3Path, q1, rung: "dead-clause-probe"))) return false;
                 var q2 = SmtTranslator.BuildProjectionProbeQuery(
                     inputs, outputs, preClauses, b, a, method, mutableNames);
                 if (q2 == null) return false;
-                return Unsat(await Z3Runner.RunZ3(z3Path, q2));
+                return Unsat(await Z3Runner.RunZ3(z3Path, q2, rung: "dead-clause-probe"));
             }
 
             async Task<List<List<Expression>>> MergeClauses(List<List<Expression>> clauses, string tag)
@@ -2622,7 +2838,8 @@ class Program
             List<Expression> clause,
             List<(string Name, string Type)> ins,
             List<(string Name, string Type)> outs,
-            HashSet<string> mutables)
+            HashSet<string> mutables,
+            bool census = false)   // census: tally the guard/frame/input-only/old-only split
         {
             var result = new List<int>();
             if (clause.Count == 0) return result;
@@ -2648,14 +2865,27 @@ class Program
                     s = next;
                 }
             }
+            if (census) Z3Runner.StatClauseLiterals += clause.Count;
             for (int i = 0; i < clause.Count; i++)
             {
                 var s = litStrs[i];
-                if (IsGuardLiteral(s)) continue;
-                if (frameEq.IsMatch(s)) continue;
+                if (IsGuardLiteral(s)) { if (census) Z3Runner.StatGuards++; continue; }
+                if (frameEq.IsMatch(s)) { if (census) Z3Runner.StatFrameConds++; continue; }
                 var stripped = StripOld(s);
                 bool refsOut = outNames.Any(n => Regex.IsMatch(stripped, @"\b" + Regex.Escape(n) + @"\b"));
-                if (!refsOut) continue;
+                if (!refsOut)
+                {
+                    // Distinguish "mentions no output at all" (an input-only literal, i.e. a
+                    // precondition-like conjunct) from "mentions an output only inside old(...)"
+                    // (pre-state-only: alt outputs share the same old values, so no alt can
+                    // ever flip it and the per-literal query is UNSAT by construction).
+                    if (census)
+                    {
+                        bool mentionsOutAnywhere = outNames.Any(n => Regex.IsMatch(s, @"\b" + Regex.Escape(n) + @"\b"));
+                        if (mentionsOutAnywhere) Z3Runner.StatOldOnly++; else Z3Runner.StatInputOnly++;
+                    }
+                    continue;
+                }
                 result.Add(i);
             }
             return result;
@@ -3420,6 +3650,65 @@ class Program
             return (added, pruned);
         }
 
+        // --rung-stats: why a clause fell through to a plain query (set by Phase 1r,
+        // read by ClassifySolveRung to attribute plain solver calls by reason).
+        var plainReason = new Dictionary<(int pi, int ci), string>();
+
+        // Rung classification for --rung-stats: derive the schedule query's purpose
+        // from its label (mirrors the log-parsing conventions: round-robin counted
+        // apart from the bases it repeats; clause tokens alone are the Phase-1
+        // plain-clause solves).
+        //
+        // A tier may itself contain '/', because literal-centric BVA names the
+        // literal and the edge separately: `{1}/BL:0<=f<N/=hi`. Taking only the LAST
+        // '/'-segment therefore sees `=hi`, matches nothing, and misfiles the query
+        // as plain-clause. Instead: round-robin wins if the label ENDS in /R<k>,
+        // otherwise scan segments right-to-left for the first recognisable tier
+        // prefix, so `=hi` is skipped and `BL:0<=f<N` decides.
+        static string TierKind(string seg)
+        {
+            if (seg.StartsWith("SC")) return "phase2-spec-cov";
+            if (seg.StartsWith("Estab") || seg.StartsWith("PreSat")) return "establish/presat";
+            if (Regex.IsMatch(seg, @"^Vi?\d")) return "vacuity-phase";
+            if (seg.StartsWith("Rel")) return "relevance-repeat";
+            if (seg.StartsWith("Div")) return "phase4-precond-fill";  // {P4}/Div<n>: precondition-only diversity fill
+            if (seg.StartsWith("B")) return "phase2-bva";
+            if (seg.StartsWith("O")) return "phase2-size-value";
+            return null!;
+        }
+
+        string ClassifySolveRung(string label)
+        {
+            var segs = label.Split('/');
+            if (Regex.IsMatch(segs[segs.Length - 1], @"^R\d+$")) return "round-robin";
+            for (int i = segs.Length - 1; i >= 0; i--)
+            {
+                var seg = segs[i];
+                if (Regex.IsMatch(seg, @"^P?\{\w+\}$")) continue;   // clause / precondition token
+                var kind = TierKind(seg);
+                if (kind != null) return kind;
+            }
+            // Plain clause query: attribute it to the reason the clause fell
+            // through the ladder, recorded by Phase 1r.
+            var toks = Regex.Matches(label, @"\{(\w+)\}");
+            if (toks.Count > 0)
+            {
+                var last = toks[toks.Count - 1].Groups[1].Value;
+                if (int.TryParse(last, out int ci1))
+                {
+                    int pidx = 0;
+                    if (toks.Count > 1 && label.StartsWith("P{") && int.TryParse(toks[0].Groups[1].Value, out int pnum))
+                        pidx = pnum - 1;
+                    if (plainReason.TryGetValue((pidx, ci1 - 1), out var why))
+                        return "plain-" + why;
+                    // fall back to any precondition partition with this clause
+                    foreach (var kv in plainReason)
+                        if (kv.Key.ci == ci1 - 1) return "plain-" + kv.Value;
+                }
+            }
+            return "plain-clause";
+        }
+
         // Helper: solve one SMT query and return parsed values (or null).
         // isDefinitiveUnsat is set to true only when Z3 returns "unsat" on the primary query
         // (not after fallback retries for "unknown"), so callers can safely prune.
@@ -3440,7 +3729,7 @@ class Program
                 Console.WriteLine($"  [DEBUG] Calling Z3...");
                 Console.Out.Flush();
             }
-            var result = await Z3Runner.RunZ3(z3Path, smt);
+            var result = await Z3Runner.RunZ3(z3Path, smt, rung: ClassifySolveRung(solveLabel));
             if (verbose)
             {
                 Console.WriteLine($"  [DEBUG] Z3 returned ({result.Length} chars): {result.Substring(0, Math.Min(result.Length, 500))}");
@@ -3472,7 +3761,7 @@ class Program
                         : null;
                     if (!string.IsNullOrEmpty(uQuery) && !TimedOut())
                     {
-                        var uResult = await Z3Runner.RunZ3(z3Path, uQuery);
+                        var uResult = await Z3Runner.RunZ3(z3Path, uQuery, rung: "uniqueness");
                         var uResultTrimmed = uResult.Split('\n').Select(l => l.Trim()).ToList();
                         bool isUnique = uResultTrimmed.Any(l => l == "unsat");
                         bool isUnknown = !isUnique && uResultTrimmed.Any(l => l == "unknown");
@@ -3510,7 +3799,7 @@ class Program
                                 sbRound.AppendLine("(get-model)");
                                 SmtTranslator.EmitGetValueQueries(sbRound, inputs, outputs, mutableNames);
                                 var roundQuery = SmtTranslator.RewriteNestedSeqRefs(sbRound.ToString(), inputs, outputs);
-                                var roundResult = await Z3Runner.RunZ3(z3Path, roundQuery);
+                                var roundResult = await Z3Runner.RunZ3(z3Path, roundQuery, rung: "uniqueness");
                                 var roundLines = roundResult.Split('\n').Select(l => l.Trim()).ToList();
 
                                 if (roundLines.Any(l => l == "unsat"))
@@ -3588,7 +3877,7 @@ class Program
                         Console.WriteLine($"  [DEBUG] Retry SMT2 query for {solveLabel}:");
                         Console.WriteLine(smt2);
                     }
-                    var result2 = await Z3Runner.RunZ3(z3Path, smt2);
+                    var result2 = await Z3Runner.RunZ3(z3Path, smt2, rung: "base-retry");
                     if (verbose)
                         Console.WriteLine($"  [DEBUG] Retry Z3 output: {result2.Substring(0, Math.Min(result2.Length, 500))}");
                     var resultLines2 = result2.Split('\n').Select(l => l.Trim()).ToList();
@@ -3617,7 +3906,7 @@ class Program
                         Console.WriteLine($"  [DEBUG] No-bias SMT2 query for {solveLabel}:");
                         Console.WriteLine(smtNb);
                     }
-                    var resultNb = await Z3Runner.RunZ3(z3Path, smtNb);
+                    var resultNb = await Z3Runner.RunZ3(z3Path, smtNb, rung: "base-retry");
                     if (verbose)
                         Console.WriteLine($"  [DEBUG] No-bias Z3 output: {resultNb.Substring(0, Math.Min(resultNb.Length, 500))}");
                     var resultLinesNb = resultNb.Split('\n').Select(l => l.Trim()).ToList();
@@ -3648,7 +3937,7 @@ class Program
                         Console.WriteLine($"  [DEBUG] Input-only SMT2 query for {solveLabel}:");
                         Console.WriteLine(smt3);
                     }
-                    var result3 = await Z3Runner.RunZ3(z3Path, smt3);
+                    var result3 = await Z3Runner.RunZ3(z3Path, smt3, rung: "base-retry");
                     if (verbose)
                         Console.WriteLine($"  [DEBUG] Input-only Z3 output: {result3.Substring(0, Math.Min(result3.Length, 500))}");
                     var resultLines3 = result3.Split('\n').Select(l => l.Trim()).ToList();
@@ -3894,7 +4183,7 @@ class Program
                 if (pin == null) continue;
                 var extraWithPin = new List<string>(tierExtra) { pin };
                 var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, false, excl, extraWithPin, preLits, mutableNames);
-                var result = await Z3Runner.RunZ3(z3Path, smt);
+                var result = await Z3Runner.RunZ3(z3Path, smt, rung: "subsumption");
                 if (result.Split('\n').Select(l => l.Trim()).Any(l => l == "sat"))
                     return results[i].values;
             }
@@ -3937,7 +4226,7 @@ class Program
                 if (pin == null) continue;
                 var extraWithPin = new List<string>(tierExtra) { pin };
                 var smt = SmtTranslator.BuildSmt2Query(inputs, outputs, preClauses, lits, method, false, excl, extraWithPin, preLits, mutableNames);
-                var result = await Z3Runner.RunZ3(z3Path, smt);
+                var result = await Z3Runner.RunZ3(z3Path, smt, rung: "subsumption");
                 if (result.Split('\n').Select(l => l.Trim()).Any(l => l == "sat"))
                     return true;
             }
@@ -4128,6 +4417,8 @@ class Program
             // With FDNF, each clause is a complete conjunction (including negated literals),
             // so we solve them all directly — no tier escalation needed.
             Console.WriteLine($"  Phase 1: {n} {(usedFdnf ? "FDNF" : "DNF")} clauses");
+            Z3Runner.StatMethods++;
+            Z3Runner.StatClauses += dnfExprs.Count;
 
             // Per-clause relevance pass (embedded in Phase 1): for each clause, first try
             // a dual-output relevance query that forces Z3 to pick an ins where the last
@@ -4135,10 +4426,32 @@ class Program
             // the plain clause query is skipped. Unsat/unknown/skipped → fall through to
             // the plain query emitted by BuildScheduleEntries.
             int relAdded = 0, relUnsat = 0, relSkipped = 0;
+            var relAttempted = new HashSet<(int pi, int ci)>();
+            // Per-clause literal counts, so a clause later found INFEASIBLE can be
+            // discounted from the census: a dead clause admits no input, so by
+            // Def 4.2 none of its literals can be active — vacuously, not because
+            // they are redundant. Counting them as 'not certified' would report a
+            // coverage failure where no obligation exists.
+            var clauseSafeCount = new Dictionary<(int pi, int ci), int>();
+            var clauseCheckedCount = new Dictionary<(int pi, int ci), int>();
             // Per-(pi,ci) set of literal indices whose Phase 1r returned UNSAT for a SINGLE index.
             // Used to skip those candidates in Phase 1v: UNSAT relevance ⇒ universally vacuous ⇒
             // Phase 1 baseline already exhibits vacuity, so Phase 1v would duplicate.
             var phase1rUnsatIndices = new Dictionary<(int pi, int ci), HashSet<int>>();
+            // --log-uncertified: per-clause record of what the ladder did with each safe
+            // literal, so the census's "not certified" bucket can be attributed. A literal
+            // lands there for three quite different reasons, which the counters conflate:
+            // an individual query returned UNSAT (redundant over the ENCODED contract), a
+            // query returned UNKNOWN and was read as UNSAT (Alg. 1), or no individual query
+            // ever targeted it (the ladder stopped early, or only ran coarser rungs).
+            var uncertRecords = new List<(int pi, int ci, string label, List<Expression> clause,
+                List<int> safe, HashSet<int> indiv, HashSet<int> group,
+                HashSet<int> unsatIdx, HashSet<int> unknownIdx, List<string> trace)>();
+            // --contract-shadows: symmetric per-pair overlap verdicts, probed once.
+            var overlapCache = new Dictionary<(int pi, int lo, int hi), bool>();
+            // Per-method probe budget: after this many probes, remaining pairs fail
+            // open (no strengthening). Bounds worst-case probe time per method.
+            int overlapProbeBudget = 30;
             if (RelevanceCheckEnabled && !TimedOut())
             {
                 for (int pi = 0; pi < preCombinations.Count; pi++)
@@ -4153,14 +4466,48 @@ class Program
                         if (TimedOut()) break;
                         if (maxTests > 0 && testCases.Count >= maxTests) break;
                         var clause = dnfExprs[ci];
-                        var safeIndices = GetSafeRelevanceIndices(clause, inputs, outputs, mutableNames);
+                        var safeIndices = GetSafeRelevanceIndices(clause, inputs, outputs, mutableNames, census: pi == 0);
+                        if (pi == 0) Z3Runner.StatSafeLiterals += safeIndices.Count;
+                        clauseSafeCount[(pi, ci)] = safeIndices.Count;
+                        // Per-clause coverage bookkeeping for the census: which value literals
+                        // the ladder actually CERTIFIED active, as opposed to merely building a
+                        // query for (StatCheckedLiterals). A literal is credited once, on the
+                        // first rung that covers it; `Group` marks the weaker, group-level
+                        // guarantee of a collective/group query, which does not certify the
+                        // individual members (see Sec. 5.1). Only pi==0 counts, matching the
+                        // other census rows, which are per clause not per precondition partition.
+                        var covIndiv = new HashSet<int>();
+                        var covGroup = new HashSet<int>();
+                        void CreditIndiv(IEnumerable<int> ids)
+                        {
+                            if (pi != 0) return;
+                            foreach (var i in ids)
+                                if (!covGroup.Contains(i) && covIndiv.Add(i)) Z3Runner.StatLitCoveredIndiv++;
+                        }
+                        void CreditGroup(IEnumerable<int> ids)
+                        {
+                            if (pi != 0) return;
+                            foreach (var i in ids)
+                                if (!covIndiv.Contains(i) && covGroup.Add(i)) Z3Runner.StatLitCoveredGroup++;
+                        }
+                        var uncertUnsatIdx = new HashSet<int>();      // individual query said UNSAT
+                        var uncertUnknownIdx = new HashSet<int>();    // individual query said UNKNOWN
+                        var uncertTrace = new List<string>();        // which rungs actually ran
+                        if (Z3Runner.LogUncertified && pi == 0)
+                            uncertRecords.Add((pi, ci, $"{{{ci + 1}}}", clause, safeIndices,
+                                covIndiv, covGroup, uncertUnsatIdx, uncertUnknownIdx, uncertTrace));
+                        Z3Runner.StatLiteralChecks += safeIndices.Count;   // every (pi,ci) the ladder processes
                         if (safeIndices.Count == 0)
                         {
                             relSkipped++;
-                            // Single-literal clause with no output reference (or guard-only):
-                            // bite query has nothing to vary. Notify the user.
-                            if (verbose && clause.Count == 1)
-                                Console.WriteLine($"  Relevance {{{ci + 1}}}: skipped (single-literal clause references no output, or is a guard literal — bite has nothing to vary)");
+                            Z3Runner.RecordClause("no safe literals (plain)");
+                            plainReason[(pi, ci)] = "no-safe-literals";
+                            // No safe (output-value) literals: all guards/input-only, so the
+                            // bite query has nothing to vary.
+                            if (Z3Runner.CollectRungStats)
+                                Console.WriteLine($"  [rung-stats] NOSAFE clause {{{ci + 1}}} (no safe output-value literals)");
+                            else if (verbose)
+                                Console.WriteLine($"  Relevance {{{ci + 1}}}: skipped:NOSAFE (no safe output-value literals — all guards/input-only)");
                             continue;
                         }
                         var clauseLabel = $"{fullPreLabel}{{{ci + 1}}}/Rel";
@@ -4169,8 +4516,69 @@ class Program
                         {
                             coveredByRelevance.Add((pi, ci));
                             relSkipped++;
+                            Z3Runner.RecordClause("subsumed by prior test");
                             if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: skipped (subsumed by prior test)");
                             continue;
+                        }
+                        // --contract-shadows: find sibling clauses whose input
+                        // projection overlaps this clause's (probed once per pair,
+                        // conservative on unknown). Shadows must then escape them.
+                        // Skolemised clauses are skipped: with ghost outputs pinned,
+                        // sibling negation is not contract-level (needs re-∃).
+                        SmtTranslator.ExposedSiblingClauses = null;
+                        // Budgeted: many-clause methods (MergeLoop: 15 clauses = 105
+                        // pairs, each probe a potential Z3 timeout) are skipped, and
+                        // every undecided verdict FAILS OPEN (no strengthening = the
+                        // pre-existing clause-relative behaviour, never worse). Only
+                        // a proven-SAT probe attaches sibling negations.
+                        const int MAX_OVERLAP_CLAUSES = 8;
+                        if (SmtTranslator.ContractShadows && dnfExprs.Count > 1
+                            && SmtTranslator.GhostOutputNames.Count == 0)
+                        {
+                            if (dnfExprs.Count > MAX_OVERLAP_CLAUSES)
+                            {
+                                if (pi == 0 && ci == 0)
+                                    Console.WriteLine($"  Contract-shadows: skipped for this method ({dnfExprs.Count} clauses > {MAX_OVERLAP_CLAUSES}, probe budget)");
+                            }
+                            else
+                            {
+                            var exposed = new List<List<Expression>>();
+                            for (int cj = 0; cj < dnfExprs.Count; cj++)
+                            {
+                                if (cj == ci) continue;
+                                var okey = (pi, Math.Min(ci, cj), Math.Max(ci, cj));
+                                if (!overlapCache.TryGetValue(okey, out bool ovl))
+                                {
+                                    ovl = false;   // fail open: only proven overlap attaches
+                                    if (overlapProbeBudget > 0)
+                                    {
+                                        overlapProbeBudget--;
+                                        var probe = SmtTranslator.BuildProjectionOverlapQuery(
+                                            inputs, outputs, fullPreLits,
+                                            dnfExprs[okey.Item2], dnfExprs[okey.Item3], method, mutableNames);
+                                        if (probe != null)
+                                        {
+                                            // Short timeout: probes are cheap when decidable;
+                                            // a timeout means "don't know" → fail open.
+                                            var pres = await Z3Runner.RunZ3(z3Path, probe, rung: "overlap-probe", timeoutMs: 500);
+                                            var plines = pres.Split('\n').Select(l => l.Trim()).ToList();
+                                            ovl = plines.Any(l => l == "sat");
+                                        }
+                                    }
+                                    overlapCache[okey] = ovl;
+                                    if (ovl)
+                                        Console.WriteLine($"  Overlap probe {{{okey.Item2 + 1}}}~{{{okey.Item3 + 1}}}: OVERLAP");
+                                    else if (verbose)
+                                        Console.WriteLine($"  Overlap probe {{{okey.Item2 + 1}}}~{{{okey.Item3 + 1}}}: disjoint/undecided");
+                                }
+                                if (ovl) exposed.Add(dnfExprs[cj]);
+                            }
+                            if (exposed.Count > 0)
+                            {
+                                SmtTranslator.ExposedSiblingClauses = exposed;
+                                if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: contract-shadows — {exposed.Count} overlapping sibling clause(s); shadows must escape them");
+                            }
+                            }
                         }
                         // Mode selection:
                         //   "combined" → per-literal shadow blocks; UNSAT fallback to last-safe-alone.
@@ -4179,6 +4587,12 @@ class Program
                         //                richer than group alone since combined's SAT witness
                         //                makes every safe Q_k individually cuttable).
                         var mode = RelevanceMode;
+                        // Distinguish the two single-test relevance checks in the label:
+                        //   /Rel   = combined query (per-literal shadow blocks) SAT — every
+                        //            safe literal is INDIVIDUALLY relevant (each cuttable).
+                        //   /RelG  = group query (single shadow ¬(⋀ Qk)) SAT — only the
+                        //            COMBINATION of safe literals is relevant (coupled).
+                        bool relUsedGroup = (mode == "group");
                         // Strengthened first: when a safe-index literal is `exists vars :: c1∧…∧cn`
                         // with cn a quantifier, also assert the stripped existential. SAT here
                         // pinpoints inputs where the inner quantifier is the biting clause.
@@ -4188,9 +4602,16 @@ class Program
                                 inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices, null, assertExistsStripped: true)
                             : SmtTranslator.BuildRelevanceQuery(
                                 inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices, null, assertExistsStripped: true);
-                        if (smt == null) { relSkipped++; continue; }
+                        if (smt == null) { relSkipped++; Z3Runner.RecordClause("unsupported shape (plain)"); plainReason[(pi, ci)] = "unsupported";
+                            Z3Runner.RecordClause($"   unsupported: {SmtTranslator.LastRelevanceSkipReason ?? "?"}");
+                            if (Z3Runner.CollectRungStats) Console.WriteLine($"  [rung-stats] UNSUPPORTED {clauseLabel} :: {SmtTranslator.LastRelevanceSkipReason}"); if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: skipped:UNSUPPORTED (relevance query could not be built for this clause shape)"); continue; }
+                        relAttempted.Add((pi, ci));
+                        if (pi == 0) Z3Runner.StatCheckedLiterals += SmtTranslator.LastCheckedLiteralCount;
+                        clauseCheckedCount[(pi, ci)] = SmtTranslator.LastCheckedLiteralCount;
                         if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel} (mode={mode}+strip, safe: [{string.Join(",", safeIndices.Select(i => i + 1))}])...");
-                        var z3Result = await Z3Runner.RunZ3(z3Path, smt);
+                        var z3Result = await Z3Runner.RunZ3(z3Path, smt, rung: "combined");
+                        uncertTrace.Add("C=" + (z3Result.Contains("\nsat") || z3Result.StartsWith("sat") ? "sat"
+                            : z3Result.Contains("unsat") ? "unsat" : "unknown"));
                         var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
                         int lastQueriedIndex = safeIndices.Count == 1 ? safeIndices[0] : -1;
                         // Fallback 0: stripped-existential strengthening was UNSAT — retry without it.
@@ -4204,7 +4625,7 @@ class Program
                             if (plainSmt != null)
                             {
                                 if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: stripped-strengthen UNSAT — retry plain");
-                                z3Result = await Z3Runner.RunZ3(z3Path, plainSmt);
+                                z3Result = await Z3Runner.RunZ3(z3Path, plainSmt, rung: "combined");
                                 lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
                             }
                         }
@@ -4216,20 +4637,225 @@ class Program
                         // FirstEvenOddIndices spec — both restrict to first-occurrence
                         // independently on multi-element inputs); we emit one /RelQ<k+1>
                         // test per SAT index.
-                        bool perLiteralSweepSatAny = false;
-                        if (mode != "group" && lines.Any(l => l == "unsat") && safeIndices.Count > 1)
+                        // ── Leave-one-out (LOO) rung (prototype, --relevance-loo) ──
+                        // Between combined (all of S at once) and the per-literal sweep
+                        // (singletons): when combined is UNSAT, drop ONE safe literal at a
+                        // time and ask whether the remaining n-1 are jointly relevant. Each
+                        // SAT (n-1)-subset is a single rich witness covering all its literals;
+                        // two witnesses that drop different literals cover all of S, so we stop
+                        // after two SAT and skip the sweep. With --loo-partial-emit, a lone SAT
+                        // subset is still emitted and the sweep is narrowed to its dropped literal.
+                        var sweepIndices = safeIndices;   // literals the per-literal sweep will probe
+                        // --act-credit: literals verified active on an earlier witness's
+                        // pinned input; their own singleton queries are skipped.
+                        var creditedIndices = new HashSet<int>();
+                        async Task<bool> ActiveOnModel(int litIdx, Dictionary<string, string> vals)
                         {
+                            var q = SmtTranslator.BuildVacuityPinnedQuery(
+                                inputs, outputs, fullPreLits, clause, vals, litIdx, method, mutableNames);
+                            if (string.IsNullOrEmpty(q)) return false;   // cannot decide -> no credit
+                            var r = await Z3Runner.RunZ3(z3Path, q, rung: "act-credit");
+                            return r.Split('\n').Select(l => l.Trim()).Any(l => l == "sat");
+                        }
+                        // Jointly active on the emitted model's input (Def. 4.2), memoised:
+                        // the minimisation below asks about overlapping subsets repeatedly.
+                        var groupActiveCache = new Dictionary<string, bool>();
+                        async Task<bool> GroupActiveOnModel(List<int> grp, Dictionary<string, string> vals)
+                        {
+                            var key = string.Join(",", grp.OrderBy(x => x));
+                            if (groupActiveCache.TryGetValue(key, out var hit)) return hit;
+                            var q = SmtTranslator.BuildVacuityPinnedQuery(
+                                inputs, outputs, fullPreLits, clause, vals, grp, method, mutableNames);
+                            bool ok = false;
+                            if (!string.IsNullOrEmpty(q))
+                            {
+                                var r = await Z3Runner.RunZ3(z3Path, q, rung: "group-minimise");
+                                ok = r.Split('\n').Select(l => l.Trim()).Any(l => l == "sat");
+                            }
+                            groupActiveCache[key] = ok;
+                            return ok;
+                        }
+                        // The collective rung certifies that the residue T prunes JOINTLY, not that
+                        // it is minimal, so crediting all of T over-reports (Sec. 5.1). Def. 4.3 asks
+                        // each coupled literal to sit in SOME minimal jointly-active group, so keep
+                        // exactly the members of T for which such a group exists at this input.
+                        // Minimality is decided exactly by enumerating the proper subsets when T is
+                        // small (the usual case: pairs), and greedily above the cap.
+                        async Task<List<int>> MinimalGroupMembers(List<int> T, Dictionary<string, string> vals)
+                        {
+                            if (!MinimiseGroups || T.Count <= 1) return T;
+                            if (T.Count <= 4)
+                            {
+                                var active = new List<List<int>>();
+                                for (int mask = 1; mask < (1 << T.Count); mask++)
+                                {
+                                    var sub = Enumerable.Range(0, T.Count).Where(b => (mask & (1 << b)) != 0)
+                                        .Select(b => T[b]).ToList();
+                                    if (await GroupActiveOnModel(sub, vals)) active.Add(sub);
+                                }
+                                // minimal = jointly active with no jointly-active proper subset
+                                var minimal = active.Where(a => !active.Any(b =>
+                                    b.Count < a.Count && b.All(a.Contains))).ToList();
+                                return T.Where(c => minimal.Any(m => m.Contains(c))).ToList();
+                            }
+                            var keep = new List<int>();
+                            foreach (var c in T)
+                            {
+                                var cur = new List<int>(T);
+                                foreach (var d in T)
+                                {
+                                    if (d == c || cur.Count <= 1) continue;
+                                    var cand = cur.Where(x => x != d).ToList();
+                                    if (await GroupActiveOnModel(cand, vals)) cur = cand;
+                                }
+                                if (await GroupActiveOnModel(cur, vals)) keep.Add(c);
+                            }
+                            return keep;
+                        }
+                        if (RelevanceLoo && mode != "group" && lines.Any(l => l == "unsat") && safeIndices.Count >= 3)
+                        {
+                            bool looHandled = false;
+                            // Two leave-one-out witnesses that drop DIFFERENT literals already cover
+                            // all of S (each certifies S minus its dropped literal, and the dropped
+                            // literals differ), so we stop after the first two satisfiable subsets —
+                            // no set-cover needed.
+                            var chosen = new List<(int dropped, List<int> covered, string z3res, Dictionary<string, string> values)>();
                             foreach (var k in safeIndices)
                             {
                                 if (TimedOut()) break;
-                                if (maxTests > 0 && testCases.Count >= maxTests) break;
+                                var subset = safeIndices.Where(x => x != k).ToList();
+                                string? looStrip = SmtTranslator.BuildRelevanceQuery(
+                                    inputs, outputs, fullPreLits, clause, method, mutableNames, subset, null, assertExistsStripped: true);
+                                if (looStrip == null) continue;
+                                if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel}/RelLO{k + 1} (leave out Q{k + 1}, joint: [{string.Join(",", subset.Select(i => i + 1))}])...");
+                                var looRes = await Z3Runner.RunZ3(z3Path, looStrip, rung: "leave-one-out");
+                                var looLines = looRes.Split('\n').Select(l => l.Trim()).ToList();
+                                if (looLines.Any(l => l == "unsat"))
+                                {
+                                    var looPlain = SmtTranslator.BuildRelevanceQuery(
+                                        inputs, outputs, fullPreLits, clause, method, mutableNames, subset);
+                                    if (looPlain != null)
+                                    {
+                                        looRes = await Z3Runner.RunZ3(z3Path, looPlain, rung: "leave-one-out");
+                                        looLines = looRes.Split('\n').Select(l => l.Trim()).ToList();
+                                    }
+                                }
+                                if (!looLines.Any(l => l == "sat"))
+                                {
+                                    // With |S| == 2 the leave-one-out subset IS a singleton, so this
+                                    // verdict is an individual one and must be attributed as such,
+                                    // or --log-uncertified would report the literal NOT-QUERIED.
+                                    if (subset.Count == 1)
+                                    {
+                                        if (looLines.Any(l => l == "unsat")) uncertUnsatIdx.Add(subset[0]);
+                                        else uncertUnknownIdx.Add(subset[0]);
+                                    }
+                                    continue;
+                                }
+                                var looVals = TypeUtils.ParseZ3Model(looRes, allVars);
+                                if (looVals.Count == 0) continue;
+                                chosen.Add((k, subset, looRes, looVals));
+                                if (chosen.Count == 2) break;   // two different-drop witnesses cover S
+                            }
+                            if (chosen.Count == 2 || (LooPartialEmit && chosen.Count == 1))
+                            {
+                                foreach (var c in chosen)
+                                {
+                                    if (maxTests > 0 && testCases.Count >= maxTests) break;
+                                    var looLabel = $"{fullPreLabel}{{{ci + 1}}}/RelLO{c.dropped + 1}";
+                                    var looFp = BuildInputExclusion(c.values);
+                                    bool looDup = false;
+                                    if (looFp != null)
+                                        foreach (var prior in testCases)
+                                        {
+                                            var pf = BuildInputExclusion(prior.values);
+                                            if (pf != null && pf == looFp) { looDup = true; break; }
+                                        }
+                                    if (looDup)
+                                    {
+                                        if (verbose) Console.WriteLine($"  Relevance {looLabel}: skipped (input matches prior test)");
+                                        continue;
+                                    }
+                                    var looSpecSmt = SmtTranslator.BuildSmt2Query(
+                                        inputs, outputs, preClauses, dnfEnsures, method, false,
+                                        null, null, fullPreLits, mutableNames, skipBias: true);
+                                    var looUQuery = !hasNonInlinableFuncs
+                                        ? SmtTranslator.BuildUniquenessQuery(looSpecSmt, inputs, outputs, c.values, mutableNames)
+                                        : null;
+                                    if (!string.IsNullOrEmpty(looUQuery) && !TimedOut())
+                                    {
+                                        var looURes = await Z3Runner.RunZ3(z3Path, looUQuery, rung: "uniqueness");
+                                        var looULines = looURes.Split('\n').Select(l => l.Trim()).ToList();
+                                        var looUnique = looULines.Any(l => l == "unsat");
+                                        var looUnknown = !looUnique && looULines.Any(l => l == "unknown");
+                                        c.values["__unique__"] = (looUnique || (looUnknown && TrustUnknownUniqueness)) ? "true" : "false";
+                                    }
+                                    Z3Runner.RecordClause("covered: leave-one-out");
+                                    CreditIndiv(c.covered);
+                                    testCases.Add((looLabel, c.values, clause));
+                                    coveredByRelevance.Add((pi, ci));
+                                    relAdded++;
+                                    looHandled = true;
+                                    if (verbose) Console.WriteLine($"  Relevance {looLabel}: SAT — added test case (covers Q{string.Join("/Q", c.covered.Select(i => i + 1))})");
+                                    var looBaseKey = ScheduleKey(clause, new List<Expression>(), fullPreLits);
+                                    if (!baseConditionExclusions.ContainsKey(looBaseKey))
+                                        baseConditionExclusions[looBaseKey] = new List<string>();
+                                    var looExcl = BuildInputExclusion(c.values);
+                                    if (looExcl != null) baseConditionExclusions[looBaseKey].Add(looExcl);
+                                    relevanceContextByBaseKey[looBaseKey] = (c.covered, clause, fullPreLits, mode, looLabel);
+                                }
+                                if (looHandled && chosen.Count == 2)
+                                {
+                                    if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: covered all {safeIndices.Count} safe literals with 2 leave-one-out test(s) — skipping per-literal sweep");
+                                    lines = new List<string> { "sat-handled-via-loo" };
+                                }
+                                else if (looHandled && chosen.Count == 1)
+                                {
+                                    // One witness covers S minus its dropped literal; narrow the
+                                    // sweep to that single uncovered literal (--loo-partial-emit).
+                                    sweepIndices = new List<int> { chosen[0].dropped };
+                                    if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: one leave-one-out test covers {safeIndices.Count - 1}/{safeIndices.Count} literals — sweep narrowed to Q{chosen[0].dropped + 1}");
+                                    if (ActCredit && await ActiveOnModel(chosen[0].dropped, chosen[0].values))
+                                    {
+                                        creditedIndices.Add(chosen[0].dropped);
+                                        if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: act-credit — Q{chosen[0].dropped + 1} also active on the leave-one-out witness; sweep skipped");
+                                    }
+                                }
+                            }
+                            else if (verbose && chosen.Count > 0)
+                            {
+                                Console.WriteLine($"  Relevance {clauseLabel}: leave-one-out found only {chosen.Count} satisfiable subset ({safeIndices.Count - 1}/{safeIndices.Count} literals) — falling through to per-literal sweep");
+                            }
+                        }
+
+                        bool perLiteralSweepSatAny = false;
+                        var redundantIndices = new List<int>();   // singletons confirmed UNSAT (individually redundant)
+                        if (sweepIndices.Count < safeIndices.Count)
+                            uncertTrace.Add($"SW=narrowed({sweepIndices.Count}/{safeIndices.Count})");
+                        if (!(mode != "group" && lines.Any(l => l == "unsat") && safeIndices.Count > 1))
+                            uncertTrace.Add(mode == "group" ? "SW=skipped(group-mode)"
+                                : safeIndices.Count <= 1 ? "SW=skipped(single-literal)"
+                                : "SW=skipped(clause-covered)");
+                        int sweepProbed = 0;
+                        if (mode != "group" && lines.Any(l => l == "unsat") && safeIndices.Count > 1)
+                        {
+                            foreach (var k in sweepIndices)
+                            {
+                                if (TimedOut()) { uncertTrace.Add("SW=break(timeout)"); break; }
+                                if (maxTests > 0 && testCases.Count >= maxTests) { uncertTrace.Add("SW=break(budget)"); break; }
+                                sweepProbed++;
+                                if (creditedIndices.Contains(k))
+                                {
+                                    if (verbose) Console.WriteLine($"  Relevance {clauseLabel}/Q{k + 1}: act-credit — already active on an earlier witness; query skipped");
+                                    continue;
+                                }
                                 var perLitIndices = new List<int> { k };
                                 // Try with strip-strengthening first, fall back to plain on UNSAT.
                                 string? perStripSmt = SmtTranslator.BuildRelevanceQuery(
                                     inputs, outputs, fullPreLits, clause, method, mutableNames, perLitIndices, null, assertExistsStripped: true);
                                 if (perStripSmt == null) continue;
                                 if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel}/Q{k + 1} (single-literal+strip)...");
-                                var perResult = await Z3Runner.RunZ3(z3Path, perStripSmt);
+                                var perResult = await Z3Runner.RunZ3(z3Path, perStripSmt, rung: "one-at-a-time");
                                 var perLines = perResult.Split('\n').Select(l => l.Trim()).ToList();
                                 if (perLines.Any(l => l == "unsat"))
                                 {
@@ -4238,11 +4864,16 @@ class Program
                                     if (perPlainSmt != null)
                                     {
                                         if (verbose) Console.WriteLine($"  Relevance {clauseLabel}/Q{k + 1}: strip UNSAT — retry plain");
-                                        perResult = await Z3Runner.RunZ3(z3Path, perPlainSmt);
+                                        perResult = await Z3Runner.RunZ3(z3Path, perPlainSmt, rung: "one-at-a-time");
                                         perLines = perResult.Split('\n').Select(l => l.Trim()).ToList();
                                     }
                                 }
-                                if (!perLines.Any(l => l == "sat")) continue;
+                                if (!perLines.Any(l => l == "sat"))
+                                {
+                                    if (perLines.Any(l => l == "unsat")) { redundantIndices.Add(k); uncertUnsatIdx.Add(k); }
+                                    else uncertUnknownIdx.Add(k);   // no verdict: read as UNSAT by Alg. 1
+                                    continue;
+                                }
                                 var perValues = TypeUtils.ParseZ3Model(perResult, allVars);
                                 if (perValues.Count == 0) continue;
                                 // Emit a per-literal /RelQ<k+1> test. Same uniqueness +
@@ -4276,12 +4907,14 @@ class Program
                                     : null;
                                 if (!string.IsNullOrEmpty(perUQuery) && !TimedOut())
                                 {
-                                    var perUResult = await Z3Runner.RunZ3(z3Path, perUQuery);
+                                    var perUResult = await Z3Runner.RunZ3(z3Path, perUQuery, rung: "uniqueness");
                                     var perULines = perUResult.Split('\n').Select(l => l.Trim()).ToList();
                                     var perUnique = perULines.Any(l => l == "unsat");
                                     var perUnknown = !perUnique && perULines.Any(l => l == "unknown");
                                     perValues["__unique__"] = (perUnique || (perUnknown && TrustUnknownUniqueness)) ? "true" : "false";
                                 }
+                                Z3Runner.RecordClause("covered: one-at-a-time");
+                                CreditIndiv(perLitIndices);
                                 testCases.Add((perLabel, perValues, clause));
                                 coveredByRelevance.Add((pi, ci));
                                 relAdded++;
@@ -4293,7 +4926,89 @@ class Program
                                 var perExcl = BuildInputExclusion(perValues);
                                 if (perExcl != null) baseConditionExclusions[perBaseKey].Add(perExcl);
                                 relevanceContextByBaseKey[perBaseKey] = (perLitIndices, clause, fullPreLits, mode, perLabel);
+                                // --act-credit: check which LATER sweep literals are also
+                                // active on this witness's input; credit them so their own
+                                // queries (and tests) are skipped.
+                                if (ActCredit)
+                                    foreach (var j in sweepIndices.SkipWhile(x => x != k).Skip(1))
+                                        if (!creditedIndices.Contains(j) && await ActiveOnModel(j, perValues))
+                                        {
+                                            creditedIndices.Add(j);
+                                            // Certified active by a pinned-input query, so it counts
+                                            // as individually covered even though no test is emitted.
+                                            CreditIndiv(new[] { j });
+                                            if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: act-credit — Q{j + 1} active on the /RelQ{k + 1} witness; its query will be skipped");
+                                        }
                             }
+                            // Coupled-residual rung (--coupled-residual): some literals were
+                            // individually relevant (clause already covered), but >=2 others came
+                            // back individually redundant. The all-singletons-UNSAT group fallback
+                            // below won't fire (a singleton was SAT), so try those residual literals
+                            // collectively here to catch a coupled subset mixed in with relevant ones.
+                            if (CoupledResidual && perLiteralSweepSatAny && redundantIndices.Count >= 2
+                                && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
+                            {
+                                var rcSmt = SmtTranslator.BuildGroupRelevanceQuery(
+                                    inputs, outputs, fullPreLits, clause, method, mutableNames, redundantIndices);
+                                if (rcSmt != null)
+                                {
+                                    if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel}/RelGC (coupled residual over [{string.Join(",", redundantIndices.Select(i => i + 1))}])...");
+                                    var rcRes = await Z3Runner.RunZ3(z3Path, rcSmt, rung: "group");
+                                    var rcLines = rcRes.Split('\n').Select(l => l.Trim()).ToList();
+                                    var rcVals = rcLines.Any(l => l == "sat") ? TypeUtils.ParseZ3Model(rcRes, allVars) : null;
+                                    if (rcVals != null && rcVals.Count > 0)
+                                    {
+                                        var rcLabel = $"{fullPreLabel}{{{ci + 1}}}/RelGC";
+                                        var rcFp = BuildInputExclusion(rcVals);
+                                        bool rcDup = false;
+                                        if (rcFp != null)
+                                            foreach (var prior in testCases)
+                                            {
+                                                var pf = BuildInputExclusion(prior.values);
+                                                if (pf != null && pf == rcFp) { rcDup = true; break; }
+                                            }
+                                        if (rcDup)
+                                        {
+                                            if (verbose) Console.WriteLine($"  Relevance {rcLabel}: skipped (input matches prior test)");
+                                        }
+                                        else
+                                        {
+                                            var rcSpecSmt = SmtTranslator.BuildSmt2Query(
+                                                inputs, outputs, preClauses, dnfEnsures, method, false,
+                                                null, null, fullPreLits, mutableNames, skipBias: true);
+                                            var rcUQuery = !hasNonInlinableFuncs
+                                                ? SmtTranslator.BuildUniquenessQuery(rcSpecSmt, inputs, outputs, rcVals, mutableNames)
+                                                : null;
+                                            if (!string.IsNullOrEmpty(rcUQuery) && !TimedOut())
+                                            {
+                                                var rcURes = await Z3Runner.RunZ3(z3Path, rcUQuery, rung: "uniqueness");
+                                                var rcULines = rcURes.Split('\n').Select(l => l.Trim()).ToList();
+                                                var rcUnique = rcULines.Any(l => l == "unsat");
+                                                var rcUnknown = !rcUnique && rcULines.Any(l => l == "unknown");
+                                                rcVals["__unique__"] = (rcUnique || (rcUnknown && TrustUnknownUniqueness)) ? "true" : "false";
+                                            }
+                                            Z3Runner.RecordClause("covered: collective");
+                                            if (pi == 0) Z3Runner.StatCheckedLiterals += SmtTranslator.LastGroupUnencodableCount;
+                                            CreditGroup(await MinimalGroupMembers(redundantIndices, rcVals));
+                                            testCases.Add((rcLabel, rcVals, clause));
+                                            coveredByRelevance.Add((pi, ci));
+                                            relAdded++;
+                                            if (verbose) Console.WriteLine($"  Relevance {rcLabel}: SAT — added coupled-residual test (covers Q{string.Join("/Q", redundantIndices.Select(i => i + 1))})");
+                                            var rcBaseKey = ScheduleKey(clause, new List<Expression>(), fullPreLits);
+                                            if (!baseConditionExclusions.ContainsKey(rcBaseKey))
+                                                baseConditionExclusions[rcBaseKey] = new List<string>();
+                                            var rcExcl = BuildInputExclusion(rcVals);
+                                            if (rcExcl != null) baseConditionExclusions[rcBaseKey].Add(rcExcl);
+                                            relevanceContextByBaseKey[rcBaseKey] = (redundantIndices, clause, fullPreLits, mode, rcLabel);
+                                        }
+                                    }
+                                    else if (verbose)
+                                    {
+                                        Console.WriteLine($"  Relevance {clauseLabel}/RelGC: UNSAT — residual literals not collectively relevant");
+                                    }
+                                }
+                            }
+                            uncertTrace.Add($"SW={sweepProbed}/{sweepIndices.Count}");
                             // If at least one per-literal probe was SAT, the clause is covered;
                             // skip the group fallback. Otherwise let the group attempt run.
                             if (perLiteralSweepSatAny)
@@ -4309,9 +5024,12 @@ class Program
                             if (gSmt != null)
                             {
                                 if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: combined UNSAT — retry with group");
-                                z3Result = await Z3Runner.RunZ3(z3Path, gSmt);
+                                z3Result = await Z3Runner.RunZ3(z3Path, gSmt, rung: "group");
                                 lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
+                                uncertTrace.Add("G=" + (lines.Any(l => l == "sat") ? "sat"
+                                    : lines.Any(l => l == "unsat") ? "unsat" : "unknown"));
                                 lastQueriedIndex = -1;  // group doesn't pinpoint a single index
+                                relUsedGroup = true;    // SAT here is combination-only relevance
                             }
                         }
                         if (lines.Any(l => l == "sat"))
@@ -4329,16 +5047,22 @@ class Program
                                 bool isUnique = false;
                                 if (!string.IsNullOrEmpty(uQuery) && !TimedOut())
                                 {
-                                    var uResult = await Z3Runner.RunZ3(z3Path, uQuery);
+                                    var uResult = await Z3Runner.RunZ3(z3Path, uQuery, rung: "uniqueness");
                                     var uLines = uResult.Split('\n').Select(l => l.Trim()).ToList();
                                     isUnique = uLines.Any(l => l == "unsat");
                                     bool isUnknown = !isUnique && uLines.Any(l => l == "unknown");
                                     values["__unique__"] = (isUnique || (isUnknown && TrustUnknownUniqueness)) ? "true" : "false";
                                 }
-                                testCases.Add((clauseLabel, values, clause));
+                                Z3Runner.RecordClause(relUsedGroup ? "covered: group" : "covered: combined");
+                                if (relUsedGroup && pi == 0)
+                                    Z3Runner.StatCheckedLiterals += SmtTranslator.LastGroupUnencodableCount;
+                                if (relUsedGroup) CreditGroup(await MinimalGroupMembers(safeIndices, values));
+                                else CreditIndiv(safeIndices);
+                                var relEmitLabel = relUsedGroup ? clauseLabel.Replace("/Rel", "/RelG") : clauseLabel;
+                                testCases.Add((relEmitLabel, values, clause));
                                 coveredByRelevance.Add((pi, ci));
                                 relAdded++;
-                                if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: SAT — added test case");
+                                if (verbose) Console.WriteLine($"  Relevance {relEmitLabel}: SAT — added test case");
                                 // Register the relevance witness's input in the baseConditionExclusions
                                 // for the matching {ci+1} clause base so Phase 3 repeats are forced to
                                 // diverge from it (rather than re-picking near-identical small models).
@@ -4363,6 +5087,7 @@ class Program
                             // Phase 1's plain SAT query (run later for clauses not
                             // in coveredByRelevance) is the safety net.
                             if (verbose) Console.WriteLine($"  Relevance {clauseLabel}: UNKNOWN (falling back to plain Phase 1)");
+                            if (lastQueriedIndex >= 0) uncertUnknownIdx.Add(lastQueriedIndex);
                         }
                         else if (lines.Any(l => l == "unsat"))
                         {
@@ -4379,7 +5104,70 @@ class Program
                                     phase1rUnsatIndices[(pi, ci)] = set;
                                 }
                                 set.Add(lastQueriedIndex);
+                                uncertUnsatIdx.Add(lastQueriedIndex);
                             }
+                        }
+                    }
+                }
+                SmtTranslator.ExposedSiblingClauses = null;   // don't leak into Phase 2/3 queries
+                var exhausted = relAttempted.Where(x => !coveredByRelevance.Contains(x)).ToList();
+                foreach (var x in exhausted) plainReason[x] = "fallback";
+                // Separate INFEASIBLE clauses from genuinely uncertified ones. Every
+                // relevance query over an unsatisfiable clause is trivially UNSAT, so
+                // the ladder reports it as exhausted — but a dead clause has no admitted
+                // input, hence no coverage obligation at all (Def 4.2). Probe only the
+                // exhausted ones (at most a handful per program) and discount their
+                // literals from the census rather than booking them as not-certified.
+                var deadClauses = new List<(int pi, int ci)>();
+                foreach (var x in exhausted)
+                {
+                    if (TimedOut()) break;
+                    var dq = SmtTranslator.BuildSmt2Query(
+                        inputs, outputs, preClauses, dnfExprs[x.ci], method, verbose: false,
+                        // Method-level requires only: partition-specific pre-literals are
+                        // out of scope here, and omitting them is conservative — they can
+                        // only constrain further, so UNSAT without them implies UNSAT with.
+                        exclusions: null, extraConstraints: null, preLiterals: null,
+                        mutableNames: mutableNames, skipBias: true);
+                    if (string.IsNullOrEmpty(dq)) continue;
+                    var dres = await Z3Runner.RunZ3(z3Path, dq, rung: "dead-clause-probe");
+                    if (!dres.Split('\n').Select(l => l.Trim()).Any(l => l == "unsat")) continue;
+                    deadClauses.Add(x);
+                    if (x.pi == 0)
+                    {
+                        if (clauseSafeCount.TryGetValue(x, out var sc)) Z3Runner.StatSafeLiterals -= sc;
+                        if (clauseCheckedCount.TryGetValue(x, out var cc)) Z3Runner.StatCheckedLiterals -= cc;
+                    }
+                }
+                foreach (var x in deadClauses) exhausted.Remove(x);
+                if (deadClauses.Count > 0)
+                    Z3Runner.RecordClause("dead clause (excluded from census)", deadClauses.Count);
+                Z3Runner.RecordClause("ladder exhausted (plain)", exhausted.Count);
+                if (Z3Runner.CollectRungStats)
+                {
+                    foreach (var x in exhausted)
+                        Console.WriteLine($"  [rung-stats] EXHAUSTED clause {{{x.ci + 1}}} (all rungs UNSAT)");
+                    foreach (var x in deadClauses)
+                        Console.WriteLine($"  [rung-stats] DEAD clause {{{x.ci + 1}}} (unsatisfiable — excluded)");
+                }
+                if (Z3Runner.LogUncertified)
+                {
+                    // One line per CHECKED-but-uncertified value literal, tagged with why the
+                    // ladder left it uncertified. Dead clauses are skipped: their literals are
+                    // discounted from the census above, so including them here would not match.
+                    var deadSet = new HashSet<(int, int)>(deadClauses);
+                    foreach (var r in uncertRecords)
+                    {
+                        if (deadSet.Contains((r.pi, r.ci))) continue;
+                        foreach (var i in r.safe)
+                        {
+                            if (r.indiv.Contains(i) || r.group.Contains(i)) continue;
+                            var why = r.unsatIdx.Contains(i) ? "UNSAT"
+                                    : r.unknownIdx.Contains(i) ? "UNKNOWN"
+                                    : "NOT-QUERIED";
+                            var text = DnfEngine.ExprToString(r.clause[i]).Replace("\n", " ");
+                            var tr = r.trace.Count > 0 ? string.Join(" ", r.trace) : "-";
+                            Console.WriteLine($"  [uncertified] {method.Name} {r.label}/Q{i + 1} {why} [{tr}] :: {text}");
                         }
                     }
                 }
@@ -4472,7 +5260,7 @@ class Program
                         if (string.IsNullOrEmpty(smt)) { skipped++; continue; }
                         var label = $"{fullPreLabel}{{{ci + 1}}}{labelSuffix}";
                         if (verbose) Console.WriteLine($"  Solving {phaseTag} {label}...");
-                        var z3Result = await Z3Runner.RunZ3(z3Path, smt);
+                        var z3Result = await Z3Runner.RunZ3(z3Path, smt, rung: "establish/presat");
                         var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
                         if (!lines.Any(l => l == "sat")) { noScenario++; continue; }
                         var witness = TypeUtils.ParseZ3Model(z3Result, allVars);
@@ -4495,7 +5283,7 @@ class Program
                             : null;
                         if (!string.IsNullOrEmpty(uQueryE) && !TimedOut())
                         {
-                            var uRes = await Z3Runner.RunZ3(z3Path, uQueryE);
+                            var uRes = await Z3Runner.RunZ3(z3Path, uQueryE, rung: "uniqueness");
                             var uLn = uRes.Split('\n').Select(l => l.Trim()).ToList();
                             bool uniq = uLn.Any(l => l == "unsat");
                             bool unk = !uniq && uLn.Any(l => l == "unknown");
@@ -4580,7 +5368,7 @@ class Program
                                 var probeSmt = SmtTranslator.BuildVacuityPinnedQuery(
                                     inputs, outputs, fullPreLits, clause, priorValues, k, method, mutableNames);
                                 if (probeSmt == null) continue;
-                                var probeRes = await Z3Runner.RunZ3(z3Path, probeSmt);
+                                var probeRes = await Z3Runner.RunZ3(z3Path, probeSmt, rung: "vacuity-phase");
                                 var probeLines = probeRes.Split('\n').Select(l => l.Trim()).ToList();
                                 if (!probeLines.Any(l => l == "unsat")) continue;
                                 // Q_k vacuous in prior — but with isolated-as-default policy,
@@ -4594,7 +5382,7 @@ class Program
                                     var probeSmtJ = SmtTranslator.BuildVacuityPinnedQuery(
                                         inputs, outputs, fullPreLits, clause, priorValues, j, method, mutableNames);
                                     if (probeSmtJ == null) continue;
-                                    var probeResJ = await Z3Runner.RunZ3(z3Path, probeSmtJ);
+                                    var probeResJ = await Z3Runner.RunZ3(z3Path, probeSmtJ, rung: "vacuity-phase");
                                     var probeLinesJ = probeResJ.Split('\n').Select(l => l.Trim()).ToList();
                                     if (probeLinesJ.Any(l => l == "unsat")) { anyOtherVac = true; break; }
                                 }
@@ -4668,7 +5456,7 @@ class Program
                                         SmtTranslator.BiasMagnitudeOnly = savedBiasMagOnly;
                                     }
                                     if (string.IsNullOrEmpty(smtA)) return null;
-                                    var resA = await Z3Runner.RunZ3(z3Path, smtA);
+                                    var resA = await Z3Runner.RunZ3(z3Path, smtA, rung: "vacuity-phase");
                                     var linesA = resA.Split('\n').Select(l => l.Trim()).ToList();
                                     if (!linesA.Any(l => l == "sat")) return null;
                                     var insValues = TypeUtils.ParseZ3Model(resA, allVars);
@@ -4677,7 +5465,7 @@ class Program
                                     var smtB = SmtTranslator.BuildVacuityPinnedQuery(
                                         inputs, outputs, fullPreLits, clause, insValues, k, method, mutableNames);
                                     if (smtB == null) return null;
-                                    var resB = await Z3Runner.RunZ3(z3Path, smtB);
+                                    var resB = await Z3Runner.RunZ3(z3Path, smtB, rung: "vacuity-phase");
                                     var linesB = resB.Split('\n').Select(l => l.Trim()).ToList();
                                     if (linesB.Any(l => l == "unsat"))
                                         return insValues;  // Q_k vacuous → witness found
@@ -4745,7 +5533,7 @@ class Program
                                 : null;
                             if (!string.IsNullOrEmpty(uQueryV) && !TimedOut())
                             {
-                                var uResV = await Z3Runner.RunZ3(z3Path, uQueryV);
+                                var uResV = await Z3Runner.RunZ3(z3Path, uQueryV, rung: "uniqueness");
                                 var uLinesV = uResV.Split('\n').Select(l => l.Trim()).ToList();
                                 bool isUniqueV = uLinesV.Any(l => l == "unsat");
                                 bool isUnknownV = !isUniqueV && uLinesV.Any(l => l == "unknown");
@@ -5045,7 +5833,7 @@ class Program
                                     nextActive.Add(label); continue;
                                 }
                                 if (verbose) Console.WriteLine($"  Solving {repLabel} (relevance-style)...");
-                                var z3Result = await Z3Runner.RunZ3(z3Path, smt);
+                                var z3Result = await Z3Runner.RunZ3(z3Path, smt, rung: "phase3-repetition");
                                 var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
                                 if (lines.Any(l => l == "sat"))
                                 {
@@ -5175,10 +5963,32 @@ class Program
                         foreach (var ex in pc.preExclusions) fullPre.Add(DnfEngine.Negate(ex));
                     }
                     var lbl = (preCombinations.Count > 1 ? $"{preLabel}/" : "") + $"{{P4}}/Div{++p4n}";
+                    // NB on admissibility. Solving the PRECONDITION ALONE can yield an X with
+                    // Pre(X) true but [[Post]](X) empty, so X is not *admitted* in the sense
+                    // of Sec. 4.1. Constraining the solve with the ensures clauses would rule
+                    // those out — but that is deliberately NOT done here. A specification is
+                    // itself a test target: an X the spec cannot satisfy is a finding worth
+                    // surfacing, and for a spec-mutated program such inputs are precisely the
+                    // discriminating ones (BubbleSort with `sorted` mutated to "all elements
+                    // <= 0" admits no output once an element is positive; the resulting tests
+                    // fail on the mutant and PASS on the original, i.e. a genuine kill).
+                    // Requiring a witness output here would suppress exactly those tests.
                     var (vals, _) = await SolveOne(lbl, testCases.Count + 1, minTests,
                         new List<Expression>(), fullPre, new List<Expression>(),
                         new List<string>(p4Excl));
                     if (vals == null) { consecFail++; continue; }
+                    // Phase-4 inputs are solved from the PRECONDITION ALONE (the empty
+                    // postcondition literal list above), so the model's OUTPUT values are
+                    // unconstrained by the spec — Z3 returns an arbitrary witness. The
+                    // uniqueness probe inside SolveOne, however, runs against the full
+                    // contract, so it can return "unique" while the value it is paired with
+                    // came from a solve that ignored the postcondition. Emitting that pair
+                    // produced `expect A[..] == [24]` for a BubbleSort of [-10]. Force the
+                    // documented route (see the comment above and TestEmitter's isUnique):
+                    // full-postcondition runtime oracle, never a concrete expected value.
+                    vals["__unique__"] = "false";
+                    foreach (var k in vals.Keys.Where(k => k.StartsWith("__alt_")).ToList())
+                        vals.Remove(k);
                     var fe = BuildInputExclusion(vals);
                     if (fe != null && p4Excl.Contains(fe)) { consecFail++; continue; }
                     consecFail = 0;
@@ -5301,7 +6111,7 @@ class Program
                     var smtB = SmtTranslator.BuildVacuityPinnedQuery(
                         inputs, outputs, fullPreLits2, tcClause, tcValues, k, method, mutableNames);
                     if (string.IsNullOrEmpty(smtB)) continue;
-                    var resB = await Z3Runner.RunZ3(z3Path, smtB);
+                    var resB = await Z3Runner.RunZ3(z3Path, smtB, rung: "vacuity-annotation");
                     var linesB = resB.Split('\n').Select(l => l.Trim()).ToList();
                     if (linesB.Any(l => l == "unsat")) vacIndices.Add(k);
                 }

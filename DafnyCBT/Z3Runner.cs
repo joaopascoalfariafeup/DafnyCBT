@@ -22,12 +22,138 @@ static class Z3Runner
     /// </summary>
     static string? _resolvedZ3Path;
 
-    internal static async Task<string> RunZ3(string z3Path, string smtInput)
+    /// <summary>
+    /// Per-rung Z3 query outcome tallies (--rung-stats). Solving is sequential,
+    /// so a plain dictionary is safe. Keyed by the rung label passed to RunZ3.
+    /// </summary>
+    internal static bool CollectRungStats = false;
+    internal record RungTally
+    {
+        internal int Queries, Sat, Unsat, Unknown, Timeout, Other;
+    }
+    internal static readonly Dictionary<string, RungTally> RungStats = new();
+    static readonly List<string> RungOrder = new();
+
+    internal static void RecordRung(string rung, string z3Output)
+    {
+        if (!CollectRungStats) return;
+        if (!RungStats.TryGetValue(rung, out var t))
+        {
+            t = new RungTally(); RungStats[rung] = t; RungOrder.Add(rung);
+        }
+        t.Queries++;
+        var lines = z3Output.Split('\n').Select(l => l.Trim()).ToList();
+        if (lines.Any(l => l == "sat")) t.Sat++;
+        else if (lines.Any(l => l == "unsat")) t.Unsat++;
+        else if (lines.Any(l => l == "unknown")) t.Unknown++;
+        else if (lines.Any(l => l == "timeout")) t.Timeout++;
+        else t.Other++;
+    }
+
+    /// <summary>
+    /// Per-DNF-clause disposition of the relevance ladder: which rung covered the
+    /// clause, or why no relevance check was performed (no safe literals /
+    /// unsupported shape), or that the ladder was exhausted and the clause fell
+    /// back to a plain DNF query. Distinguishes "never needed relevance" from
+    /// "relevance was tried and failed".
+    /// </summary>
+    internal static readonly Dictionary<string, int> ClauseDispo = new();
+    static readonly List<string> DispoOrder = new();
+
+    internal static void RecordClause(string kind, int n = 1)
+    {
+        if (!CollectRungStats || n <= 0) return;
+        if (!ClauseDispo.ContainsKey(kind)) { ClauseDispo[kind] = 0; DispoOrder.Add(kind); }
+        ClauseDispo[kind] += n;
+    }
+
+    /// <summary>
+    /// Contract census (--rung-stats): sizes of what the generator actually
+    /// processed, accumulated across all files of the run. "Checked literals" is
+    /// the post-filter count (uninterpreted-function literals excluded), i.e. the
+    /// literals that relevance queries genuinely targeted; counted once per clause
+    /// (first precondition partition only).
+    /// </summary>
+    /// <summary>
+    /// --log-uncertified: emit one `[uncertified]` line per relevance-checked value
+    /// literal the ladder did not certify, tagged UNSAT / UNKNOWN / NOT-QUERIED.
+    /// Diagnostic only; does not change generation.
+    /// </summary>
+    internal static bool LogUncertified;
+
+    internal static int StatMethods, StatClauses, StatSafeLiterals, StatCheckedLiterals;
+    // Value literals the ladder CERTIFIED active (vs merely queried).
+    // Indiv = singleton witness (combined / leave-one-out / one-at-a-time /
+    // act-credit). Group = covered only by a collective or group query, which
+    // certifies the SET, not its individual members.
+    internal static int StatLitCoveredIndiv, StatLitCoveredGroup;
+    // Census of the non-safe clause literals, by the reason they are excluded from the
+    // relevance check: guards (shape/well-formedness), frame conditions `X == old(X)`,
+    // input-only conjuncts (mention no output), and pre-state-only ones (mention an
+    // output only inside old(...), so no alt output can flip them).
+    internal static int StatClauseLiterals, StatGuards, StatFrameConds, StatInputOnly, StatOldOnly;
+    // Literal CHECKS: safe literals summed over every (precondition partition, clause)
+    // the ladder actually processes — the same literal counts once per clause it
+    // appears in, and again per precondition partition. This is the denominator the
+    // ladder's query counts scale with, unlike StatSafeLiterals (corpus size).
+    internal static int StatLiteralChecks;
+
+    internal static void ReportSpecStats(TextWriter w)
+    {
+        if (!CollectRungStats || StatMethods == 0) return;
+        w.WriteLine();
+        w.WriteLine("[DafnyCBT] === Contract census ===");
+        w.WriteLine($"  {"method contracts processed",-36}{StatMethods,6}");
+        w.WriteLine($"  {"DNF clauses (after merging)",-36}{StatClauses,6}");
+        w.WriteLine($"  {"clause literals (total)",-36}{StatClauseLiterals,6}");
+        w.WriteLine($"  {"  guards (shape/well-formedness)",-36}{StatGuards,6}");
+        w.WriteLine($"  {"  frame conditions (X == old(X))",-36}{StatFrameConds,6}");
+        w.WriteLine($"  {"  input-only (no output ref)",-36}{StatInputOnly,6}");
+        w.WriteLine($"  {"  pre-state-only (output under old)",-36}{StatOldOnly,6}");
+        w.WriteLine($"  {"  safe literals",-36}{StatSafeLiterals,6}");
+        w.WriteLine($"  {"relevance-checked literals",-36}{StatCheckedLiterals,6}");
+        w.WriteLine($"  {"  certified active (individually)",-36}{StatLitCoveredIndiv,6}");
+        w.WriteLine($"  {"  covered at group level only",-36}{StatLitCoveredGroup,6}");
+        w.WriteLine($"  {"  not certified (redundant)",-36}{StatCheckedLiterals - StatLitCoveredIndiv - StatLitCoveredGroup,6}");
+        w.WriteLine($"  {"literal checks (per clause x pre-part)",-36}{StatLiteralChecks,6}");
+    }
+
+    internal static void ReportClauseDispo(TextWriter w)
+    {
+        if (!CollectRungStats || ClauseDispo.Count == 0) return;
+        w.WriteLine();
+        w.WriteLine("[DafnyCBT] === DNF clause disposition (relevance ladder) ===");
+        int tot = 0;
+        foreach (var k in DispoOrder)
+        {
+            w.WriteLine($"  {k,-36}{ClauseDispo[k],6}");
+            if (!k.StartsWith(" ")) tot += ClauseDispo[k];   // indented rows are detail breakdowns
+        }
+        w.WriteLine($"  {"TOTAL clauses",-36}{tot,6}");
+    }
+
+    internal static void ReportRungStats(TextWriter w)
+    {
+        if (!CollectRungStats || RungStats.Count == 0) return;
+        w.WriteLine();
+        w.WriteLine("[DafnyCBT] === Z3 query outcomes per rung ===");
+        w.WriteLine($"{"rung",-26}{"queries",9}{"SAT",7}{"UNSAT",7}{"UNKNOWN",9}{"TIMEOUT",9}{"other",7}");
+        int q = 0, s = 0, u = 0, k = 0, to = 0, o = 0;
+        foreach (var rung in RungOrder)
+        {
+            var t = RungStats[rung];
+            w.WriteLine($"{rung,-26}{t.Queries,9}{t.Sat,7}{t.Unsat,7}{t.Unknown,9}{t.Timeout,9}{t.Other,7}");
+            q += t.Queries; s += t.Sat; u += t.Unsat; k += t.Unknown; to += t.Timeout; o += t.Other;
+        }
+        w.WriteLine($"{"TOTAL",-26}{q,9}{s,7}{u,7}{k,9}{to,9}{o,7}");
+    }
+
+    internal static async Task<string> RunZ3(string z3Path, string smtInput, string rung = "other", int? timeoutMs = null)
     {
         var psi = new ProcessStartInfo
         {
             FileName = z3Path,
-            Arguments = $"-in -smt2 -model -t:{Z3QueryTimeoutMs}",
+            Arguments = $"-in -smt2 -model -t:{timeoutMs ?? Z3QueryTimeoutMs}",
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -45,6 +171,7 @@ static class Z3Runner
         catch (IOException)
         {
             try { process.Kill(); } catch { }
+            RecordRung(rung, "timeout");
             return "timeout";
         }
 
@@ -54,14 +181,17 @@ static class Z3Runner
         var errTask = process.StandardError.ReadToEndAsync();
         var allDone = Task.WhenAll(outputTask, errTask);
 
-        if (await Task.WhenAny(allDone, Task.Delay(Z3QueryTimeoutMs + 2000)) != allDone)
+        if (await Task.WhenAny(allDone, Task.Delay((timeoutMs ?? Z3QueryTimeoutMs) + 2000)) != allDone)
         {
             // Timeout: kill the process tree to unblock the read tasks
             try { process.Kill(entireProcessTree: true); } catch { }
+            RecordRung(rung, "timeout");
             return "timeout";
         }
 
-        return outputTask.Result + errTask.Result;
+        var z3Out = outputTask.Result + errTask.Result;
+        RecordRung(rung, z3Out);
+        return z3Out;
     }
 
     /// <summary>

@@ -2461,16 +2461,20 @@ static class TestEmitter
                         && (mutableNames == null || !mutableNames.Contains(lhsName));
                     if (lhsIsImmutableInput)
                         continue;
-                    // Comment out vacuously-true literals: they pass trivially on this
-                    // input (the post-vacuity scan tagged them in the comment block
-                    // above), so the runtime expect adds noise without checking
-                    // anything. Keep the text in commented form for transparency
-                    // (so the reader can see what would have been asserted and why
-                    // it was skipped).
+                    // Vacuous literals are ANNOTATED but still asserted. The scan tags
+                    // each literal INDIVIDUALLY (vacuous = implied by the others on
+                    // this input), and those verdicts must not be applied as a set:
+                    // for a COUPLED cluster every member is individually vacuous
+                    // because each is implied by the rest, so commenting them all out
+                    // dropped their joint content from the oracle and let sorting-style
+                    // mutants survive (e.g. SortSeq stating sortedness in an all-pairs
+                    // and an adjacent-pairs form: both tagged, both dropped, nothing
+                    // left forcing sortedness). Asserting a genuinely vacuous literal is
+                    // free: implied by its siblings, it cannot fail when they pass.
                     var litCanonical = DnfEngine.CanonicalLiteralKey(lit);
                     bool isVacuous = vacuousLiterals.Contains(litCanonical);
-                    var prefix = isVacuous ? "    // expect " : "    expect ";
-                    var suffix = isVacuous ? "; // VACUOUSLY TRUE on these inputs" : ";";
+                    var prefix = "    expect ";
+                    var suffix = isVacuous ? "; // individually vacuous on these inputs" : ";";
                     if (isSimpleEq && rhsCaptures.TryGetValue(lhsName, out var checkVar))
                         sb.AppendLine($"{prefix}{lhsName} == {checkVar}{suffix}");
                     else if (isSimpleEq && rhsInline.TryGetValue(lhsName, out var inlineRhs))

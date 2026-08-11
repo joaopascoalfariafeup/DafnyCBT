@@ -43,3 +43,15 @@ Thumbs.db
 # Shell scripts (excluded by default; allow specific ones below)
 *.sh
 !run_tests_buggy_progs_comparison.sh
+
+# LaTeX build artefacts
+*.aux
+*.bbl
+*.blg
+*.out
+*.synctex.gz
+docs/**/*.log
+chk.*
+
+# Extra published binaries (variants of publish/)
+publish_*/

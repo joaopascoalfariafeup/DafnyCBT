@@ -1004,7 +1004,7 @@ static class DnfEngine
     /// <summary>
     /// Unwrap parentheses and ConcreteSyntaxExpression wrappers.
     /// </summary>
-    static Expression Unwrap(Expression expr)
+    public static Expression Unwrap(Expression expr)
     {
         while (true)
         {

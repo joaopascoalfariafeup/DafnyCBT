@@ -5,6 +5,25 @@ namespace DafnyCBT;
 
 static class SmtTranslator
 {
+    internal static string? LastRelevanceSkipReason;
+    // --contract-shadows: contract-level exclusion for relevance shadows. When this
+    // clause's input projection overlaps a sibling clause's (detected by an
+    // existential probe in Phase 1r), each relevance shadow must additionally
+    // violate the overlapping sibling(s), so the activeness witness is excluded by
+    // the WHOLE contract (Y_k ∉ ⟦Post⟧(X)) rather than the clause alone. Set per
+    // clause by the Phase 1r loop (solving is sequential, so a static context
+    // field is safe); null/empty ⇒ no strengthening.
+    internal static bool ContractShadows = false;
+    internal static int LastCheckedLiteralCount;
+    // |T| minus the members whose negation can be encoded: value literals that
+    // take part in a group query without carrying the negation.
+    internal static int LastGroupUnencodableCount;
+
+    // Set by Program.cs when a class invariant is kept opaque: maps a `Valid()`-style
+    // call to its inlined body so the SMT still carries the invariant's content.
+    // Returns the argument unchanged for every other expression.
+    internal static Func<Expression, Expression>? InvariantExpander;
+    internal static List<List<Expression>>? ExposedSiblingClauses;
     /// <summary>
     /// Checks if a Dafny expression likely refers to a sequence/array type in the given context.
     /// Used to decide whether '+' should be translated as seq.++ instead of arithmetic addition.
@@ -151,6 +170,20 @@ static class SmtTranslator
     internal static bool ModificationRelevance { get; set; } = true;
 
     /// <summary>
+    /// Phase 1r "no-op inadmissibility" — when true, the relevance query also
+    /// prefers an initial state that VIOLATES the old-free postconditions, i.e.
+    /// substitutes post→pre into every postcondition that does not mention `old`
+    /// and soft-asserts their conjunction is false. This strengthens
+    /// ModificationRelevance: "some value changes" (check (a)) is too weak when
+    /// the spec admits multiple valid outputs (a no-op among them) — it can pick
+    /// an input whose unchanged state still satisfies the postcondition, so a
+    /// no-op mutant survives. Forcing the unchanged state to be inadmissible
+    /// guarantees a no-op mutant fails the oracle. Default ON; set false via
+    /// --no-noop-relevance to keep only check (a).
+    /// </summary>
+    internal static bool NoOpInadmissibilityRelevance { get; set; } = true;
+
+    /// <summary>
     /// Permutation-domain pin — when a `multiset(seqA) == multiset(seqB)`
     /// literal is present, the multiset equality is encoded as a bounded
     /// `_mset_count` conjunction over a fixed value universe (GetElementUniverse).
@@ -264,7 +297,16 @@ static class SmtTranslator
     // witness-free clauses the extra assertion is trivially true (no ghosts to
     // re-bind), so it's a no-op — it only bites on Skolemized existential clauses,
     // where it makes the relevance strict WITHOUT the quantifier-last carve-out.
-    internal static bool StrictRelevance = false;
+    internal static bool StrictRelevance = true;
+    // When true (with StrictRelevance), the `¬∃ ghosts` conjunct is emitted only
+    // for checked literals that actually MENTION a ghost output. For a ghost-free
+    // Qk the conjunct is entailed by what the query already asserts (¬Qk holds at
+    // the shadow regardless of the ghosts, and the clause is a conjunction
+    // containing Qk, so no ghost assignment satisfies it), hence redundant. It is
+    // not free, though: the extra quantified assertion can push Z3 to UNKNOWN,
+    // which the ladder treats as UNSAT — withdrawing a certification plain
+    // relevance would have granted. A/B flag.
+    internal static bool StrictPerLiteral = true;
     // When true, Phase 3 round-robin emits ordering-shape exclusions for prior
     // int-typed seq/array witnesses in addition to input-fingerprint exclusions,
     // and performs shape-pinned subsumption against priors of matching shape.
@@ -1757,6 +1799,19 @@ static class SmtTranslator
         }
         try
         {
+            // Class invariants are kept ATOMIC for decomposition (one literal in the
+            // clause, so they never explode S or the clause count) but must still be
+            // TRANSLATED, or the encoded postcondition loses them: the solver could
+            // return a post-state violating the invariant and, where uniqueness holds,
+            // we would emit a concrete `expect` from that model — a false kill on a
+            // correct program. Expanding here, after DNF and after S is fixed, gives
+            // both: opaque to the criterion, present in the SMT.
+            if (InvariantExpander != null)
+            {
+                var expanded = InvariantExpander(expr);
+                if (!ReferenceEquals(expanded, expr))
+                    return ExprToSmtImpl(expanded, inputs, mutableNames, isPostContext, insideOld);
+            }
             return ExprToSmtImpl(expr, inputs, mutableNames, isPostContext, insideOld);
         }
         finally
@@ -4930,6 +4985,43 @@ static class SmtTranslator
             }
         }
 
+        // (1b) No-op inadmissibility: the INITIAL state must violate the old-free
+        // postconditions. Check (a) above only forces *some* state change, which is
+        // too weak when the spec admits multiple valid outputs (a no-op among them):
+        // it can pick an input whose unchanged state still satisfies the post, so a
+        // no-op mutant survives. Substitute post→pre (insideOld: true) into every
+        // old-free post-literal and prefer an input where their conjunction is FALSE,
+        // i.e. the unchanged state is inadmissible — guaranteeing a no-op fails the
+        // oracle. Postconditions that mention `old` are skipped: at the no-op state
+        // (post = pre) they collapse to trivially true and can never exclude a no-op.
+        // Literals that don't depend on the modifies-state (pre-form == post-form)
+        // are skipped too — they belong to the value-output shadow, not here. Soft
+        // (high weight) so an unsatisfiable case degrades gracefully rather than
+        // making the whole relevance query UNSAT.
+        if (NoOpInadmissibilityRelevance && mutableNames.Count > 0)
+        {
+            var inputsAndOutputs = inputs.Concat(outputs).ToList();
+            var noopViolable = new List<string>();
+            foreach (var lit in postLiterals)
+            {
+                if (AnyDescendant(lit, e => e is OldExpr)) continue;   // old-free only
+                ResetExprToSmtBudget();
+                var atPre = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true, insideOld: true);
+                if (atPre == null) continue;
+                ResetExprToSmtBudget();
+                var atPost = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true, insideOld: false);
+                if (atPost != null && atPre == atPost) continue;      // independent of modifies-state
+                noopViolable.Add(atPre);
+            }
+            if (noopViolable.Count > 0)
+            {
+                var conj = noopViolable.Count == 1 ? noopViolable[0] : $"(and {string.Join(" ", noopViolable)})";
+                sb.AppendLine();
+                sb.AppendLine("; ─── Phase 1r: no-op inadmissibility — initial state must violate the old-free postcondition ───");
+                sb.AppendLine($"(assert-soft (not {conj}) :weight 1000)");
+            }
+        }
+
         // (2) Forall non-vacuity: every top-level forall literal in the clause
         // must have a non-empty range. Skips length-0 array witnesses where a
         // `forall i :: 0 <= i < a.Length ==> P(i)` is vacuously true.
@@ -5535,6 +5627,98 @@ static class SmtTranslator
         return result;
     }
 
+    // Appends, for each exposed sibling clause, the constraint ¬(⋀ sibling
+    // literals) over the shadow outputs (renameMap applied) — the contract-level
+    // exclusion of --contract-shadows. Sound to skip a sibling whose literals
+    // cannot all be translated: the constraint just gets weaker (clause-relative).
+    static void AppendExposedSiblingNegations(
+        System.Text.StringBuilder sb,
+        List<(string Name, string Type)> inputsAndOutputs,
+        HashSet<string> mutableNames,
+        Dictionary<string, string> renameMap,
+        string suffix)
+    {
+        if (!ContractShadows || ExposedSiblingClauses == null || ExposedSiblingClauses.Count == 0)
+            return;
+        int sIdx = 0;
+        foreach (var sibling in ExposedSiblingClauses)
+        {
+            sIdx++;
+            var parts = new List<string>();
+            bool ok = true;
+            foreach (var lit in sibling)
+            {
+                if (TypeUtils.IsSpecOnlyLiteral(DnfEngine.ExprToString(lit))) continue;
+                ResetExprToSmtBudget();
+                var s = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true);
+                if (s == null) { ok = false; break; }
+                parts.Add(ApplyOutputAltRenames(s, renameMap));
+            }
+            if (!ok || parts.Count == 0) continue;
+            var conjS = parts.Count == 1 ? parts[0] : "(and " + string.Join(" ", parts) + ")";
+            sb.AppendLine($"; ─── Contract shadow: outs_{suffix} must also violate overlapping sibling clause #{sIdx} ───");
+            sb.AppendLine($"(assert (not {conjS}))");
+        }
+    }
+
+    /// <summary>
+    /// Overlap probe for --contract-shadows: SAT iff some precondition-admissible
+    /// input admits outputs under BOTH clauses — ∃X,Y,Y_ovl. A(X,Y) ∧ B(X,Y_ovl).
+    /// Purely existential (no ∀ direction), unlike the projection-EQUIVALENCE probe
+    /// used for clause merging. Returns null when the query cannot be built
+    /// (caller treats that as overlapping, conservatively).
+    /// </summary>
+    internal static string? BuildProjectionOverlapQuery(
+        List<(string Name, string Type)> inputs,
+        List<(string Name, string Type)> outputs,
+        List<Expression> preLiterals,
+        List<Expression> clauseA,
+        List<Expression> clauseB,
+        Method method,
+        HashSet<string> mutableNames)
+    {
+        var baseSmt = BuildSmt2Query(
+            inputs, outputs, preLiterals, clauseA, method,
+            verbose: false, exclusions: null, extraConstraints: null,
+            preLiterals: preLiterals, mutableNames: mutableNames, skipBias: true);
+        var checkIdx = baseSmt.LastIndexOf("(check-sat)");
+        if (checkIdx < 0) return null;
+        var sb = new System.Text.StringBuilder(baseSmt.Substring(0, checkIdx));
+        var inputsAndOutputs = inputs.Concat(outputs).ToList();
+        const string suffix = "ovl";
+        sb.AppendLine();
+        sb.AppendLine("; ─── Overlap probe: sibling clause asserted on a second output copy ───");
+        if (!EmitOutputAltDeclarations(sb, inputs, outputs, mutableNames, suffix)) return null;
+        var renameMap = BuildOutputAltRenameMap(inputs, outputs, mutableNames, suffix);
+        if (renameMap.Count == 0) return null;
+        foreach (var lit in clauseB)
+        {
+            if (TypeUtils.IsSpecOnlyLiteral(DnfEngine.ExprToString(lit))) continue;
+            ResetExprToSmtBudget();
+            var s = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true);
+            if (s == null) return null;
+            sb.AppendLine($"(assert {ApplyOutputAltRenames(s, renameMap)})");
+        }
+        sb.AppendLine();
+        sb.AppendLine("(check-sat)");
+        return RewriteNestedSeqRefs(sb.ToString(), inputs, outputs);
+    }
+
+    /// <summary>
+    /// True when the literal references a ghost (Skolemised-witness) output by
+    /// name. Whole-identifier match on the source rendering, so `i` does not
+    /// match `hi` or `minIndex`.
+    /// </summary>
+    internal static bool LiteralMentionsGhost(Expression lit)
+    {
+        if (GhostOutputNames.Count == 0) return false;
+        var s = DnfEngine.ExprToString(lit);
+        foreach (var g in GhostOutputNames)
+            if (Regex.IsMatch(s, $@"(?<![A-Za-z0-9_]){Regex.Escape(g)}(?![A-Za-z0-9_])"))
+                return true;
+        return false;
+    }
+
     internal static string? BuildRelevanceQuery(
         List<(string Name, string Type)> inputs,
         List<(string Name, string Type)> outputs,
@@ -5547,7 +5731,7 @@ static class SmtTranslator
         bool assertExistsStripped = false)
     {
         mutableNames ??= new HashSet<string>();
-        if (postLiterals.Count == 0) return null;
+        if (postLiterals.Count == 0) { LastRelevanceSkipReason = "no-post-literals"; return null; };
 
         // Default: negate only the last literal (backwards-compat).
         var indices = safeIndices != null && safeIndices.Count > 0
@@ -5571,7 +5755,7 @@ static class SmtTranslator
             skipBias: false);
 
         var checkIdx = baseSmt.LastIndexOf("(check-sat)");
-        if (checkIdx < 0) return null;
+        if (checkIdx < 0) { LastRelevanceSkipReason = "no-check-index"; return null; };
 
         // Drop any safe index whose literal references a residual uninterpreted
         // user-defined function (recursive call not fully inlined). Z3 can assign
@@ -5597,12 +5781,13 @@ static class SmtTranslator
                 }
                 if (!hasUninterp) filtered.Add(idx);
             }
-            if (filtered.Count == 0) return null;
+            if (filtered.Count == 0) { LastRelevanceSkipReason = "uninterpreted-fn (recursive/non-inlined)"; return null; };
             indices = filtered;
         }
 
         var sb = new System.Text.StringBuilder(baseSmt.Substring(0, checkIdx));
         var inputsAndOutputs = inputs.Concat(outputs).ToList();
+        LastCheckedLiteralCount = indices.Count;
 
         // Emit one shadow output block per safe index; each block negates exactly
         // one literal (Qidx) while keeping the others intact.
@@ -5612,10 +5797,10 @@ static class SmtTranslator
             sb.AppendLine();
             sb.AppendLine($"; ─── Relevance: shadow output for Q{idx + 1} (outs_{suffix}) ───");
             if (!EmitOutputAltDeclarations(sb, inputs, outputs, mutableNames, suffix))
-                return null;
+                { LastRelevanceSkipReason = "shadow-output decl unsupported (type)"; return null; };
 
             var renameMap = BuildOutputAltRenameMap(inputs, outputs, mutableNames, suffix);
-            if (renameMap.Count == 0) return null;
+            if (renameMap.Count == 0) { LastRelevanceSkipReason = "empty-rename-map"; return null; };
 
             sb.AppendLine();
             sb.AppendLine($"; ─── Relevance: shadow assertions for Q{idx + 1} (clause minus Q{idx + 1} + ¬Q{idx + 1}) ───");
@@ -5626,11 +5811,16 @@ static class SmtTranslator
                 if (TypeUtils.IsSpecOnlyLiteral(litStr)) continue;
                 ResetExprToSmtBudget();
                 var smtExpr = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true);
-                if (smtExpr == null) return null;
+                if (smtExpr == null) { LastRelevanceSkipReason = "literal untranslatable to SMT"; return null; };
                 smtExpr = ApplyOutputAltRenames(smtExpr, renameMap);
                 if (j == idx) smtExpr = $"(not {smtExpr})";
                 sb.AppendLine($"(assert {smtExpr})");
             }
+
+            // Contract-level exclusion (--contract-shadows): the shadow must also
+            // escape every overlapping sibling clause, so the witness output is
+            // excluded by the WHOLE contract, not just this clause.
+            AppendExposedSiblingNegations(sb, inputsAndOutputs, mutableNames, renameMap, suffix);
 
             // Strengthen: when the negated literal is `exists vars :: c1 ∧ … ∧ cn`
             // with cn itself a quantifier, additionally assert the stripped form
@@ -5653,7 +5843,7 @@ static class SmtTranslator
             sb.AppendLine();
             sb.AppendLine($"; ─── Relevance: outs ≠ outs_{suffix} ───");
             var ineq = BuildOutputInequalityClause(inputs, outputs, mutableNames, suffix);
-            if (ineq == null) return null;
+            if (ineq == null) { LastRelevanceSkipReason = "no output-inequality"; return null; };
             sb.AppendLine(ineq);
 
             // Strict relevance: assert the alt output is UNACHIEVABLE by the full
@@ -5664,7 +5854,9 @@ static class SmtTranslator
             // existential clauses this is the genuine set-difference relevance; on
             // witness-free clauses there are no ghosts to bind, so it reduces to a
             // no-op (the full clause is already false at the alt under ¬Qidx).
-            if (StrictRelevance && GhostOutputNames.Count > 0)
+            if (StrictRelevance && GhostOutputNames.Count > 0
+                && (!StrictPerLiteral || idx >= postLiterals.Count
+                    || LiteralMentionsGhost(postLiterals[idx])))
             {
                 // Rename map for the alt observable, excluding ghost names (kept bare
                 // and re-existentialized below).
@@ -5733,7 +5925,7 @@ static class SmtTranslator
         bool assertExistsStripped = false)
     {
         mutableNames ??= new HashSet<string>();
-        if (postLiterals.Count == 0) return null;
+        if (postLiterals.Count == 0) { LastRelevanceSkipReason = "no-post-literals"; return null; };
 
         var indices = safeIndices != null && safeIndices.Count > 0
             ? safeIndices
@@ -5749,7 +5941,7 @@ static class SmtTranslator
             skipBias: false);
 
         var checkIdx = baseSmt.LastIndexOf("(check-sat)");
-        if (checkIdx < 0) return null;
+        if (checkIdx < 0) { LastRelevanceSkipReason = "no-check-index"; return null; };
 
         // Drop safe indices whose literal references uninterpreted user-defined
         // functions (same rationale as BuildRelevanceQuery).
@@ -5759,6 +5951,15 @@ static class SmtTranslator
             if (!string.IsNullOrWhiteSpace(dm.Groups[2].Value))
                 uninterpFns.Add(dm.Groups[1].Value);
         }
+        // Membership in T is decided by "is it a value literal of the residue",
+        // NOT by "can we encode its negation" — Eq. (4) holds only the literals
+        // OUTSIDE T, so demoting an unencodable member out of T would make it a
+        // held sibling and pin the shadow to the real output, killing the query
+        // (SumIntsLoop: `s == sumInts(n-1)+n` pinned s_altG = s, so ¬Q3 was UNSAT).
+        // Encodability decides only which members CARRY the negation: negating a
+        // strict subset T' ⊆ T is sound, since ¬⋀T' ⇒ ¬⋀T. Unencodable members are
+        // therefore simply absent from the query — neither held nor negated.
+        var negatable = indices;
         if (uninterpFns.Count > 0)
         {
             var filtered = new List<int>();
@@ -5773,22 +5974,26 @@ static class SmtTranslator
                 }
                 if (!hasUninterp) filtered.Add(idx);
             }
-            if (filtered.Count == 0) return null;
-            indices = filtered;
+            // Nothing left to negate: the query cannot be expressed at all.
+            if (filtered.Count == 0) { LastRelevanceSkipReason = "uninterpreted-fn (recursive/non-inlined)"; return null; };
+            negatable = filtered;
         }
 
         var sb = new System.Text.StringBuilder(baseSmt.Substring(0, checkIdx));
         var inputsAndOutputs = inputs.Concat(outputs).ToList();
-        var safeSet = new HashSet<int>(indices);
+        var tSet = new HashSet<int>(indices);        // T — not held on the shadow
+        var safeSet = new HashSet<int>(negatable);   // the members carrying ¬
+        LastGroupUnencodableCount = indices.Count - negatable.Count;
+        LastCheckedLiteralCount = indices.Count;     // all of T participates
 
         const string suffix = "altG";
         sb.AppendLine();
         sb.AppendLine($"; ─── Grouped Relevance: shadow output (outs_{suffix}) ───");
         if (!EmitOutputAltDeclarations(sb, inputs, outputs, mutableNames, suffix))
-            return null;
+            { LastRelevanceSkipReason = "shadow-output decl unsupported (type)"; return null; };
 
         var renameMap = BuildOutputAltRenameMap(inputs, outputs, mutableNames, suffix);
-        if (renameMap.Count == 0) return null;
+        if (renameMap.Count == 0) { LastRelevanceSkipReason = "empty-rename-map"; return null; };
 
         sb.AppendLine();
         sb.AppendLine($"; ─── Grouped Relevance: non-safe literals held; ¬(⋀ safe Q_k) ───");
@@ -5801,19 +6006,24 @@ static class SmtTranslator
             if (TypeUtils.IsSpecOnlyLiteral(litStr)) continue;
             ResetExprToSmtBudget();
             var smtExpr = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true);
-            if (smtExpr == null) return null;
+            if (smtExpr == null) { LastRelevanceSkipReason = "literal untranslatable to SMT"; return null; };
             smtExpr = ApplyOutputAltRenames(smtExpr, renameMap);
             if (safeSet.Contains(j))
-                safeSmtParts.Add(smtExpr);
+                safeSmtParts.Add(smtExpr);          // member of T that carries ¬
+            else if (tSet.Contains(j))
+                continue;                            // member of T, unencodable: omit entirely
             else
-                sb.AppendLine($"(assert {smtExpr})");
+                sb.AppendLine($"(assert {smtExpr})"); // outside T: held on the shadow
         }
 
-        if (safeSmtParts.Count == 0) return null;
+        if (safeSmtParts.Count == 0) { LastRelevanceSkipReason = "no-safe-smt-parts"; return null; };
         var conj = safeSmtParts.Count == 1
             ? safeSmtParts[0]
             : $"(and {string.Join(" ", safeSmtParts)})";
         sb.AppendLine($"(assert (not {conj}))");
+
+        // Contract-level exclusion (--contract-shadows), as in BuildRelevanceQuery.
+        AppendExposedSiblingNegations(sb, inputsAndOutputs, mutableNames, renameMap, suffix);
 
         // Strengthen: for any safe-index literal that is `exists vars :: c1 ∧ … ∧ cn`
         // with cn a quantifier, also assert the stripped existential. Same intent as
@@ -5835,7 +6045,7 @@ static class SmtTranslator
         sb.AppendLine();
         sb.AppendLine($"; ─── Grouped Relevance: outs ≠ outs_{suffix} ───");
         var ineq = BuildOutputInequalityClause(inputs, outputs, mutableNames, suffix);
-        if (ineq == null) return null;
+        if (ineq == null) { LastRelevanceSkipReason = "no output-inequality"; return null; };
         sb.AppendLine(ineq);
 
         EmitBehaviouralRelevanceConstraints(sb, inputs, outputs, postLiterals, mutableNames);
@@ -6447,10 +6657,29 @@ static class SmtTranslator
         int literalIndex,
         Method method,
         HashSet<string>? mutableNames = null)
+        => BuildVacuityPinnedQuery(inputs, outputs, preLiterals, postLiterals,
+            pinnedInputValues, new List<int> { literalIndex }, method, mutableNames);
+
+    /// <summary>
+    /// Group form: SAT iff the GROUP `groupIndices` is jointly active at the pinned
+    /// input (Def. 4.2) -- some shadow satisfies every literal outside the group yet
+    /// violates their conjunction. A singleton group is the per-literal check above.
+    /// </summary>
+    internal static string? BuildVacuityPinnedQuery(
+        List<(string Name, string Type)> inputs,
+        List<(string Name, string Type)> outputs,
+        List<Expression> preLiterals,
+        List<Expression> postLiterals,
+        Dictionary<string, string> pinnedInputValues,
+        List<int> groupIndices,
+        Method method,
+        HashSet<string>? mutableNames = null)
     {
         mutableNames ??= new HashSet<string>();
         if (postLiterals.Count == 0) return null;
-        if (literalIndex < 0 || literalIndex >= postLiterals.Count) return null;
+        if (groupIndices == null || groupIndices.Count == 0) return null;
+        if (groupIndices.Any(i => i < 0 || i >= postLiterals.Count)) return null;
+        int literalIndex = groupIndices[0];
 
         // Keep bias ON so the outs_alt search (Phase B) is consistent with Phase A
         // and with the main test generation pipeline. Vacuity tests were previously
@@ -6477,11 +6706,14 @@ static class SmtTranslator
         }
         if (uninterpFns.Count > 0)
         {
-            var litDafny = DnfEngine.ExprToString(postLiterals[literalIndex]);
-            foreach (var fn in uninterpFns)
+            foreach (var gi in groupIndices)
             {
-                if (Regex.IsMatch(litDafny, @"\b" + Regex.Escape(fn) + @"\s*(<[^>]*>)?\s*\("))
-                    return null;
+                var litDafny = DnfEngine.ExprToString(postLiterals[gi]);
+                foreach (var fn in uninterpFns)
+                {
+                    if (Regex.IsMatch(litDafny, @"\b" + Regex.Escape(fn) + @"\s*(<[^>]*>)?\s*\("))
+                        return null;
+                }
             }
         }
 
@@ -6552,7 +6784,7 @@ static class SmtTranslator
         }
 
         // Single shadow output block: outs_alt violating only Q_k.
-        var suffix = $"vac{literalIndex}";
+        var suffix = $"vac{string.Join("_", groupIndices)}";
         sb.AppendLine();
         sb.AppendLine($"; ─── Vacuity: shadow output for Q{literalIndex + 1} (outs_{suffix}) ───");
         if (!EmitOutputAltDeclarations(sb, inputs, outputs, mutableNames, suffix))
@@ -6563,6 +6795,7 @@ static class SmtTranslator
 
         sb.AppendLine();
         sb.AppendLine($"; ─── Vacuity: shadow assertions (clause minus Q{literalIndex + 1} + ¬Q{literalIndex + 1}) ───");
+        var groupExprs = new List<string>();
         for (int j = 0; j < postLiterals.Count; j++)
         {
             var lit = postLiterals[j];
@@ -6572,9 +6805,13 @@ static class SmtTranslator
             var smtExpr = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true);
             if (smtExpr == null) return null;
             smtExpr = ApplyOutputAltRenames(smtExpr, renameMap);
-            if (j == literalIndex) smtExpr = $"(not {smtExpr})";
-            sb.AppendLine($"(assert {smtExpr})");
+            if (groupIndices.Contains(j)) groupExprs.Add(smtExpr);
+            else sb.AppendLine($"(assert {smtExpr})");
         }
+        if (groupExprs.Count == 0) return null;
+        sb.AppendLine(groupExprs.Count == 1
+            ? $"(assert (not {groupExprs[0]}))"
+            : $"(assert (not (and {string.Join(" ", groupExprs)})))");
 
         sb.AppendLine();
         sb.AppendLine("(check-sat)");

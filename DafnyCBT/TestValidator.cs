@@ -330,10 +330,15 @@ static class TestValidator
                 // analysis (mutation kill curves etc.) can attribute each test to
                 // its originating method without re-parsing the Tests.dfy output.
                 var methodTag = $" [{src}]";
+                // Surface the generating tier/phase/relevance-rung label (already in the
+                // test comment, e.g. {1}/Rel, {1}/RelLO2, {1}/RelQ3, {1}/Vi3, {1}/BL:..,
+                // {1}/O|a|=2) AFTER the PASS/FAIL token so kill@k plotters are unaffected.
+                var lm = Regex.Match(comment, @"// Test case for combination (.+?):");
+                var tierTag = lm.Success ? $" [{lm.Groups[1].Value}]" : "";
                 if (skippedIds.Contains(i))
                 {
                     skippedCount++;
-                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: SKIP (precondition violated)");
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: SKIP (precondition violated){tierTag}");
                 }
                 else if (exceptionIds.Contains(i))
                 {
@@ -348,7 +353,7 @@ static class TestValidator
                         failing: true);
                     classified.Add((comment, annotatedBody, src, TestStatus.CrashSkipped));
                     skippedExceptionCount++;
-                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: SKIP (exception from implementation)");
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: SKIP (exception from implementation){tierTag}");
                 }
                 else if (failedIds.Contains(i))
                 {
@@ -364,7 +369,7 @@ static class TestValidator
                         failing: true);
                     classified.Add((comment, annotatedBody, src, TestStatus.Failing));
                     failingCount++;
-                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: FAIL");
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: FAIL{tierTag}");
                 }
                 else if (wrongValIds.Contains(i))
                 {
@@ -372,7 +377,7 @@ static class TestValidator
                     injected = InjectRuntimeInfo(injected, capturedOuts.GetValueOrDefault(i), null, failing: false);
                     classified.Add((comment, injected, src, TestStatus.Passing));
                     passingCount++;
-                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: PASS (rescued — Z3 value corrected by runtime)");
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: PASS (rescued — Z3 value corrected by runtime){tierTag}");
                 }
                 else
                 {
@@ -380,7 +385,7 @@ static class TestValidator
                     injected = InjectRuntimeInfo(injected, capturedOuts.GetValueOrDefault(i), null, failing: false);
                     classified.Add((comment, injected, src, TestStatus.Passing));
                     passingCount++;
-                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: PASS");
+                    Console.WriteLine($"  Test {i + 1}/{testBlocks.Count}{methodTag}: PASS{tierTag}");
                 }
             }
 
