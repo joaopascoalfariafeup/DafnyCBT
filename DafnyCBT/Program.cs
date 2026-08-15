@@ -48,6 +48,7 @@ class Program
     // Credit only literals belonging to a MINIMAL jointly-active group at the
     // witnessing input (Def. 4.3), rather than every member of the residue.
     static bool MinimiseGroups = true;
+    static bool FullCoupledGroup = false;
     // Prototype (--test-entry-only): restrict auto-discovery to methods annotated
     // `{:testEntry}`, mirroring Dafny's built-in generate-tests. For experiments
     // comparing against DTest on the same entry points. Default OFF (test all
@@ -290,6 +291,7 @@ class Program
         var noDeadClausePruningOpt = new Option<bool>("--no-dead-clause-pruning", () => false, "Disable dead-clause pruning. By default, once a DNF clause's plain (no-tier) combination is definitively Z3-UNSAT, all of that clause's boundary/categorical tier sub-combinations are skipped across the Phase 1/2/2b passes (a tier only ADDS constraints to an already-UNSAT formula → provably UNSAT; never prunes a SAT tier, so no test/kill is lost). Targets dead clauses like an inlined recursive base-case branch `k==i+1` made unreachable by the spec's own `k<=i` bound (~25-34 wasted Z3 solves on SeqMaxSum; ~⅓ faster). Monotone, not output-neutral: the freed solve budget lets the budget-bounded Phase 3 round-robin reach extra repeats within the same -n/timeout (tests ≥, never fewer). This flag forces every tier to be solved individually (slower; A/B / safety valve).");
         var capSmallSizeRepeatsOpt = new Option<bool>("--cap-small-size-repeats", () => false, "[spike] In Phase 3 round-robin, cap repeats of the degenerate-value tiers: 0 repeats for `|x|=1` (singleton) and boundary `=0` tiers, ≤1 repeat for `|x|=2` and boundary `=1`. Repeated tiny/extremal-constant inputs rarely expose new behaviour (sort/swap/interior bugs need ≥3 elements or a non-boundary index); the freed budget is reallocated by the round-robin to larger / more diverse bases. Default off.");
         var noBoundedFoldOpt = new Option<bool>("--no-bounded-fold", () => false, "Disable bounded-fold. By default ON: recursive additive prefix-sum folds (f(s,n) = sum of first n elements) are recognised at the AST level and emitted as a bounded closed form Σ_{i<MAX_SEQ_LEN} ite(i<n, s[i], 0) instead of an uninterpreted residual. Gives Z3 a real objective for `exists n :: … f(s,n) …` specs (the Sum2/min/prime/Inorder/BelowZero recursive-fold cluster) so the discriminating input is found deterministically. This flag disables the AST-level fold detection (the residual then stays uninterpreted, recovering pre-spike behaviour for A/B measurement).");
+        var noBiasPhase2Opt = new Option<bool>("--no-bias-phase2", "Keep the anti-trivial bias in Phase 1 but drop it from the amplification tiers (Phase 2 onwards), whose boundary and size goals target the degenerate values the bias avoids. Diagnostic/experimental; default OFF.");
         var minSeqLenOpt = new Option<int>("--min-seq-len", () => 0, "When > 0, add `(assert-soft (>= (seq.len s) N) :weight 1)` for each seq/array input — biases Z3 toward larger collections. Useful on fold-heavy corpora (verifixer_mutants) whose killing witnesses are inherently multi-element. Soft, weight 1: loses to hard spec constraints and to the upper cap, so specs that pin `|s|=1` still get `|s|=1`. Default 0 (no extra bias — current behaviour).");
         var noShapeExclusionOpt = new Option<bool>("--no-shape-exclusion", () => false, "Disable ordering-shape exclusion. By default ON: Phase 3 round-robin repeats exclude prior ordering shapes for int-typed seq/array inputs (not just prior values). Shape = the rank-vector equivalence class under monotonic value remap (e.g. `[1,2,1,2]`, `[10,20,10,20]` share shape `[0,1,0,1]`; `[1,1,2,2]` has shape `[0,0,1,1]`). Encoded as n disjuncts using the prior's sort permutation σ. Combined with shape-pinned subsumption: if any prior test of the same shape already satisfies the candidate's tier objective under value pin, the candidate is skipped (catches cross-base redundancy without the over-restriction of pure shape-hash dedup). Forces structurally distinct inputs (different sort orders / equality patterns / lengths) rather than just different element values at the same shape. This flag disables the whole shape mechanism (per-base seeding + shape-pinned subsumption probe).");
         var noSkolemizeOpt = new Option<bool>("--no-skolemize-exists", () => false, "Disable Skolemization of positive top-level existential postconditions. By default ON: `ensures exists vars :: body` lifts `vars` to GHOST outputs and replaces the literal with `body`, so the inner conjuncts/disjuncts become first-class DNF literals handled by the normal relevance/BVA pipeline (the witness is a Skolem function of the input, solved on the generation side; ghost outputs are excluded from the method call and runtime oracle, which keeps the original `exists` via the full-postcondition expect). Unifies exists::AND and exists::OR into ordinary DNF. This flag restores the legacy atomic-exists handling for A/B measurement.");
@@ -309,8 +311,9 @@ class Program
         noBiasOpt.AddAlias("-nb");
         var noRelevanceOpt = new Option<bool>("--no-relevance", "Disable per-literal relevance check (Phase 1r). Default: relevance ON.");
         noRelevanceOpt.AddAlias("-nr");
+        var fullCoupledOpt = new Option<bool>("--full-coupled", "Run the collective rung over ALL value literals rather than the uncertified residue, and credit the result only if it certifies a literal not already covered. Reaches minimal jointly-active groups that include an already-certified literal, which the residue-only query cannot express. Experimental; default OFF.");
         var noMinimiseGroupsOpt = new Option<bool>("--no-minimise-groups", "Credit EVERY member of a jointly-active residue at group level, instead of only those belonging to a minimal jointly-active group at the witnessing input (Def. 4.3). The collective rung proves the residue prunes jointly, not that it is minimal, so the default (minimisation ON) is what the criterion asks for; this flag restores the over-reporting behaviour for A/B. Minimality is decided exactly for residues of up to 4 literals and greedily above that. Does not change which tests are emitted - only which literals are certified.");
-        var logUncertifiedOpt = new Option<bool>("--log-uncertified", "Emit one line per relevance-checked value literal the ladder did not certify, tagged UNSAT (an individual query proved it redundant over the encoded contract), UNKNOWN (the solver gave no verdict and Alg. 1 read it as UNSAT), or NOT-QUERIED (no individual query targeted it). Diagnostic only; generation is unchanged. Use with --rung-stats to reconcile against the contract census. Default: OFF.");
+        var logUncertifiedOpt = new Option<bool>("--log-uncertified", "Emit one line per relevance-checked value literal the ladder did not certify, tagged UNSAT (an individual query proved it NOT INDEPENDENT over the encoded contract -- it is then either redundant or coupled, which this tag does not separate), UNKNOWN (the solver gave no verdict and Alg. 1 read it as UNSAT), or NOT-QUERIED (no individual query targeted it). Diagnostic only; generation is unchanged. Use with --rung-stats to reconcile against the contract census. Default: OFF.");
         var rungStatsOpt = new Option<bool>("--rung-stats", "Report per-rung Z3 query outcome counts (queries / SAT / UNSAT / UNKNOWN) at the end of the run. Rungs: combined, leave-one-out, one-at-a-time, group, plus uniqueness and base/schedule queries. Default: OFF.");
         var vacuityOpt = new Option<bool>("--vacuity", "Enable per-literal vacuity check (Phase 1v). For each safe candidate Q_k, try isolated mode first (find ins where Q_k is vacuous AND every other Q_j is non-vacuous → /Vik label) and fall back to non-isolated (Q_k vacuous but other Q_j may also be → /Vk label) when isolated is infeasible. Note: independently of this flag, every emitted test gets per-Q vacuity annotations (// individually vacuous on these inputs) via a post-phase scan. The annotation is informational only - the expect is still asserted, since the per-literal verdicts must not be applied as a set (every member of a COUPLED cluster is individually vacuous, so dropping them all would remove their joint content from the oracle). Default: OFF.");
         vacuityOpt.AddAlias("-v1v");
@@ -382,7 +385,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noNoopRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noShapeExclusionOpt, noSubsumedBasesOpt, strictRelevanceOpt, strictPerLiteralOpt, noStrictRelevanceOpt, noStrictPerLiteralOpt, noDeprioOpaqueOpt, noSkolemizeOpt, skolemizeCarveOutOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noInvariantOpaqueOpt, noDeadClausePruningOpt, vacuityOpt, rungStatsOpt, logUncertifiedOpt, noMinimiseGroupsOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, relevanceLooOpt, looPartialEmitOpt, noLooPartialEmitOpt, actCreditOpt, noActCreditOpt, coupledResidualOpt, noCoupledResidualOpt, contractShadowsOpt, distributeForallOpt, testEntryOnlyOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noNoopRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noBiasPhase2Opt, noShapeExclusionOpt, noSubsumedBasesOpt, strictRelevanceOpt, strictPerLiteralOpt, noStrictRelevanceOpt, noStrictPerLiteralOpt, noDeprioOpaqueOpt, noSkolemizeOpt, skolemizeCarveOutOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noInvariantOpaqueOpt, noDeadClausePruningOpt, vacuityOpt, rungStatsOpt, logUncertifiedOpt, noMinimiseGroupsOpt, fullCoupledOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, relevanceLooOpt, looPartialEmitOpt, noLooPartialEmitOpt, actCreditOpt, noActCreditOpt, coupledResidualOpt, noCoupledResidualOpt, contractShadowsOpt, distributeForallOpt, testEntryOnlyOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -434,6 +437,9 @@ class Program
                 Console.WriteLine("[DafnyCBT] Smoke tests: ON (also testing methods with `requires` only)");
             var antiTrivialBias = !ctx.ParseResult.GetValueForOption(noBiasOpt);
             SmtTranslator.AntiTrivialBiasEnabled = antiTrivialBias;
+            SmtTranslator.BiasInAmplification = !ctx.ParseResult.GetValueForOption(noBiasPhase2Opt);
+            if (!SmtTranslator.BiasInAmplification)
+                Console.WriteLine("[DafnyCBT] Anti-trivial bias: Phase 1 only (amplification tiers unbiased)");
             if (!antiTrivialBias)
                 Console.WriteLine("[DafnyCBT] Anti-trivial bias: OFF");
             var relevanceEnabled = !ctx.ParseResult.GetValueForOption(noRelevanceOpt);
@@ -446,6 +452,7 @@ class Program
             Z3Runner.CollectRungStats = ctx.ParseResult.GetValueForOption(rungStatsOpt);
             Z3Runner.LogUncertified = ctx.ParseResult.GetValueForOption(logUncertifiedOpt);
             MinimiseGroups = !ctx.ParseResult.GetValueForOption(noMinimiseGroupsOpt);
+            FullCoupledGroup = ctx.ParseResult.GetValueForOption(fullCoupledOpt);
             EstablishCheckEnabled = !ctx.ParseResult.GetValueForOption(noEstablishOpt);
             if (!EstablishCheckEnabled)
                 Console.WriteLine("[DafnyCBT] Establish check (Phase 1e): OFF");
@@ -1711,10 +1718,24 @@ class Program
         {
             var reqText = string.Join(" ", method.Req.Select(r => DnfEngine.ExprToString(r.E)));
             var ensText = string.Join(" ", method.Ens.Select(e => DnfEngine.ExprToString(e.E)));
-            foreach (var p in inlinablePredicates)
+            // Only a genuine class invariant is kept opaque: `Valid()` -- the Dafny
+            // convention, and what {:autocontracts} injects. The former proxy, "called
+            // in BOTH requires and ensures", also matches ordinary helper predicates
+            // (twoSum's summingPair, task_id_784's IsEven/IsOdd, and inside a class
+            // anything like Sorted(a)). Making such a predicate opaque in the ENSURES
+            // stops it constraining the output: for twoSum that let the solver pick
+            // nums=[-10], which the method's own precondition rejects, yielding tests
+            // whose oracles fail on correct code. The errors are asymmetric -- a missed
+            // invariant only costs extra clause decomposition, a mistaken one costs
+            // wrong tests -- so require the name, not the usage shape.
+            if (classInfo != null)
             {
-                var pat = new Regex(@"\b" + Regex.Escape(p.name) + @"\s*\(");
-                if (pat.IsMatch(reqText) && pat.IsMatch(ensText)) invariantPreds.Add(p.name);
+                foreach (var p in inlinablePredicates)
+                {
+                    if (p.name != "Valid") continue;
+                    var pat = new Regex(@"\b" + Regex.Escape(p.name) + @"\s*\(");
+                    if (pat.IsMatch(reqText) || pat.IsMatch(ensText)) invariantPreds.Add(p.name);
+                }
             }
             if (classInfo is { IsAutoContracts: true }) invariantPreds.Add("Valid");
             if (invariantPreds.Count > 0 && Z3Runner.CollectRungStats)
@@ -4416,6 +4437,10 @@ class Program
             // --- Phase 1: solve all FDNF entries ---
             // With FDNF, each clause is a complete conjunction (including negated literals),
             // so we solve them all directly — no tier escalation needed.
+            // Reset at the START of Phase 1: the flag is static and persists across
+            // methods, so clearing it only at the end of Phase 1 leaves it set from
+            // the previous method's Phase 2, unbiasing this method's Phase 1.
+            SmtTranslator.InAmplificationPhase = false;
             Console.WriteLine($"  Phase 1: {n} {(usedFdnf ? "FDNF" : "DNF")} clauses");
             Z3Runner.StatMethods++;
             Z3Runner.StatClauses += dnfExprs.Count;
@@ -4441,9 +4466,13 @@ class Program
             // --log-uncertified: per-clause record of what the ladder did with each safe
             // literal, so the census's "not certified" bucket can be attributed. A literal
             // lands there for three quite different reasons, which the counters conflate:
-            // an individual query returned UNSAT (redundant over the ENCODED contract), a
-            // query returned UNKNOWN and was read as UNSAT (Alg. 1), or no individual query
-            // ever targeted it (the ladder stopped early, or only ran coarser rungs).
+            // an individual query returned UNSAT, a query returned UNKNOWN and was read as
+            // UNSAT (Alg. 1), or no individual query ever targeted it (the ladder stopped
+            // early, or only ran coarser rungs).
+            // UNSAT is NOT a proof of redundancy: it says the literal is not INDEPENDENT
+            // over the encoded contract, which a redundant literal shares with a coupled
+            // one the single collective query (issued over the residue S\V only) did not
+            // pair with its partner. Separating the two would need the group search.
             var uncertRecords = new List<(int pi, int ci, string label, List<Expression> clause,
                 List<int> safe, HashSet<int> indiv, HashSet<int> group,
                 HashSet<int> unsatIdx, HashSet<int> unknownIdx, List<string> trace)>();
@@ -4610,8 +4639,23 @@ class Program
                         clauseCheckedCount[(pi, ci)] = SmtTranslator.LastCheckedLiteralCount;
                         if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel} (mode={mode}+strip, safe: [{string.Join(",", safeIndices.Select(i => i + 1))}])...");
                         var z3Result = await Z3Runner.RunZ3(z3Path, smt, rung: "combined");
-                        uncertTrace.Add("C=" + (z3Result.Contains("\nsat") || z3Result.StartsWith("sat") ? "sat"
-                            : z3Result.Contains("unsat") ? "unsat" : "unknown"));
+                        var combinedVerdict = z3Result.Contains("\nsat") || z3Result.StartsWith("sat") ? "sat"
+                            : z3Result.Contains("unsat") ? "unsat" : "unknown";
+                        uncertTrace.Add("C=" + combinedVerdict);
+                        // --log-uncertified bookkeeping only. The per-literal sweep is the
+                        // usual source of these verdicts, but it does not always run: a
+                        // single-literal clause skips it (the combined query already IS that
+                        // literal's individual query), and it is only entered after a
+                        // definitive combined UNSAT. Attribute the combined verdict in those
+                        // two cases so the tag reports why a literal is uncertified rather
+                        // than merely that the sweep did not reach it.
+                        if (Z3Runner.LogUncertified && pi == 0)
+                        {
+                            if (combinedVerdict == "unsat" && safeIndices.Count == 1)
+                                uncertUnsatIdx.Add(safeIndices[0]);
+                            else if (combinedVerdict == "unknown")
+                                foreach (var si in safeIndices) uncertUnknownIdx.Add(si);
+                        }
                         var lines = z3Result.Split('\n').Select(l => l.Trim()).ToList();
                         int lastQueriedIndex = safeIndices.Count == 1 ? safeIndices[0] : -1;
                         // Fallback 0: stripped-existential strengthening was UNSAT — retry without it.
@@ -4708,7 +4752,15 @@ class Program
                                     var cand = cur.Where(x => x != d).ToList();
                                     if (await GroupActiveOnModel(cand, vals)) cur = cand;
                                 }
-                                if (await GroupActiveOnModel(cur, vals)) keep.Add(c);
+                                // Joint activeness is upward-closed, so `cur` is minimal iff no
+                                // single removal stays active. The pass above settled that for
+                                // every d != c (an inactive verdict on a larger set carries down
+                                // to its subsets), leaving only c itself to probe: if cur\{c} is
+                                // still active, c is dispensable here and earns no credit.
+                                if (await GroupActiveOnModel(cur, vals)
+                                    && !(cur.Count > 1
+                                         && await GroupActiveOnModel(cur.Where(x => x != c).ToList(), vals)))
+                                    keep.Add(c);
                             }
                             return keep;
                         }
@@ -4945,17 +4997,39 @@ class Program
                             // back individually redundant. The all-singletons-UNSAT group fallback
                             // below won't fire (a singleton was SAT), so try those residual literals
                             // collectively here to catch a coupled subset mixed in with relevant ones.
-                            if (CoupledResidual && perLiteralSweepSatAny && redundantIndices.Count >= 2
+                            if (CoupledResidual && perLiteralSweepSatAny && (FullCoupledGroup
+                                    // Only the case the shipped rung cannot express:
+                                    // a lone uncertified literal, whose only possible
+                                    // minimal group pairs it with an already-certified
+                                    // one. Capped at |S| <= 4 so the minimality search
+                                    // stays exact and bounded (15 pinned-input checks).
+                                    ? (redundantIndices.Count == 1 && safeIndices.Count <= 4)
+                                    : redundantIndices.Count >= 2)
                                 && !TimedOut() && (maxTests <= 0 || testCases.Count < maxTests))
                             {
                                 var rcSmt = SmtTranslator.BuildGroupRelevanceQuery(
-                                    inputs, outputs, fullPreLits, clause, method, mutableNames, redundantIndices);
+                                    inputs, outputs, fullPreLits, clause, method, mutableNames, FullCoupledGroup ? safeIndices : redundantIndices);
                                 if (rcSmt != null)
                                 {
                                     if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel}/RelGC (coupled residual over [{string.Join(",", redundantIndices.Select(i => i + 1))}])...");
                                     var rcRes = await Z3Runner.RunZ3(z3Path, rcSmt, rung: "group");
                                     var rcLines = rcRes.Split('\n').Select(l => l.Trim()).ToList();
                                     var rcVals = rcLines.Any(l => l == "sat") ? TypeUtils.ParseZ3Model(rcRes, allVars) : null;
+                                    // Minimal groups at this input, over the queried set.
+                                    // With --full-coupled that set spans V, so a group
+                                    // pairing a residue literal with a certified one is
+                                    // reachable; keep the model only if it credits a
+                                    // literal that is not already covered.
+                                    var rcGroupT = FullCoupledGroup ? safeIndices : redundantIndices;
+                                    var rcCredited = (rcVals != null && rcVals.Count > 0)
+                                        ? await MinimalGroupMembers(rcGroupT, rcVals)
+                                        : new List<int>();
+                                    if (FullCoupledGroup
+                                        && !rcCredited.Any(i => !covIndiv.Contains(i) && !covGroup.Contains(i)))
+                                    {
+                                        if (verbose) Console.WriteLine($"  Relevance {clauseLabel}/RelGC: SAT but certifies nothing new — discarded");
+                                        rcVals = null;
+                                    }
                                     if (rcVals != null && rcVals.Count > 0)
                                     {
                                         var rcLabel = $"{fullPreLabel}{{{ci + 1}}}/RelGC";
@@ -4989,7 +5063,7 @@ class Program
                                             }
                                             Z3Runner.RecordClause("covered: collective");
                                             if (pi == 0) Z3Runner.StatCheckedLiterals += SmtTranslator.LastGroupUnencodableCount;
-                                            CreditGroup(await MinimalGroupMembers(redundantIndices, rcVals));
+                                            CreditGroup(rcCredited);
                                             testCases.Add((rcLabel, rcVals, clause));
                                             coveredByRelevance.Add((pi, ci));
                                             relAdded++;
@@ -5183,6 +5257,7 @@ class Program
 
             if (!verbose) Console.Write("\r                          \r"); // clear progress line
             Console.WriteLine($"  Phase 1 complete: {testCases.Count} test(s)");
+            SmtTranslator.InAmplificationPhase = false;
 
             // --- Phase 1e: establish / pre-satisfied check ---
             // For a clause whose post is a pure target-state predicate, the input may
@@ -5555,6 +5630,7 @@ class Program
                 await RunEstablishPhase(negate: false, labelSuffix: "/PreSat", phaseTag: "PreSat");
 
             HashSet<string> phase2Keys = new HashSet<string>();
+            SmtTranslator.InAmplificationPhase = true;   // Phase 2 onwards
             // --- Phase 2: single-fault refined-range BVA (per clause, per variable) ---
             async Task RunPhase2()
             {

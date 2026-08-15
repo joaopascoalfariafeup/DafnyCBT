@@ -33,6 +33,18 @@ static class SmtTranslator
         dafnyExpr = dafnyExpr.Trim();
         // a[..] is always a sequence
         if (dafnyExpr.EndsWith("[..]")) return true;
+        // Any slice a[i..j] / a[i..] / a[..j] yields a sequence, even when the base
+        // is an array. Detected by a trailing bracket group containing "..", which
+        // also excludes plain indexing a[i] and map lookup m[k] (element-valued).
+        // Without this, `a[i..] + a[..j]` translates as integer + on two sequences,
+        // Z3 rejects the sort, and the whole conjunct is silently dropped -- the
+        // wrap-around branch of a circular-buffer invariant is exactly this shape.
+        if (dafnyExpr.EndsWith("]"))
+        {
+            var open = dafnyExpr.LastIndexOf('[');
+            if (open >= 0 && dafnyExpr.Substring(open).Contains(".."))
+                return true;
+        }
         // Bare identifier that is a seq or array input
         var match = inputs.FirstOrDefault(v => v.Name == dafnyExpr);
         if (match != default && (TypeUtils.IsSeqType(match.Type) || TypeUtils.IsArrayType(match.Type)))
@@ -253,6 +265,11 @@ static class SmtTranslator
     // otherwise allows many solutions. Soft-asserts are ignored when hard constraints
     // force a specific value, so correctness is preserved. Toggled by --no-bias CLI.
     internal static bool AntiTrivialBiasEnabled = false;
+    // --no-bias-phase2: suppress the bias once generation leaves Phase 1. The
+    // boundary and size tiers deliberately target degenerate values, which the
+    // bias is designed to avoid, so the two work against each other there.
+    internal static bool BiasInAmplification = true;
+    internal static bool InAmplificationPhase = false;
     internal static int AntiTrivialBiasSeed = 0;
     // --bounded-fold spike (default OFF). When on, recursive functions
     // recognised by BoundedFold as additive prefix-sum folds are emitted as a
@@ -346,7 +363,8 @@ static class SmtTranslator
     {
         mutableNames ??= new HashSet<string>();
 
-        bool biasOn = AntiTrivialBiasEnabled && !skipBias;
+        bool biasOn = AntiTrivialBiasEnabled && !skipBias
+                      && (BiasInAmplification || !InAmplificationPhase);
         // ForcedSeed overrides per-method seeding and is emitted even when
         // bias is off — it's the reproducibility knob, independent of bias.
         int seed = ForcedSeed ?? AntiTrivialBiasSeed;
@@ -6813,6 +6831,43 @@ static class SmtTranslator
             ? $"(assert (not {groupExprs[0]}))"
             : $"(assert (not (and {string.Join(" ", groupExprs)})))");
 
+        // Strict relevance, exactly as in BuildRelevanceQuery: assert the shadow's
+        // OBSERVABLE output is unachievable by the full clause with the ghost
+        // witnesses re-existentialized. Without this the pinned probe answers the
+        // weaker question "can the witness move?" while the ladder that certified the
+        // clause answered "can the OUTPUT move?", so act(m) and the group minimisation
+        // would credit literals the rung itself would have rejected. Ghost-free
+        // clauses have no ghosts to bind, so this is a no-op there.
+        if (StrictRelevance && GhostOutputNames.Count > 0
+            && (!StrictPerLiteral
+                || groupIndices.Any(gi => gi >= postLiterals.Count
+                                          || LiteralMentionsGhost(postLiterals[gi]))))
+        {
+            var ghostExclMap = renameMap.Where(kv => !GhostOutputNames.Contains(kv.Key))
+                                        .ToDictionary(kv => kv.Key, kv => kv.Value);
+            var strictParts = new List<string>();
+            bool strictOk = true;
+            for (int j = 0; j < postLiterals.Count; j++)
+            {
+                var lit = postLiterals[j];
+                if (TypeUtils.IsSpecOnlyLiteral(DnfEngine.ExprToString(lit))) continue;
+                ResetExprToSmtBudget();
+                var s = ExprToSmt(lit, inputsAndOutputs, mutableNames, isPostContext: true);
+                if (s == null) { strictOk = false; break; }
+                strictParts.Add(ApplyOutputAltRenames(s, ghostExclMap));
+            }
+            var ghostOuts = outputs.Where(o => GhostOutputNames.Contains(o.Name)).ToList();
+            if (strictOk && strictParts.Count > 0 && ghostOuts.Count > 0)
+            {
+                var body = strictParts.Count == 1
+                    ? strictParts[0]
+                    : "(and " + string.Join(" ", strictParts) + ")";
+                var bindings = ghostOuts.Select(g => $"({g.Name} {TypeUtils.DafnyTypeToSmt(g.Type)})");
+                sb.AppendLine($"; ─── Strict: outs_{suffix} unachievable by full clause (ghosts re-∃) ───");
+                sb.AppendLine($"(assert (not (exists ({string.Join(" ", bindings)}) {body})))");
+            }
+        }
+
         sb.AppendLine();
         sb.AppendLine("(check-sat)");
 
@@ -6900,8 +6955,12 @@ static class SmtTranslator
 
         for (int i = 0; i <= expr.Length - 1; i++)
         {
-            if (expr[i] == '(') depth++;
-            else if (expr[i] == ')') depth--;
+            // Square brackets count toward depth as well: a top-level operator can
+            // never sit inside an index or slice, and a computed slice bound such as
+            // a[..size - (a.Length - start)] otherwise offers its '-' as a split
+            // point, cutting the expression into two untranslatable halves.
+            if (expr[i] == '(' || expr[i] == '[') depth++;
+            else if (expr[i] == ')' || expr[i] == ']') depth--;
             else if (depth == 0 && i + 6 <= expr.Length)
             {
                 var remaining = expr.Substring(i);

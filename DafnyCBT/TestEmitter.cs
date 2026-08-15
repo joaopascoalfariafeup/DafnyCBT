@@ -290,6 +290,72 @@ static class TestEmitter
     // identifier, `|s|`, `s.Length`). Multi-link chains and complex bounds are
     // left alone — those will still fail to compile and can be picked up by
     // --comment-uncompilable.
+    // `forall i :: (R ==> A) && (R ==> B)` -> `forall i :: R ==> (A && B)`.
+    //
+    // Distributing rule 1 (--distribute-forall, tab:quant-rules) over a conjunctive
+    // body pushes the range R inside each conjunct. Dafny's compiler infers a
+    // finite range for a bound variable only from a TOP-LEVEL antecedent, so the
+    // distributed form is specification-only even though the source clause was
+    // perfectly compilable: `if !(<spec-only>) { print ...; return; }` is then
+    // rejected with "not allowed in this context ... guarded by a specification-only
+    // expression", and the whole test file fails to resolve. Undistributing restores
+    // the compilable shape without changing meaning.
+    static string UndistributeForallAntecedent(string lit)
+    {
+        // `forall VARS :: (R ==> A) && (R ==> B) [&& (R ==> C)...]`, all conjuncts
+        // sharing one syntactically identical antecedent.
+        // The binder may carry types and attributes (`forall i: int {:trigger a[i]} ::`),
+        // both of which contain single colons, so scan non-greedily to the `::`.
+        var m = Regex.Match(lit, @"(forall\b[^\n]*?::\s*)\((?<a>[^()]+?)\s*==>\s*(?<b>[^()]+?)\)(?<rest>(?:\s*&&\s*\([^()]+?\s*==>\s*[^()]+?\))+)");
+        if (!m.Success) return lit;
+        var ante = m.Groups["a"].Value.Trim();
+        var bodies = new List<string> { m.Groups["b"].Value.Trim() };
+        foreach (Match c in Regex.Matches(m.Groups["rest"].Value,
+                     @"\(\s*(?<a>[^()]+?)\s*==>\s*(?<b>[^()]+?)\)"))
+        {
+            if (c.Groups["a"].Value.Trim() != ante) return lit;  // antecedents differ
+            bodies.Add(c.Groups["b"].Value.Trim());
+        }
+        return lit.Substring(0, m.Index) + m.Groups[1].Value
+             + $"{ante} ==> ({string.Join(" && ", bodies)})"
+             + lit.Substring(m.Index + m.Length);
+    }
+
+    // True when a quantified precondition still looks specification-only after the
+    // rewrites, i.e. no top-level antecedent or conjunct bounds the variable. Emitting
+    // the PRE-CHECK for such a clause breaks the build and loses EVERY test in the
+    // file, which is strictly worse than running without that one check: the test's
+    // oracle still holds it to the full postcondition. Six Dataset-B programs (all of
+    // them previously killed) were lost this way before this guard existed.
+    static bool PreCheckLikelyUncompilable(string preStr)
+    {
+        var m = Regex.Match(preStr,
+            @"\b(forall|exists)\b\s*(?<binders>[^\n]*?)::\s*(?<body>.+)$");
+        if (!m.Success) return false;                 // quantifier-free: always fine
+        var body = m.Groups["body"].Value;
+
+        // (a) A conjunction of separately-guarded implications that survived
+        //     undistribution: the range is not a top-level antecedent, so Dafny
+        //     cannot infer a finite range even though every bound occurs somewhere.
+        if (Regex.IsMatch(body, @"^\s*\(\s*[^()]*==>") && body.Contains("&&")) return true;
+
+        // (b) A bound variable with no range constraint at all, as in
+        //     `exists p: int, q: int :: p != q && IsDuplicate(a,p) && IsDuplicate(a,q)`.
+        //     Dafny compiles a quantifier only over a bounded domain; `p != q` orders
+        //     the witnesses but bounds neither. Strip attributes first so a trigger
+        //     like `{:trigger IsDuplicate(a, q)}` is not mistaken for a binder.
+        var binders = Regex.Replace(m.Groups["binders"].Value, @"\{:[^}]*\}", " ");
+        foreach (Match b in Regex.Matches(binders, @"(?<v>[A-Za-z_]\w*)\s*:"))
+        {
+            var v = Regex.Escape(b.Groups["v"].Value);
+            var bounded = Regex.IsMatch(body, @"(<|<=)\s*" + v + @"\b")      // LO <= v
+                       || Regex.IsMatch(body, @"\b" + v + @"\s*(<|<=)")      // v < HI
+                       || Regex.IsMatch(body, @"\b" + v + @"\s+in\b");       // v in S
+            if (!bounded) return true;
+        }
+        return false;
+    }
+
     static string RewriteChainedForallBounds(string lit)
     {
         // Compound-token alternative comes BEFORE bare-identifier so that
@@ -1787,7 +1853,15 @@ static class TestEmitter
             {
                 var preStr = DnfEngine.ExprToString(pre);
                 if (TypeUtils.IsSpecOnlyLiteral(preStr)) continue; // skip fresh(), etc.
-                if (!preOnlyMode && SmtTranslator._translatedPreConditions.Contains(preStr)) continue; // Z3 guarantees this
+                // NOTE: a translated precondition is NOT guaranteed. The SMT encoding
+                // APPROXIMATES Dafny semantics (bounded quantifier expansion, bounded
+                // recursion unrolling), so the encoded precondition is weaker than the
+                // real one and a model can satisfy the former while violating the
+                // latter -- twoSum's `exists i,j :: i<j<|nums| && summingPair(...)` was
+                // "translated", yet the solver returned nums=[-10], which has no such
+                // pair at all. Emitting the runtime check for EVERY precondition costs
+                // one `expect` per test and is the only thing that makes the input
+                // demonstrably admissible.
                 // For class methods: replace field refs with obj.field, predicates with obj.pred
                 if (classInfo != null)
                 {
@@ -1843,17 +1917,27 @@ static class TestEmitter
                 // formal type-param that isn't in scope in the test method
                 // and Dafny rejects with a syntax/type error.
                 preStr = ApplyTypeParamMap(preStr, typeParamMap);
-                bool hasQuantifier = Regex.IsMatch(preStr, @"\b(exists|forall)\b");
-                if (hasQuantifier)
-                {
-                    sb.AppendLine($"    // PRE-CHECK skipped (uses unbounded quantifier, not runtime-evaluable): {preStr}");
-                }
-                else
+                // A quantified precondition used to disable the PRE-CHECK entirely, so
+                // such tests ran WITHOUT their precondition verified: for twoSum that
+                // meant inputs like nums=[-10] (no i<j at all) executing anyway, and
+                // their oracle failures being scored as kills. Dafny compiles bounded
+                // quantifiers perfectly well -- `exists i:nat,j:nat :: i<j<|nums| && ...`
+                // is exactly what DTest emits in its own precondition `expect` -- so
+                // emit the check and let a genuinely non-compilable one surface as a
+                // build error, which is visible, rather than as a silent omission.
+                // (Same reasoning the ghost-predicate case above already applies.)
                 {
                     // Same chained-bound rewrite as the post path: `LO <= V1 <= V2 <= HI`
                     // → independent bounds + filter, so Dafny's runtime compiler
-                    // accepts the expect.
-                    sb.AppendLine($"    expect {RewriteForallBiconditionals(RewriteChainedForallBounds(preStr))}; // PRE-CHECK");
+                    // accepts the expect. UndistributeForallAntecedent additionally
+                    // undoes rule 1's distribution, which would otherwise leave the
+                    // range inside each conjunct and make the guard spec-only.
+                    var preCheck = RewriteForallBiconditionals(
+                        RewriteChainedForallBounds(UndistributeForallAntecedent(preStr)));
+                    if (PreCheckLikelyUncompilable(preCheck))
+                        sb.AppendLine($"    // PRE-CHECK omitted (not compilable): {preCheck}");
+                    else
+                        sb.AppendLine($"    expect {preCheck}; // PRE-CHECK");
                 }
             }
 
