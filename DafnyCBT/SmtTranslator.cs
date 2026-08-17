@@ -6078,6 +6078,106 @@ static class SmtTranslator
     }
 
     /// <summary>
+    /// Discovery relevance query (--discovery-rung): one shadow, hard ¬Q_target,
+    /// guards and input literals held, every other value literal soft-preferred to
+    /// hold (weight 100, dominating the anti-trivial bias), so a satisfying model
+    /// violates a small group G ∋ target. violD&lt;j&gt; booleans expose which value
+    /// literals the shadow violates; the caller reads them off the model and
+    /// decides minimality with pinned-input checks. Returns null when any value
+    /// literal cannot be encoded: an unread-but-violable literal would make the
+    /// violated-set reading unsound.
+    /// </summary>
+    internal static string? BuildDiscoveryRelevanceQuery(
+        List<(string Name, string Type)> inputs,
+        List<(string Name, string Type)> outputs,
+        List<Expression> preLiterals,
+        List<Expression> postLiterals,
+        Method method,
+        HashSet<string>? mutableNames,
+        List<int> safeIndices,
+        int targetIdx)
+    {
+        mutableNames ??= new HashSet<string>();
+        if (postLiterals.Count == 0) { LastRelevanceSkipReason = "no-post-literals"; return null; }
+
+        var baseSmt = BuildSmt2Query(
+            inputs, outputs, preLiterals, postLiterals, method,
+            false, null, null, preLiterals, mutableNames, skipBias: false);
+        var checkIdx = baseSmt.LastIndexOf("(check-sat)");
+        if (checkIdx < 0) { LastRelevanceSkipReason = "no-check-index"; return null; }
+
+        var uninterpFns = new HashSet<string>();
+        foreach (Match dm in Regex.Matches(baseSmt, @"\(declare-fun\s+(\S+)\s+\(([^)]*)\)\s"))
+            if (!string.IsNullOrWhiteSpace(dm.Groups[2].Value)) uninterpFns.Add(dm.Groups[1].Value);
+        foreach (var idx in safeIndices)
+        {
+            var litDafny = DnfEngine.ExprToString(postLiterals[idx]);
+            foreach (var fn in uninterpFns)
+                if (Regex.IsMatch(litDafny, @"\b" + Regex.Escape(fn) + @"\s*(<[^>]*>)?\s*\("))
+                { LastRelevanceSkipReason = "discovery: uninterpreted-fn in value literal"; return null; }
+        }
+
+        // Strict-relevance guard (v1): on a clause with ghost outputs, plain ¬Q on a
+        // shadow whose ghosts are free can be satisfied by moving the WITNESS rather
+        // than the observable output — exactly what the strict form (Eq. 8) rejects,
+        // and how BelowZero's `n <= |ops|` was spuriously re-certified. Until the
+        // ¬∃ghosts conjunct is ported into this query AND into the pinned minimality
+        // checks, skip discovery here so it can never certify what the strict sweep
+        // refused.
+        if (StrictRelevance && GhostOutputNames.Count > 0
+            && safeIndices.Any(i2 => LiteralMentionsGhost(postLiterals[i2])))
+        { LastRelevanceSkipReason = "discovery: ghost outputs need strict form"; return null; }
+
+        // A spec-only target (e.g. fresh(...)) cannot carry the hard ¬Q: the emit
+        // loop skips such literals, which left a vacuously-SAT query whose empty
+        // violated-set minted a spurious INDIVIDUAL certification (FilterVowelsArray
+        // fresh(ys)). Abstain instead.
+        if (TypeUtils.IsSpecOnlyLiteral(DnfEngine.ExprToString(postLiterals[targetIdx])))
+        { LastRelevanceSkipReason = "discovery: spec-only target"; return null; }
+
+        var sb = new System.Text.StringBuilder(baseSmt.Substring(0, checkIdx));
+        var inputsAndOutputs = inputs.Concat(outputs).ToList();
+        var safeSet = new HashSet<int>(safeIndices);
+        const string suffix = "altD";
+        sb.AppendLine();
+        sb.AppendLine($"; ─── Discovery: shadow (outs_{suffix}); hard ¬Q{targetIdx + 1}; soft siblings ───");
+        if (!EmitOutputAltDeclarations(sb, inputs, outputs, mutableNames, suffix))
+            { LastRelevanceSkipReason = "shadow-output decl unsupported (type)"; return null; }
+        var renameMap = BuildOutputAltRenameMap(inputs, outputs, mutableNames, suffix);
+        if (renameMap.Count == 0) { LastRelevanceSkipReason = "empty-rename-map"; return null; }
+
+        for (int j2 = 0; j2 < postLiterals.Count; j2++)
+        {
+            var litStr = DnfEngine.ExprToString(postLiterals[j2]);
+            if (TypeUtils.IsSpecOnlyLiteral(litStr)) continue;
+            ResetExprToSmtBudget();
+            var smtExpr = ExprToSmt(postLiterals[j2], inputsAndOutputs, mutableNames, isPostContext: true);
+            if (smtExpr == null) { LastRelevanceSkipReason = "literal untranslatable to SMT"; return null; }
+            smtExpr = ApplyOutputAltRenames(smtExpr, renameMap);
+            if (j2 == targetIdx)
+                sb.AppendLine($"(assert (not {smtExpr}))");
+            else if (safeSet.Contains(j2))
+            {
+                sb.AppendLine($"(assert-soft {smtExpr} :weight 100)");
+                sb.AppendLine($"(declare-const violD{j2} Bool)");
+                sb.AppendLine($"(assert (= violD{j2} (not {smtExpr})))");
+            }
+            else
+                sb.AppendLine($"(assert {smtExpr})");
+        }
+
+        EmitBehaviouralRelevanceConstraints(sb, inputs, outputs, postLiterals, mutableNames);
+        sb.AppendLine();
+        sb.AppendLine("(check-sat)");
+        sb.AppendLine("(get-model)");
+        EmitGetValueQueries(sb, inputs, outputs, mutableNames);
+        var violNames = safeIndices.Where(i2 => i2 != targetIdx).Select(i2 => $"violD{i2}").ToList();
+        if (violNames.Count > 0)
+            sb.AppendLine("(get-value (" + string.Join(" ", violNames) + "))");
+        return RewriteNestedSeqRefs(sb.ToString(), inputs, outputs);
+    }
+
+    /// <summary>
     /// Emits shadow declarations for every output identifier with "_alt" suffix.
     /// Mirrors a subset of the type-handling logic in BuildSmt2Query.
     /// Returns false if an unsupported output type is encountered.

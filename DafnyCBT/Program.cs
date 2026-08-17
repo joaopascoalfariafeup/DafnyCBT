@@ -47,8 +47,177 @@ class Program
     static bool CoupledResidual = true;
     // Credit only literals belonging to a MINIMAL jointly-active group at the
     // witnessing input (Def. 4.3), rather than every member of the residue.
+
+    // ── prototype (env CBT_WF_GUARD_REPORT=1): WF-based guard classification ──
+    // A literal is a guard iff it is needed for the well-formedness of a sibling:
+    // obligations collected from seq/array selections, div/mod, and callee requires
+    // (formals substituted textually). Report-only; changes nothing.
+    static IEnumerable<string> WfObligations(Expression e)
+    {
+        if (e == null) yield break;
+        if (e is SeqSelectExpr ss && ss.SelectOne && ss.E0 != null)
+        {
+            var seq = DnfEngine.ExprToString(ss.Seq);
+            var idx = DnfEngine.ExprToString(ss.E0);
+            yield return $"0 <= {idx}";
+            yield return $"{idx} < |{seq}|";
+        }
+        if (e is FunctionCallExpr fc && fc.Function != null)
+        {
+            var formals = fc.Function.Ins;
+            foreach (var r in (IEnumerable<AttributedExpression>)fc.Function.Req)
+            {
+                var t = DnfEngine.ExprToString(r.E);
+                for (int a = 0; a < formals.Count && a < fc.Args.Count; a++)
+                    t = System.Text.RegularExpressions.Regex.Replace(t,
+                        @"\b" + System.Text.RegularExpressions.Regex.Escape(formals[a].Name) + @"\b",
+                        DnfEngine.ExprToString(fc.Args[a]));
+                yield return t;
+            }
+        }
+        foreach (var sub in e.SubExpressions)
+            foreach (var o in WfObligations(sub)) yield return o;
+    }
+
+    static string WfNorm(string s) =>
+        System.Text.RegularExpressions.Regex.Replace(s, @"\s+|\(|\)", "");
+
+    static IEnumerable<string> WfAtoms(string s)
+    {
+        foreach (var part in s.Split(new[] { "&&" }, StringSplitOptions.None))
+        {
+            var t = part.Trim();
+            var m = System.Text.RegularExpressions.Regex.Match(t, @"^(.+?)(<=|<)(.+?)(<=|<)(.+)$");
+            if (m.Success)
+            {
+                yield return m.Groups[1].Value + m.Groups[2].Value + m.Groups[3].Value;
+                yield return m.Groups[3].Value + m.Groups[4].Value + m.Groups[5].Value;
+            }
+            yield return t;
+        }
+    }
+
+    static async Task WfGuardCompare(string methodName, int ci, List<Expression> clause, List<int> safeIdx,
+        List<(string Name, string Type)> inputs, List<(string Name, string Type)> outputs,
+        List<Expression> preLits, Method method, HashSet<string> mutableNames, string z3Path)
+    {
+        // v1 entailment rule: g is a GUARD iff (decls/typing ∧ pre ∧ WF(siblings)) ⟹ g,
+        // i.e. ¬g UNSAT under them. UNKNOWN/untranslatable → VALUE (safe: obligation kept).
+        var lits = clause.Select(DnfEngine.ExprToString).ToList();
+        var ios = inputs.Concat(outputs).ToList();
+        var known = new HashSet<string>(ios.Select(v => v.Name));
+        string baseSmt;
+        try
+        {
+            baseSmt = SmtTranslator.BuildSmt2Query(inputs, outputs, preLits,
+                new List<Expression>(), method, false, null, null, preLits, mutableNames, skipBias: true);
+        }
+        catch { return; }
+        var cut = baseSmt.LastIndexOf("(check-sat)");
+        if (cut < 0) return;
+        baseSmt = baseSmt.Substring(0, cut);
+
+        for (int i = 0; i < clause.Count; i++)
+        {
+            var wf = new List<string>();
+            for (int j = 0; j < clause.Count; j++)
+            {
+                if (j == i) continue;
+                foreach (var o in WfObligations(clause[j]))
+                    foreach (var atom in WfAtoms(o))
+                    {
+                        // skip atoms mentioning quantifier-bound (unknown) identifiers
+                        var ids = System.Text.RegularExpressions.Regex.Matches(atom, @"[A-Za-z_][A-Za-z0-9_]*")
+                            .Select(m => m.Value).Where(t => t != "true" && t != "false");
+                        if (ids.All(t => known.Contains(t)))
+                        {
+                            var smt = SmtTranslator.DafnyExprToSmt(atom, ios);
+                            if (smt != null && !wf.Contains(smt)) wf.Add(smt);
+                        }
+                    }
+            }
+            var gSmt = SmtTranslator.DafnyExprToSmt(lits[i], ios);
+            string verdict;
+            if (gSmt == null) verdict = "VALUE (untranslatable)";
+            else
+            {
+                var q = baseSmt + "\n" + string.Join("\n", wf.Select(w => $"(assert {w})"))
+                      + $"\n(assert (not {gSmt}))\n(check-sat)\n";
+                var r = await Z3Runner.RunZ3(z3Path, q, rung: "wf-guard");
+                var line = r.Split('\n').Select(l => l.Trim()).FirstOrDefault(l => l == "sat" || l == "unsat" || l == "unknown") ?? "?";
+                verdict = line == "unsat" ? "GUARD (entailed by WF+typing+pre)" : "VALUE";
+            }
+            var oldc = safeIdx.Contains(i) ? "VALUE" : "non-value";
+            Console.WriteLine($"  [wf-guard] {methodName} {{{ci + 1}}} Q{i + 1}: old={oldc}  new={verdict}  :: {lits[i]}");
+        }
+    }
+
+    // ── WF-entailment classification (default ON; CBT_WF_GUARDS=0 opts out) ──
+    // Demotes from the value-literal set every literal entailed by
+    // (decls/typing ∧ pre ∧ WF(siblings)); demoted literals are held on shadows
+    // like any guard but carry no coverage obligation. UNKNOWN keeps the literal.
+    static async Task<List<int>> WfGuardFilter(string methodName, int ci, List<Expression> clause, List<int> safeIdx,
+        List<(string Name, string Type)> inputs, List<(string Name, string Type)> outputs,
+        List<Expression> preLits, Method method, HashSet<string> mutableNames, string z3Path)
+    {
+        var lits = clause.Select(DnfEngine.ExprToString).ToList();
+        var ios = inputs.Concat(outputs).ToList();
+        var known = new HashSet<string>(ios.Select(v => v.Name));
+        string baseSmt;
+        try
+        {
+            baseSmt = SmtTranslator.BuildSmt2Query(inputs, outputs, preLits,
+                new List<Expression>(), method, false, null, null, preLits, mutableNames, skipBias: true);
+        }
+        catch { return safeIdx; }
+        var cut = baseSmt.LastIndexOf("(check-sat)");
+        if (cut < 0) return safeIdx;
+        baseSmt = baseSmt.Substring(0, cut);
+        var kept = new List<int>();
+        foreach (var i in safeIdx)
+        {
+            // v2 whitelist: only simple comparison literals may be demoted. The
+            // string-path translation degenerates on old() (pre/post collapse to the
+            // same term: UpdateElements old(a[4]) < a[4]) and on quantified bodies
+            // (Search1000/Search2Pow foralls, the ProductEvenOdd capture), minting
+            // false "entailed" verdicts. Those shapes keep their obligation.
+            if (lits[i].Contains("old(") || lits[i].Contains("forall") || lits[i].Contains("exists"))
+            { kept.Add(i); continue; }
+            var wf = new List<string>();
+            for (int j = 0; j < clause.Count; j++)
+            {
+                if (j == i) continue;
+                foreach (var o in WfObligations(clause[j]))
+                    foreach (var atom in WfAtoms(o))
+                    {
+                        var ids = System.Text.RegularExpressions.Regex.Matches(atom, @"[A-Za-z_][A-Za-z0-9_]*")
+                            .Select(m => m.Value).Where(t => t != "true" && t != "false");
+                        if (ids.All(t => known.Contains(t)))
+                        {
+                            var smt = SmtTranslator.DafnyExprToSmt(atom, ios);
+                            if (smt != null && !wf.Contains(smt)) wf.Add(smt);
+                        }
+                    }
+            }
+            var gSmt = SmtTranslator.DafnyExprToSmt(lits[i], ios);
+            bool guard = false;
+            if (gSmt != null)
+            {
+                var q = baseSmt + "\n" + string.Join("\n", wf.Select(w => $"(assert {w})"))
+                      + $"\n(assert (not {gSmt}))\n(check-sat)\n";
+                var r = await Z3Runner.RunZ3(z3Path, q, rung: "wf-guard");
+                guard = r.Split('\n').Select(l => l.Trim()).Any(l => l == "unsat");
+            }
+            if (guard)
+                Console.WriteLine($"  [wf-guard-demote] {methodName} {{{ci + 1}}} Q{i + 1} :: {lits[i]}");
+            else kept.Add(i);
+        }
+        return kept;
+    }
+
     static bool MinimiseGroups = true;
     static bool FullCoupledGroup = false;
+    static bool DiscoveryRung = false;
     // Prototype (--test-entry-only): restrict auto-discovery to methods annotated
     // `{:testEntry}`, mirroring Dafny's built-in generate-tests. For experiments
     // comparing against DTest on the same entry points. Default OFF (test all
@@ -312,6 +481,7 @@ class Program
         var noRelevanceOpt = new Option<bool>("--no-relevance", "Disable per-literal relevance check (Phase 1r). Default: relevance ON.");
         noRelevanceOpt.AddAlias("-nr");
         var fullCoupledOpt = new Option<bool>("--full-coupled", "Run the collective rung over ALL value literals rather than the uncertified residue, and credit the result only if it certifies a literal not already covered. Reaches minimal jointly-active groups that include an already-certified literal, which the residue-only query cannot express. Experimental; default OFF.");
+        var discoveryRungOpt = new Option<bool>("--discovery-rung", "Replace the collective query by per-residual DISCOVERY queries: for each uncertified value literal, ask for a shadow violating it while soft-preferring every sibling to hold, read the violated group G off the model, certify the members of minimal jointly-active groups within G, and emit the witness as a test when someone new is certified. Fires whenever the residue is non-empty, including the singleton residues the collective rung skips. Experimental; default OFF.");
         var noMinimiseGroupsOpt = new Option<bool>("--no-minimise-groups", "Credit EVERY member of a jointly-active residue at group level, instead of only those belonging to a minimal jointly-active group at the witnessing input (Def. 4.3). The collective rung proves the residue prunes jointly, not that it is minimal, so the default (minimisation ON) is what the criterion asks for; this flag restores the over-reporting behaviour for A/B. Minimality is decided exactly for residues of up to 4 literals and greedily above that. Does not change which tests are emitted - only which literals are certified.");
         var logUncertifiedOpt = new Option<bool>("--log-uncertified", "Emit one line per relevance-checked value literal the ladder did not certify, tagged UNSAT (an individual query proved it NOT INDEPENDENT over the encoded contract -- it is then either redundant or coupled, which this tag does not separate), UNKNOWN (the solver gave no verdict and Alg. 1 read it as UNSAT), or NOT-QUERIED (no individual query targeted it). Diagnostic only; generation is unchanged. Use with --rung-stats to reconcile against the contract census. Default: OFF.");
         var rungStatsOpt = new Option<bool>("--rung-stats", "Report per-rung Z3 query outcome counts (queries / SAT / UNSAT / UNKNOWN) at the end of the run. Rungs: combined, leave-one-out, one-at-a-time, group, plus uniqueness and base/schedule queries. Default: OFF.");
@@ -385,7 +555,7 @@ class Program
 
         var rootCommand = new RootCommand("Generates test cases for Dafny methods based on their contracts")
         {
-            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noNoopRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noBiasPhase2Opt, noShapeExclusionOpt, noSubsumedBasesOpt, strictRelevanceOpt, strictPerLiteralOpt, noStrictRelevanceOpt, noStrictPerLiteralOpt, noDeprioOpaqueOpt, noSkolemizeOpt, skolemizeCarveOutOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noInvariantOpaqueOpt, noDeadClausePruningOpt, vacuityOpt, rungStatsOpt, logUncertifiedOpt, noMinimiseGroupsOpt, fullCoupledOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, relevanceLooOpt, looPartialEmitOpt, noLooPartialEmitOpt, actCreditOpt, noActCreditOpt, coupledResidualOpt, noCoupledResidualOpt, contractShadowsOpt, distributeForallOpt, testEntryOnlyOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
+            inputArg, methodOpt, outputOpt, verboseOpt, allCombOpt, boundaryOpt, simpleOpt, tiersOpt, checkOpt, noCheckOpt, groupingOpt, repeatOpt, minTestsOpt, z3PathOpt, maxTestsOpt, timeoutOpt, z3QueryTimeoutOpt, trustUnknownOpt, uniquenessRoundsOpt, skipBodylessOpt, noBiasOpt, noRelevanceOpt, noModificationRelOpt, noForallRelOpt, noNoopRelOpt, noPermDomainPinOpt, noBoundedFoldOpt, minSeqLenOpt, noBiasPhase2Opt, noShapeExclusionOpt, noSubsumedBasesOpt, strictRelevanceOpt, strictPerLiteralOpt, noStrictRelevanceOpt, noStrictPerLiteralOpt, noDeprioOpaqueOpt, noSkolemizeOpt, skolemizeCarveOutOpt, capSmallSizeRepeatsOpt, noPrecondFillOpt, noInvariantOpaqueOpt, noDeadClausePruningOpt, vacuityOpt, rungStatsOpt, logUncertifiedOpt, noMinimiseGroupsOpt, fullCoupledOpt, discoveryRungOpt, noEstablishOpt, preSatOpt, existsDecompOpt, noExistsDecompOpt, reverseBvaOrderOpt, noLiteralBvaOpt, literalBvaOpt, bvaNeighborsOpt, relevanceModeOpt, relevanceLooOpt, looPartialEmitOpt, noLooPartialEmitOpt, actCreditOpt, noActCreditOpt, coupledResidualOpt, noCoupledResidualOpt, contractShadowsOpt, distributeForallOpt, testEntryOnlyOpt, dropPostWfOpt, skipOnExceptionOpt, commentUncompilableOpt, seedOpt, unrollDepthOpt, smokeTestsOpt
         };
 
         rootCommand.SetHandler(async (ctx) =>
@@ -453,6 +623,7 @@ class Program
             Z3Runner.LogUncertified = ctx.ParseResult.GetValueForOption(logUncertifiedOpt);
             MinimiseGroups = !ctx.ParseResult.GetValueForOption(noMinimiseGroupsOpt);
             FullCoupledGroup = ctx.ParseResult.GetValueForOption(fullCoupledOpt);
+            DiscoveryRung = ctx.ParseResult.GetValueForOption(discoveryRungOpt);
             EstablishCheckEnabled = !ctx.ParseResult.GetValueForOption(noEstablishOpt);
             if (!EstablishCheckEnabled)
                 Console.WriteLine("[DafnyCBT] Establish check (Phase 1e): OFF");
@@ -4496,7 +4667,12 @@ class Program
                         if (maxTests > 0 && testCases.Count >= maxTests) break;
                         var clause = dnfExprs[ci];
                         var safeIndices = GetSafeRelevanceIndices(clause, inputs, outputs, mutableNames, census: pi == 0);
+                        // WF-guard classification (entailment + simple-literal whitelist)
+                        // is ON by default since v24; CBT_WF_GUARDS=0 opts out.
+                        if (Environment.GetEnvironmentVariable("CBT_WF_GUARDS") != "0" && safeIndices.Count > 0 && !TimedOut())
+                            safeIndices = await WfGuardFilter(method.Name, ci, clause, safeIndices, inputs, outputs, fullPreLits, method, mutableNames, z3Path);
                         if (pi == 0) Z3Runner.StatSafeLiterals += safeIndices.Count;
+                        if (pi == 0 && Environment.GetEnvironmentVariable("CBT_WF_GUARD_REPORT") == "1") await WfGuardCompare(method.Name, ci, clause, safeIndices, inputs, outputs, fullPreLits, method, mutableNames, z3Path);
                         clauseSafeCount[(pi, ci)] = safeIndices.Count;
                         // Per-clause coverage bookkeeping for the census: which value literals
                         // the ladder actually CERTIFIED active, as opposed to merely building a
@@ -4997,7 +5173,75 @@ class Program
                             // back individually redundant. The all-singletons-UNSAT group fallback
                             // below won't fire (a singleton was SAT), so try those residual literals
                             // collectively here to catch a coupled subset mixed in with relevant ones.
-                            if (CoupledResidual && perLiteralSweepSatAny && (FullCoupledGroup
+                            // ── Discovery rung (--discovery-rung) ─────────────────────────
+                            // Per still-uncertified value literal q: one query with hard
+                            // ¬Q_q on a fresh shadow and every sibling soft-preferred to
+                            // hold, so the model violates a small group G ∋ q. G is jointly
+                            // active at the model's input by construction (the shadow holds
+                            // everything outside G yet falls outside [[C]]); minimal groups
+                            // within G are decided by the pinned checks and their members
+                            // certified. Emits the witness only when someone new is added.
+                            if (DiscoveryRung && !TimedOut())
+                            {
+                                foreach (var dq in safeIndices)
+                                {
+                                    if (TimedOut()) break;
+                                    if (maxTests > 0 && testCases.Count >= maxTests) break;
+                                    if (covIndiv.Contains(dq) || covGroup.Contains(dq)) continue;
+                                    var dSmt = SmtTranslator.BuildDiscoveryRelevanceQuery(
+                                        inputs, outputs, fullPreLits, clause, method, mutableNames, safeIndices, dq);
+                                    if (dSmt == null) continue;
+                                    if (verbose) Console.WriteLine($"  Solving relevance {clauseLabel}/RelD{dq + 1} (discovery)...");
+                                    var dRes = await Z3Runner.RunZ3(z3Path, dSmt, rung: "discovery");
+                                    if (!dRes.Split('\n').Select(l => l.Trim()).Any(l => l == "sat")) continue;
+                                    var dVals = TypeUtils.ParseZ3Model(dRes, allVars);
+                                    if (dVals == null || dVals.Count == 0) continue;
+                                    var G = new List<int> { dq };
+                                    foreach (System.Text.RegularExpressions.Match vm in
+                                             System.Text.RegularExpressions.Regex.Matches(dRes, @"violD(\d+)[\s()A-Za-z]*?(true|false)"))
+                                    {
+                                        if (vm.Groups[2].Value == "true"
+                                            && int.TryParse(vm.Groups[1].Value, out var vj)
+                                            && vj != dq && safeIndices.Contains(vj) && !G.Contains(vj))
+                                            G.Add(vj);
+                                    }
+                                    var dCredited = await MinimalGroupMembers(G, dVals);
+                                    var dNew = dCredited.Where(i => !covIndiv.Contains(i) && !covGroup.Contains(i)).ToList();
+                                    if (dNew.Count == 0)
+                                    {
+                                        if (verbose) Console.WriteLine($"  Relevance {clauseLabel}/RelD{dq + 1}: SAT, G=[Q{string.Join(",Q", G.Select(i => i + 1))}] certifies nothing new — discarded");
+                                        continue;
+                                    }
+                                    var dLabel = $"{fullPreLabel}{{{ci + 1}}}/RelD{dq + 1}";
+                                    var dSpecSmt = SmtTranslator.BuildSmt2Query(
+                                        inputs, outputs, preClauses, dnfEnsures, method, false,
+                                        null, null, fullPreLits, mutableNames, skipBias: true);
+                                    var dUQuery = !hasNonInlinableFuncs
+                                        ? SmtTranslator.BuildUniquenessQuery(dSpecSmt, inputs, outputs, dVals, mutableNames)
+                                        : null;
+                                    if (!string.IsNullOrEmpty(dUQuery) && !TimedOut())
+                                    {
+                                        var dURes = await Z3Runner.RunZ3(z3Path, dUQuery, rung: "uniqueness");
+                                        var dULines = dURes.Split('\n').Select(l => l.Trim()).ToList();
+                                        var dUnique = dULines.Any(l => l == "unsat");
+                                        var dUnknown = !dUnique && dULines.Any(l => l == "unknown");
+                                        dVals["__unique__"] = (dUnique || (dUnknown && TrustUnknownUniqueness)) ? "true" : "false";
+                                    }
+                                    Z3Runner.RecordClause("covered: discovery");
+                                    if (G.Count == 1) CreditIndiv(dCredited); else CreditGroup(dCredited);
+                                    testCases.Add((dLabel, dVals, clause));
+                                    coveredByRelevance.Add((pi, ci));
+                                    relAdded++;
+                                    if (verbose) Console.WriteLine($"  Relevance {dLabel}: SAT — discovery certified Q{string.Join("/Q", dNew.Select(i => i + 1))} (G=[Q{string.Join(",Q", G.Select(i => i + 1))}])");
+                                    var dBaseKey = ScheduleKey(clause, new List<Expression>(), fullPreLits);
+                                    if (!baseConditionExclusions.ContainsKey(dBaseKey))
+                                        baseConditionExclusions[dBaseKey] = new List<string>();
+                                    var dExcl = BuildInputExclusion(dVals);
+                                    if (dExcl != null) baseConditionExclusions[dBaseKey].Add(dExcl);
+                                    relevanceContextByBaseKey[dBaseKey] = (dCredited, clause, fullPreLits, mode, dLabel);
+                                }
+                            }
+                            if (!DiscoveryRung && CoupledResidual && perLiteralSweepSatAny && (FullCoupledGroup
                                     // Only the case the shipped rung cannot express:
                                     // a lone uncertified literal, whose only possible
                                     // minimal group pairs it with an already-certified
