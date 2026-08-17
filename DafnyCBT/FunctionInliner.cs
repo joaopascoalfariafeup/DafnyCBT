@@ -92,6 +92,12 @@ internal class FunctionInliningSubstituter : Substituter
                 try
                 {
                     var inlined = innerSub.Substitute(func.Body);
+                    // Capture repair: a quantifier binder in the body may share its
+                    // name with a variable free in a substituted actual (task_id_784:
+                    // IsFirstEven(i, lst) with body binder `i` -> `0 <= i < i`).
+                    // Rename such binders so every downstream consumer (DNF literals,
+                    // string translation, logs) sees the true literal.
+                    AlphaRenameCapturedBinders(inlined, substitutedArgs);
                     return new ParensExpression(func.Body.Origin, inlined);
                 }
                 finally
@@ -130,6 +136,104 @@ internal class FunctionInliningSubstituter : Substituter
         }
 
         return base.Substitute(expr);
+    }
+
+    static void CollectNames(Expression e, HashSet<string> names)
+    {
+        if (e is IdentifierExpr ie) names.Add(ie.Name);
+        if (e is ComprehensionExpr ce) foreach (var bv in ce.BoundVars) names.Add(bv.Name);
+        foreach (var s in e.SubExpressions) CollectNames(s, names);
+    }
+
+    static bool TrySetName(object target, string current, string fresh, int depth = 2,
+                           HashSet<object>? seen = null)
+    {
+        // The backing store for the name differs across Dafny versions and between
+        // IVariable and IdentifierExpr: sometimes a plain string field, sometimes a
+        // string one level in (a `Name`/token node whose Value holds it). Search for
+        // any string-typed instance field currently equal to the name, descending a
+        // bounded number of levels through reference-typed fields.
+        seen ??= new HashSet<object>(ReferenceEqualityComparer.Instance);
+        if (target == null || !seen.Add(target)) return false;
+        var nested = new List<object>();
+        for (var t = target.GetType(); t != null && t != typeof(object); t = t.BaseType)
+            foreach (var f in t.GetFields(System.Reflection.BindingFlags.NonPublic
+                | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+            {
+                if (f.FieldType == typeof(string))
+                {
+                    if ((string?)f.GetValue(target) == current) { f.SetValue(target, fresh); return true; }
+                }
+                else if (depth > 0 && !f.FieldType.IsPrimitive && !f.FieldType.IsEnum)
+                {
+                    var v = f.GetValue(target);
+                    if (v != null) nested.Add(v);
+                }
+            }
+        foreach (var v in nested)
+            if (TrySetName(v, current, fresh, depth - 1, seen)) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Repair name capture introduced by inlining. Substituting an actual into a
+    /// function body can put a free variable under a binder of the same name:
+    /// `IsMin(s[..], s[i])` with body `forall i :: … s[i] >= r` renders as
+    /// `forall i :: … s[..][i] >= s[i]`, a tautology (task_id_755 Q7; likewise
+    /// task_id_784 Q4's `i &lt; i`).
+    ///
+    /// The resolved AST is not actually wrong -- each IdentifierExpr keeps a Var
+    /// reference, so the two `i`s are distinct objects -- but every downstream
+    /// consumer here (DNF literals, the string SMT translation, the logs) works
+    /// from the rendered text, where they collide. So we rename the binder and its
+    /// own occurrences, identified by reference to the BoundVar rather than by
+    /// name: renaming by name cannot tell the captured occurrence from the
+    /// capturing one, which is why doing this on names alone had no effect.
+    /// </summary>
+    static void AlphaRenameCapturedBinders(Expression e, List<Expression> args)
+    {
+        var used = new HashSet<string>();
+        CollectNames(e, used);
+        foreach (var a in args) CollectNames(a, used);
+        RenameCaptured(e, used);
+    }
+
+    static void RenameCaptured(Expression e, HashSet<string> used)
+    {
+        if (e is ComprehensionExpr ce)
+        {
+            foreach (var bv in ce.BoundVars)
+            {
+                if (!IsShadowed(ce, bv)) continue;
+                var fresh = bv.Name;
+                do { fresh += "_"; } while (used.Contains(fresh));
+                used.Add(fresh);
+                var old = bv.Name;
+                var okv = TrySetName(bv, old, fresh);
+                if (Environment.GetEnvironmentVariable("CBT_TRACE_CAPTURE") == "1")
+                    Console.Error.WriteLine($"[capture] shadowed binder {old} -> {fresh} (setName={okv})");
+                if (okv) RenameOccurrences(ce, bv, old, fresh);
+            }
+        }
+        foreach (var s in e.SubExpressions) RenameCaptured(s, used);
+    }
+
+    /// <summary>True if some identifier under <paramref name="ce"/> carries the
+    /// binder's name while denoting a different variable.</summary>
+    static bool IsShadowed(Expression ce, BoundVar bv)
+    {
+        if (ce is IdentifierExpr ie && ie.Name == bv.Name && !ReferenceEquals(ie.Var, bv))
+            return true;
+        foreach (var s in ce.SubExpressions)
+            if (IsShadowed(s, bv)) return true;
+        return false;
+    }
+
+    static void RenameOccurrences(Expression e, BoundVar bv, string old, string fresh)
+    {
+        if (e is IdentifierExpr ie && ReferenceEquals(ie.Var, bv))
+            TrySetName(ie, old, fresh);
+        foreach (var s in e.SubExpressions) RenameOccurrences(s, bv, old, fresh);
     }
 }
 
