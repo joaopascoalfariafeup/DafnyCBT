@@ -14,10 +14,24 @@
       System.CommandLine.dll, and the Microsoft.Extensions.* DLLs referenced
       below. With the VS Code Dafny extension, the path typically looks like
       "<USER>/.vscode/extensions/dafny-lang.ide-vscode-3.5.2/out/resources/4.11.0/github/dafny".
-      Copy this template to DafnyCBT.csproj and replace the value below.
+      It can also be supplied without editing this file, as an environment
+      variable (MSBuild surfaces those as properties) or on the command line:
+          DafnyDir=/path/to/dafny  dotnet build
+          dotnet build -p:DafnyDir=/path/to/dafny
+      Either overrides the fallback below, which is used only when neither is set.
     -->
-    <DafnyDir>PATH_TO_YOUR_LOCAL_DAFNY_INSTALL</DafnyDir>
+    <DafnyDir Condition="'$(DafnyDir)' == ''">PATH_TO_YOUR_LOCAL_DAFNY_INSTALL</DafnyDir>
   </PropertyGroup>
+
+  <!--
+    Fail early and legibly. Without this, an unset or wrong DafnyDir surfaces as
+    hundreds of CS0246 "type or namespace not found" errors, which look like a
+    broken checkout rather than a misconfigured path.
+  -->
+  <Target Name="CheckDafnyDir" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(DafnyDir)/DafnyCore.dll')"
+           Text="DafnyDir does not point at a Dafny 4.11.0 install: no DafnyCore.dll under '$(DafnyDir)'. Pass it as an environment variable (DafnyDir=/path/to/dafny dotnet build), as a property (-p:DafnyDir=/path/to/dafny), or set the &lt;DafnyDir&gt; fallback in DafnyCBT.csproj." />
+  </Target>
 
   <ItemGroup>
     <!-- Dafny core (for parsing .dfy files and walking the AST) -->
