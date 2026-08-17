@@ -38,7 +38,7 @@ Thumbs.db
 # Auxiliary Shell and Python scripts
 *.sh
 *.py
-
+scripts/
 
 # LaTeX build artefacts
 *.aux
@@ -56,3 +56,6 @@ chk.*
 #Other aux folders
 __pycache__/
 publish_*/
+
+# Local analysis scripts
+scripts/
